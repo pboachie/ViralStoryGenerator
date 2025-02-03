@@ -68,7 +68,7 @@ def cli_main():
                         help="Sampling temperature (higher => more random).")
     parser.add_argument("--show-thinking", action="store_true",
                         help="If passed, print chain-of-thought (if available).")
-    parser.add_argument("--chunk-size", type=int, default=500,
+    parser.add_argument("--chunk-size", type=int, default=1500,
                         help="Word chunk size for splitting sources.")
     args = parser.parse_args()
 

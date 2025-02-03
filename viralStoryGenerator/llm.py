@@ -48,9 +48,7 @@ def generate_story_script(topic,
                           model="deepseek-r1-distill-qwen-14b@q4_k_m",
                           temperature=0.7,
                           show_thinking=False):
-    # Replace inline system_instructions with call from prompts
     system_instructions = get_system_instructions()
-    # Replace inline user_prompt with call from prompts module
     user_prompt = get_user_prompt(topic, sources)
 
     headers = {"Content-Type": "application/json"}
