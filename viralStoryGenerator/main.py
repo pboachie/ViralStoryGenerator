@@ -156,6 +156,7 @@ Now, please produce the narrated story script followed by the video description.
     # 2) Check if format is correct
     story, description = _check_format(completion_text)
     if story is None or description is None:
+        logging.info("Initial completion was off-format. Attempting reformatting...")
         # Attempt to reformat
         fixed_text = _reformat_text(completion_text, endpoint, model, temperature)
 
