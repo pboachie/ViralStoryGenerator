@@ -13,7 +13,7 @@ def cleanse_sources(raw_sources, endpoint, model, temperature=0.7):
     Returns a single cohesive text summary.
     """
     system_prompt = (
-        "You are a helpful assistant that merges multiple notes or sources into one cohesive summary.\n"
+        "You are a helpful assistant that merges multiple notes or sources into one cohesive summary ensuring the story is coherent and easy to understand.\n"
         "1. Summarize all major points or controversies.\n"
         "2. Remove duplicates or confusion.\n"
         "3. Return a concise but complete summary.\n"
@@ -55,7 +55,7 @@ Sources:
     return summary
 
 
-def _chunk_text_by_words(text, chunk_size=500):
+def _chunk_text_by_words(text, chunk_size=1500):
     """
     Splits the text into roughly equal chunks by word count.
     chunk_size is how many words per chunk.
@@ -81,9 +81,9 @@ def _chunk_text_by_words(text, chunk_size=500):
 
 
 def chunkify_and_summarize(raw_sources, endpoint, model,
-                           temperature=0.7, chunk_size=500):
+                           temperature=0.7, chunk_size=1500):
     """
-    1) Split raw_sources into smaller chunks (default ~500 words each).
+    1) Split raw_sources into smaller chunks (default ~1500 words each).
     2) Summarize each chunk individually via cleanse_sources().
     3) Merge those mini-summaries into one final summary
        (calling cleanse_sources() again on the concatenated chunk summaries).
