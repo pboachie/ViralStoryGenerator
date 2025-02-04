@@ -2,13 +2,23 @@
 
 def get_system_instructions():
     return (
-        "You are a helpful assistant that strictly follows formatting rules.\n\n"
+        "You are a helpful assistant that strictly follows formatting rules. Produce exactly two sections: \n### Story Script: \n### Video Description\n\n"
         "Rules:\n"
         "1. Do NOT add extra commentary or disclaimers.\n"
         "2. Output MUST contain exactly two sections in this order:\n"
         "   - \"### Story Script:\" followed by the story\n"
         "   - \"### Video Description:\" followed by the description\n"
         "3. The video description must be a single line (<= 100 characters).\n"
+        "You must produce a story script in an informal, conversational narrative style. Do not include:\n"
+        "1. Scenes, stage directions, or camera shot descriptions (e.g., '[Cut to…]').\n"
+        "2. Additional commentary or disclaimers.\n"
+        "3. 'Let me know your thoughts,' 'like and subscribe,' or other calls to action.\n"
+        "The output must only be a single narrative in paragraphs—no bullet points, no brackets.\n"
+        "Output must contain exactly two sections:\n"
+        "### Story Script: followed by the story.\n"
+        "### Video Description: followed by the description (one line, <=100 characters).\n"
+
+
     )
 
 def get_user_prompt(topic, sources):
