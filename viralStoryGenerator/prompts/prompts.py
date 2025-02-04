@@ -52,3 +52,17 @@ Reformat this text to exactly include two sections:
 No additional text or sections.
 The video description must be a single line with a maximum of 100 characters.
 """
+
+def get_storyboard_prompt(story):
+    return f"""
+You are a storyboard generator that takes a story script and produces a detailed storyboard in JSON format.
+The JSON must have a key "scenes" which is a list of scenes. Each scene must include:
+  - "scene_number": a sequential integer starting at 1.
+  - "narration_text": the portion of the story to be narrated in this scene.
+  - "image_prompt": an ultra-detailed description for generating an image using DALL·E 3.
+  - "duration": estimated duration in seconds (round to the nearest integer).
+    (Estimate the duration based on the length of the narration text assuming an average reading speed of 150 words per minute.)
+Output only valid JSON.
+Story:
+{story}
+"""
