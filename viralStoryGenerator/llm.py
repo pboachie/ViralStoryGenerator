@@ -18,7 +18,7 @@ def _reformat_text(raw_text, endpoint, model, temperature=0.7):
         "model": model,
         "messages": [{"role": "user", "content": fix_prompt.strip()}],
         "temperature": temperature,
-        "max_tokens": 1024,
+        "max_tokens": 4096,
         "stream": False
     }
     try:
