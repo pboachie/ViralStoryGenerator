@@ -5,12 +5,16 @@ import time
 import logging
 import os
 import datetime
+import json
 
 from viralStoryGenerator.llm import generate_story_script
 from viralStoryGenerator.source_cleanser import chunkify_and_summarize
 from viralStoryGenerator.elevenlabs_tts import generate_elevenlabs_audio
 
-def _save_story_output(result, topic):
+# Directory where failed audio generations are queued
+AUDIO_QUEUE_DIR = "AudioQueue"
+
+def _save_story_output(result, topic, voice_id=None):
     now = datetime.datetime.now()
     date_str = now.strftime("%Y-%m-%d")
     week_num = now.isocalendar().week
@@ -40,27 +44,100 @@ def _save_story_output(result, topic):
         mp3_file_path = os.path.join(folder_path, f"{base_name}.mp3")
 
         # We'll assume your ElevenLabs API key is stored somewhere
-        # e.g. ENV var, config file, or CLI argument
-        api_key = os.environ.get("ELEVENLABS_API_KEY", "sk_15cb1ec5322909d636dd3afb9223dd65578013807895d481")  # or pass from CLI
+        api_key = os.environ.get("ELEVENLABS_API_KEY", "sk_15cb1ec5322909d636dd3afb9223dd65578013807895d481")
         if not api_key:
             logging.warning("No ElevenLabs API Key found. Skipping TTS generation.")
             return
 
-        # Optionally let user pass a voice ID on the CLI or default
-        default_voice_id = None  # will revert to the default inside generate_elevenlabs_audio
+        # Use the provided voice_id (if any) or default to None
         success = generate_elevenlabs_audio(
             text=story_text,
             api_key=api_key,
             output_mp3_path=mp3_file_path,
-            voice_id=default_voice_id,    # or from CLI arg
-            model_id="eleven_monolingual_v2",  # or "eleven_multilingual_v2"
+            voice_id=voice_id,
+            model_id="eleven_monolingual_v2",
             stability=0.5,
             similarity_boost=0.75
         )
         if success:
             logging.info(f"Audio TTS saved to {mp3_file_path}")
         else:
-            logging.warning("Audio generation failed.")
+            logging.warning("Audio generation failed. Queueing for later re-generation.")
+            # Prepare metadata for retrying audio generation later
+            metadata = {
+                "topic": topic,
+                "story": story_text,
+                "mp3_file_path": mp3_file_path,
+                "voice_id": voice_id,
+                "model_id": "eleven_monolingual_v2",
+                "stability": 0.5,
+                "similarity_boost": 0.75,
+                "attempts": 1,
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+            queue_failed_audio(metadata)
+
+
+def queue_failed_audio(metadata):
+    """
+    Saves the metadata for a failed audio generation attempt into the AUDIO_QUEUE_DIR.
+    """
+    os.makedirs(AUDIO_QUEUE_DIR, exist_ok=True)
+    # Create a safe filename using the topic and current timestamp.
+    safe_topic = metadata.get("topic", "untitled").replace("/", "_").replace("\\", "_")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    filename = f"{safe_topic}_{timestamp}.json"
+    file_path = os.path.join(AUDIO_QUEUE_DIR, filename)
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=4)
+        logging.info(f"Queued failed audio generation to {file_path}")
+    except Exception as e:
+        logging.error(f"Failed to write queue file {file_path}: {e}")
+
+
+def process_audio_queue():
+    """
+    Scans the AUDIO_QUEUE_DIR for queued audio jobs and attempts to re-generate audio.
+    On success, the queued file is removed.
+    """
+    if not os.path.isdir(AUDIO_QUEUE_DIR):
+        return
+
+    for filename in os.listdir(AUDIO_QUEUE_DIR):
+        if filename.endswith(".json"):
+            file_path = os.path.join(AUDIO_QUEUE_DIR, filename)
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+            except Exception as e:
+                logging.error(f"Error reading queued file {file_path}: {e}")
+                continue
+
+            api_key = os.environ.get("ELEVENLABS_API_KEY", None)
+            if not api_key:
+                logging.error("No ElevenLabs API Key found. Skipping queued audio generation.")
+                break
+
+            logging.info(f"Attempting queued audio generation for {metadata.get('mp3_file_path')}")
+            success = generate_elevenlabs_audio(
+                text=metadata["story"],
+                api_key=api_key,
+                output_mp3_path=metadata["mp3_file_path"],
+                voice_id=metadata.get("voice_id"),
+                model_id=metadata.get("model_id", "eleven_monolingual_v2"),
+                stability=metadata.get("stability", 0.5),
+                similarity_boost=metadata.get("similarity_boost", 0.75)
+            )
+            if success:
+                logging.info(f"Queued audio generated successfully for {metadata.get('mp3_file_path')}. Removing from queue.")
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    logging.error(f"Could not remove queue file {file_path}: {e}")
+            else:
+                logging.warning(f"Queued audio generation failed for {metadata.get('mp3_file_path')}. Will retry on next run.")
+
 
 def _read_sources_from_folder(folder_path):
     """
@@ -86,6 +163,7 @@ def _read_sources_from_folder(folder_path):
     # Combine them into one big block of text separated by double newlines
     return "\n\n".join(combined_texts)
 
+
 def cli_main():
     parser = argparse.ArgumentParser(
         description="Generate short, informal story scripts via a local LLM endpoint."
@@ -107,6 +185,9 @@ def cli_main():
     args = parser.parse_args()
 
     start_exec = time.time()
+
+    # === Process any queued failed audio generations first ===
+    process_audio_queue()
 
     # 1) Read all the files from the sources folder into one combined text
     logging.info(f"Reading all files in folder '{args.sources_folder}' for sources...")
@@ -151,10 +232,27 @@ def cli_main():
         print(result)
 
     # 6) Save the final outputs
-    _save_story_output(result, args.topic)
+    _save_story_output(result, args.topic, voice_id=args.voice_id)
+
+    # 7) Generate storyboard from the story script (if available)
+    if result.get("story", "").strip():
+        try:
+            from viralStoryGenerator import storyboard
+            logging.info("Generating storyboard based on the story script...")
+            storyboard.generate_storyboard(
+                story=result["story"],
+                topic=args.topic,
+                llm_endpoint=args.endpoint,
+                model=args.model,
+                temperature=args.temperature,
+                voice_id=args.voice_id
+            )
+        except Exception as e:
+            logging.error(f"Storyboard generation failed: {e}")
 
     total_exec_time = time.time() - start_exec
     logging.info(f"Total execution time (CLI start to finish): {total_exec_time:.2f} seconds")
+
 
 if __name__ == "__main__":
     cli_main()
