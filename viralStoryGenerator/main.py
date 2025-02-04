@@ -11,32 +11,59 @@ from viralStoryGenerator.prompts.prompts import get_system_instructions, get_use
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# Precompiled regex patterns for efficiency
+THINK_PATTERN = re.compile(r'(<think>.*?</think>)', re.DOTALL)
+STORY_PATTERN = re.compile(r"(?s)### Story Script:\s*(.*?)\n### Video Description:")
+DESC_PATTERN = re.compile(r"### Video Description:\s*(.*)$")
+
+def _extract_chain_of_thought(text):
+    """
+    Extracts chain-of-thought from text using THINK_PATTERN.
+    Returns a tuple (clean_text, chain_of_thought).
+    """
+    match = THINK_PATTERN.search(text)
+    chain = ""
+    if match:
+        chain = match.group(1)
+        text = text.replace(chain, "").strip()
+    return text, chain
+
 def _reformat_text(raw_text, endpoint, model, temperature=0.7):
     """
     Makes a second LLM call to reformat 'raw_text' if the first attempt was off-format.
     """
     fix_prompt = get_fix_prompt(raw_text)
-
-    headers = {"Content-Type": "application/json"}
     data = {
         "model": model,
         "messages": [
             {"role": "user", "content": fix_prompt.strip()},
         ],
         "temperature": temperature,
-        "max_tokens": 1024,
+        "max_tokens": 4096,
         "stream": False
     }
 
     try:
-        response = requests.post(endpoint, headers=headers, data=json.dumps(data))
+        logging.info("Reformatting text using LLM...")
+        response = requests.post(endpoint, json=data, timeout=15)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        print(f"An error occurred while calling the LLM for reformatting: {e}")
+        logging.error(f"An error occurred while calling the LLM for reformatting: {e}")
         return raw_text  # fallback: just return the original
 
-    response_json = response.json()
-    return response_json["choices"][0]["message"]["content"]
+    try:
+        response_json = response.json()
+    except json.JSONDecodeError as e:
+        logging.error(f"JSON decode error during reformatting: {e}")
+        return raw_text
+
+    try:
+        content = response_json["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        logging.error(f"Unexpected response structure: {e}")
+        return raw_text
+
+    return content
 
 def _check_format(completion_text):
     """
@@ -45,12 +72,8 @@ def _check_format(completion_text):
       ### Video Description:
     Returns (story, description) if valid, else (None, None).
     """
-    # Use regex to capture the sections
-    story_pattern = r"(?s)### Story Script:\s*(.*?)\n### Video Description:"
-    desc_pattern = r"### Video Description:\s*(.*)$"
-
-    story_match = re.search(story_pattern, completion_text)
-    desc_match = re.search(desc_pattern, completion_text)
+    story_match = STORY_PATTERN.search(completion_text)
+    desc_match = DESC_PATTERN.search(completion_text)
 
     if story_match and desc_match:
         story = story_match.group(1).strip()
@@ -70,19 +93,13 @@ def generate_story_script(topic,
         ### Story Script:
         ### Video Description:
     """
-
-    # System-level or top-level instructions (reinforce format)
     system_instructions = get_system_instructions()
-
     user_prompt = get_user_prompt(topic, sources).strip()
 
-    headers = {"Content-Type": "application/json"}
     data = {
         "model": model,
         "messages": [
-            # System message:
             {"role": "system", "content": system_instructions},
-            # User message:
             {"role": "user", "content": user_prompt}
         ],
         "temperature": temperature,
@@ -90,10 +107,9 @@ def generate_story_script(topic,
         "stream": False
     }
 
-    # Start timer for generation
     start_time = time.time()
     try:
-        response = requests.post(endpoint, headers=headers, data=json.dumps(data))
+        response = requests.post(endpoint, json=data, timeout=30)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
         logging.error(f"Error calling the LLM: {e}")
@@ -106,39 +122,45 @@ def generate_story_script(topic,
         }
     generation_time = time.time() - start_time
 
-    response_json = response.json()
-    # Capture token usage if available
+    try:
+        response_json = response.json()
+    except json.JSONDecodeError as e:
+        logging.error(f"Error decoding JSON response: {e}")
+        return {
+            "story": "",
+            "video_description": "",
+            "thinking": "",
+            "generation_time": generation_time,
+            "usage": {}
+        }
+
     usage_info = response_json.get("usage", {})
+    try:
+        completion_text = response_json["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        logging.error(f"Unexpected response structure: {e}")
+        return {
+            "story": "",
+            "video_description": "",
+            "thinking": "",
+            "generation_time": generation_time,
+            "usage": usage_info
+        }
 
-    completion_text = response_json["choices"][0]["message"]["content"]
+    # Extract chain-of-thought if present
+    completion_text, thinking = _extract_chain_of_thought(completion_text)
 
-    # Always try to extract chain-of-thought and remove it from final text
-    thinking = ""
-    match = re.search(r'(<think>.*?</think>)', completion_text, re.DOTALL)
-    if match:
-        thinking = match.group(1)
-        # Always remove it from the final text
-        completion_text = completion_text.replace(thinking, "").strip()
-
-    # 2) Check if format is correct
+    # Check if format is correct
     story, description = _check_format(completion_text)
     if story is None or description is None:
         logging.info("Initial completion was off-format. Attempting reformatting...")
-        # Attempt to reformat
         fixed_text = _reformat_text(completion_text, endpoint, model, temperature)
-
-        # Check again for chain-of-thought in the re-formatted text
-        match = re.search(r'(<think>.*?</think>)', fixed_text, re.DOTALL)
-        if match:
-            # If we didn't capture anything before, store it now
-            if not thinking:
-                thinking = match.group(1)
-            # Remove from final text
-            fixed_text = fixed_text.replace(match.group(1), "").strip()
-
+        fixed_text, extra_thinking = _extract_chain_of_thought(fixed_text)
+        if not thinking and extra_thinking:
+            thinking = extra_thinking
         story, description = _check_format(fixed_text)
         if story is None or description is None:
-            # Return partially if still not formatted
+            logging.warning("Reformatting did not produce the expected format; returning raw output.")
             return {
                 "story": completion_text,
                 "video_description": "",
