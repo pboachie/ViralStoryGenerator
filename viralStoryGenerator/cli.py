@@ -213,8 +213,7 @@ def cli_main():
         sources=cleansed_sources,
         endpoint=args.endpoint,
         model=args.model,
-        temperature=args.temperature,
-        show_thinking=args.show_thinking
+        temperature=args.temperature
     )
 
     # 4) Print chain-of-thought if requested
@@ -235,20 +234,7 @@ def cli_main():
     _save_story_output(result, args.topic, voice_id=args.voice_id)
 
     # 7) Generate storyboard from the story script (if available)
-    if result.get("story", "").strip():
-        try:
-            from viralStoryGenerator import storyboard
-            logging.info("Generating storyboard based on the story script...")
-            storyboard.generate_storyboard(
-                story=result["story"],
-                topic=args.topic,
-                llm_endpoint=args.endpoint,
-                model=args.model,
-                temperature=args.temperature,
-                voice_id=args.voice_id
-            )
-        except Exception as e:
-            logging.error(f"Storyboard generation failed: {e}")
+
 
     total_exec_time = time.time() - start_exec
     logging.info(f"Total execution time (CLI start to finish): {total_exec_time:.2f} seconds")

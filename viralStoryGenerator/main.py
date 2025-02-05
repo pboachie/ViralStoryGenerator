@@ -39,7 +39,7 @@ def _reformat_text(raw_text, endpoint, model, temperature=0.7):
             {"role": "user", "content": fix_prompt.strip()},
         ],
         "temperature": temperature,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "stream": False
     }
 
@@ -103,7 +103,7 @@ def generate_story_script(topic,
             {"role": "user", "content": user_prompt}
         ],
         "temperature": temperature,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "stream": False
     }
 

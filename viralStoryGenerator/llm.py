@@ -5,6 +5,7 @@ import json
 import re
 import time
 import logging
+from viralStoryGenerator.storyboard import generate_storyboard
 from viralStoryGenerator.prompts.prompts import get_system_instructions, get_user_prompt, get_fix_prompt
 
 # Configure basic logging
@@ -18,7 +19,7 @@ def _reformat_text(raw_text, endpoint, model, temperature=0.7):
         "model": model,
         "messages": [{"role": "user", "content": fix_prompt.strip()}],
         "temperature": temperature,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "stream": False
     }
     try:
@@ -46,8 +47,7 @@ def generate_story_script(topic,
                           sources,
                           endpoint="http://192.168.1.190:1234/v1/chat/completions",
                           model="deepseek-r1-distill-qwen-14b@q4_k_m",
-                          temperature=0.7,
-                          show_thinking=False):
+                          temperature=0.7):
     system_instructions = get_system_instructions()
     user_prompt = get_user_prompt(topic, sources)
 
@@ -59,7 +59,7 @@ def generate_story_script(topic,
             {"role": "user", "content": user_prompt}
         ],
         "temperature": temperature,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "stream": False
     }
     start_time = time.time()
@@ -73,7 +73,8 @@ def generate_story_script(topic,
             "video_description": "",
             "thinking": "",
             "generation_time": 0,
-            "usage": {}
+            "usage": {},
+            "storyboard": ""
         }
     generation_time = time.time() - start_time
     response_json = response.json()
@@ -84,6 +85,7 @@ def generate_story_script(topic,
     if match:
         thinking = match.group(1)
         completion_text = completion_text.replace(thinking, "").strip()
+
     story, description = _check_format(completion_text)
     if story is None or description is None:
         fixed_text = _reformat_text(completion_text, endpoint, model, temperature)
