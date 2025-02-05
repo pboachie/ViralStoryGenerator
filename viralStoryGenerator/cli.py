@@ -55,7 +55,7 @@ def _save_story_output(result, topic, voice_id=None):
             api_key=api_key,
             output_mp3_path=mp3_file_path,
             voice_id=voice_id,
-            model_id="eleven_monolingual_v2",
+            model_id="eleven_multilingual_v2",
             stability=0.5,
             similarity_boost=0.75
         )
@@ -69,7 +69,7 @@ def _save_story_output(result, topic, voice_id=None):
                 "story": story_text,
                 "mp3_file_path": mp3_file_path,
                 "voice_id": voice_id,
-                "model_id": "eleven_monolingual_v2",
+                "model_id": "eleven_multilingual_v2",
                 "stability": 0.5,
                 "similarity_boost": 0.75,
                 "attempts": 1,
@@ -125,7 +125,7 @@ def process_audio_queue():
                 api_key=api_key,
                 output_mp3_path=metadata["mp3_file_path"],
                 voice_id=metadata.get("voice_id"),
-                model_id=metadata.get("model_id", "eleven_monolingual_v2"),
+                model_id=metadata.get("model_id", "eleven_multilingual_v2"),
                 stability=metadata.get("stability", 0.5),
                 similarity_boost=metadata.get("similarity_boost", 0.75)
             )

@@ -6,66 +6,63 @@ def get_system_instructions():
         "You are a Viral Content Specialist AI that creates engaging social media stories from raw information sources.\n\n"
 
         "## Task\n"
-        "Convert provided source material into two exactly formatted sections:\n"
-        "1. A 1.5-minute narrated story script\n"
-        "2. A 100-character video description with hashtags\n\n"
+        "Convert source material into two formatted sections:\n"
+        "1. 1.5-minute narrated story script (~220 words)\n"
+        "2. 100-character video description with hashtags\n\n"
 
         "## Guidelines\n"
         "### Story Script Requirements:\n"
-        "- Informal, conversational tone using contractions (don't, can't)\n"
-        "- 3-5 short paragraphs (45-70 words total)\n"
-        "- Open with a hook/question (e.g., 'Did you hear about...?')\n"
-        "- Include controversial elements from sources\n"
-        "- NO scenes, stage directions, or technical terms\n"
-        "- NO bullet points, markdown, or special formatting\n\n"
+        "- Conversational, engaging tone with contractions (don't, you're)\n"
+        "- 3-4 paragraphs (200-220 words total)\n"
+        "- Start with a bold, attention-grabbing hook/question (no markdown formatting)\n"
+        "- Highlight conflicts/controversies\n"
+        "- Present unconfirmed/unclear details as rumors or speculation\n"
+        "- NO technical terms or scene directions\n\n"
 
         "### Video Description Requirements:\n"
-        "- Exactly 1 line <=100 characters\n"
-        "- Include 3-5 relevant hashtags (e.g., #TechDrama #AIUpdate)\n"
-        "- No emojis or special characters\n\n"
+        "- 1 line ≤100 characters (incl. spaces)\n"
+        "- 3-5 relevant hashtags (e.g., #TechDrama #AIUpdate #NVIDIA)\n"
+        "- NO emojis/special characters\n\n"
 
         "## Output Format\n"
-        "EXACTLY two sections in this order:\n"
-        "### Story Script:\n"
-        "[Your narrative text here. No section headers or labels]\n\n"
-        "### Video Description:\n"
-        "[Your one-line description here] #Hashtag1 #Hashtag2\n\n"
+        "EXACTLY two unlabeled sections in order:\n\n"
+        "[Story script text]\n\n"
+        "[Description] #Hashtag1 #Hashtag2\n\n"
 
         "## Examples\n"
-        "✅ CORRECT FORMAT:\n"
-        "### Story Script:\n"
-        "Did you hear about the AI that leaked its own training data? Sources say...\n\n"
-        "### Video Description:\n"
-        "AI goes rogue in data leak scandal #AISafety #TechNews #DataPrivacy\n\n"
-
-        "❌ INCORRECT FORMAT:\n"
-        "[Scene 1: Closeup of computer screen] The AI system... (includes scene directions)\n"
-        "Description: Check out this crazy AI story! 🤯 (contains emoji)"
+        "✅ CORRECT:\n"
+        "Did you know Instagram secretly ranks users by attractiveness? Former engineers claim... (3 paragraphs, 215 words)\n\n"
+        "Instagram beauty algorithm exposed #SocialMediaSecrets #AIControversy #MetaNews\n\n"
+        "❌ INCORRECT:\n"
+        "[Scene: Smartphone closeup] Instagram's algorithm... (scene directions)\n"
+        "Description: Shocking Insta truth! 😱 (emoji)"
     )
 
 def get_user_prompt(topic, sources):
     return f"""
 ## Source Material Analysis
 Analyze these {topic} sources and identify:
-1. Core controversy/unique angle
-2. Key technical failures mentioned
-3. Speculative elements from leaks
-4. Industry reactions if available
+1. Core controversy or unique angle
+2. Key technical issues or failures (explain simply, avoid jargon)
+3. Unconfirmed or speculative claims from leaks (treat as rumors)
+4. Industry or public reactions if available
 
 ## Story Requirements
-Transform the key points into a viral narrative:
-- Start with attention-grabbing hook
-- Explain technical issues simply (avoid jargon)
-- Weave in 2-3 controversial elements from sources
-- End with open question/potential implications
+Transform these key points into a spicy, viral narrative:
+- Start with a bold, attention-grabbing hook
+- Use short, punchy sentences for drama
+- Weave in 2-3 controversial elements from the sources
+- Treat unverified info as 'alleged' or 'rumored'
+- End with an open question about possible implications
 
 ## Formatting Rules
 STRICTLY follow this structure:
+
 ### Story Script:
-[Your story text in 3-5 short paragraphs. No markdown]
+[Your story text in 3-5 short paragraphs, Must be a minumum of 200-220 words total. No markdown]
 
 ### Video Description:
-[Max 100 chars] [3-5 hashtags from these categories: {topic} genre, key entities, emotions]
+[Single line, ≤100 chars, 3-5 hashtags related to {topic}, key entities, emotions]
 
 ## Example Output
 Sources: "Internal memo suggests CEO knew about security flaws... Reddit leaks show prototype images..."
@@ -85,29 +82,36 @@ Generate story script and description now.
 def get_fix_prompt(raw_text):
     return f"""
 ## Error Analysis
-The previous response violated format rules. Issues found:
-- {_identify_errors(raw_text)}
+The previous response did not follow the required format. Issues detected include:
+- The story script did not meet the required 200-220 words spread over 3-4 paragraphs.
+- It did not start with a clear, bold, attention-grabbing hook/question.
+- The video description may have exceeded 100 characters, lacked the proper 3-5 hashtags, or included extra formatting.
+- Extraneous markdown, labels, or scene directions were present.
 
 ## Correction Instructions
-Reformat to EXACTLY:
-### Story Script:
-[Story text without sections/scenes]
+Please generate a corrected version that outputs EXACTLY two unlabeled sections (with no markdown headers or extra text), following these rules:
 
-### Video Description:
-[100-char line] [Hashtags]
+1. **Story Script:**
+   - A 1.5-minute narrated story script of approximately 220 words.
+   - Composed of 3-4 short paragraphs.
+   - Must begin with a bold, attention-grabbing hook/question (presented in plain text, not markdown).
+   - Written in a conversational, engaging tone using contractions.
+   - Weave in at least 2-3 controversial elements and present any unconfirmed details as 'alleged' or 'rumored'.
+   - Avoid technical terms, scene directions, or any extraneous labels.
 
-## Example Fix
-❌ Incorrect:
-[Video Description] CEO controversy erupts! #News
+2. **Video Description:**
+   - A single line of text containing 100 characters or fewer (including spaces).
+   - Must include 3-5 relevant hashtags (without emojis or special characters).
 
-✅ Correct:
-### Video Description:
-CEO knew about security flaws? #TechScandal #CorporateDrama
+## Example (Correct Format)
+Did you know top execs might have been hiding serious security flaws? Rumors now swirl after internal leaks suggested that critical vulnerabilities were kept under wraps, leaving many to wonder about what else might be concealed. The tension builds as industry insiders debate whether this was a calculated risk or a colossal oversight. With whispers of boardroom conspiracies and conflicting reports, the drama only intensifies as more details emerge. Is this the beginning of a corporate scandal that could shake the entire tech world?
+
+CEO knew about security flaws? #TechScandal #DataLeak #CorporateDrama
 
 ## Faulty Output:
 {raw_text}
 
-Generate corrected version:
+Generate the corrected version now.
 """.strip()
 
 def get_storyboard_prompt(story):

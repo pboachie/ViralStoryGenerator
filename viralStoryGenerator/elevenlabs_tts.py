@@ -1,10 +1,9 @@
-# viralStoryGenerator/elevenlabs_tts.py
-
 import requests
 import logging
 import time
+import json
 
-DEFAULT_VOICE_ID = "JZ3e95uoTACVf6tXaaEi"  # Johnny - Upbeat Professional American...
+DEFAULT_VOICE_ID = "JZ3e95uoTACVf6tXaaEi"
 DEFAULT_MODEL_ID = "eleven_multilingual_v2"
 
 def generate_elevenlabs_audio(
@@ -15,16 +14,11 @@ def generate_elevenlabs_audio(
     model_id=DEFAULT_MODEL_ID,
     stability=0.5,
     similarity_boost=0.75,
-    timeout=10  # Timeout parameter in seconds
+    timeout=90  # Timeout parameter in seconds
 ):
     """
     Calls ElevenLabs TTS API to convert 'text' into speech, saving the result as MP3 at 'output_mp3_path'.
-
-    - If 'voice_id' is not provided, uses a default.
-    - Adjust stability/similarity_boost as desired.
-    - Retries the request up to 3 times if it fails.
-    - Uses a timeout for the API request.
-    - Provides detailed logging and error handling.
+    Additional request and response objects are dumped for better debugging.
     """
     if not voice_id:
         voice_id = DEFAULT_VOICE_ID
@@ -46,20 +40,23 @@ def generate_elevenlabs_audio(
     }
 
     max_retries = 3
+    response = None
+
     for attempt in range(1, max_retries + 1):
         try:
-            logging.info(
-                f"Attempt {attempt}/{max_retries}: Sending TTS request to ElevenLabs for voice_id='{voice_id}' with timeout={timeout}s..."
-            )
+            logging.info(f"Attempt {attempt}/{max_retries}: Sending TTS request to ElevenLabs for voice_id='{voice_id}' with timeout={timeout}s...")
+            logging.debug(f"URL: {url}")
+            logging.debug(f"Headers: {headers}")
+            logging.debug(f"Payload: {json.dumps(payload, indent=2)}")
             response = requests.post(url, headers=headers, json=payload, timeout=timeout)
             response.raise_for_status()
             logging.debug(f"TTS response status code: {response.status_code}")
-            # Request succeeded, break out of retry loop
             break
         except requests.exceptions.Timeout as e:
             logging.error(f"Attempt {attempt} timed out after {timeout}s: {e}")
         except requests.exceptions.HTTPError as e:
-            logging.error(f"HTTP error during attempt {attempt}: {e}")
+            error_content = response.text if response is not None else "No response"
+            logging.error(f"HTTP error during attempt {attempt}: {e}. Response content: {error_content}")
         except requests.exceptions.RequestException as e:
             logging.error(f"Request exception during attempt {attempt}: {e}")
         except Exception as e:
@@ -68,11 +65,10 @@ def generate_elevenlabs_audio(
         if attempt == max_retries:
             logging.error("All attempts failed, giving up on audio generation.")
             return False
-        # Wait a moment before retrying
+
         logging.info("Retrying TTS request...")
         time.sleep(1)
 
-    # Save the MP3 file
     try:
         with open(output_mp3_path, "wb") as f:
             f.write(response.content)
