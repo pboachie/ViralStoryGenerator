@@ -1,20 +1,19 @@
 # viralStoryGenerator/src/cli.py
 import argparse
 import time
-import logging
 import os
 import datetime
 import json
-from dotenv import load_dotenv
 
 from viralStoryGenerator.src.llm import generate_story_script
 from viralStoryGenerator.src.source_cleanser import chunkify_and_summarize
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
+from viralStoryGenerator.src.logger import logger as _logger
+from viralStoryGenerator.utils import config
 
 # Directory where failed audio generations are queued
 AUDIO_QUEUE_DIR = os.environ.get("AUDIO_QUEUE_DIR", "AudioQueue")
-load_dotenv()
-
+appconfig = config.config
 
 def _save_story_output(result, topic, voice_id=None):
     now = datetime.datetime.now()
@@ -36,7 +35,7 @@ def _save_story_output(result, topic, voice_id=None):
         f.write("\n\n### Video Description:\n")
         f.write(result.get("video_description", ""))
 
-    logging.info(f"Story saved to {txt_file_path}")
+    _logger.info(f"Story saved to {txt_file_path}")
 
     # Also generate audio from the story (if we have content)
     story_text = result.get("story", "")
@@ -46,9 +45,9 @@ def _save_story_output(result, topic, voice_id=None):
         mp3_file_path = os.path.join(folder_path, f"{base_name}.mp3")
 
         # We'll assume your ElevenLabs API key is stored somewhere
-        api_key = os.environ.get("ELEVENLABS_API_KEY", "sk_15cb1ec5322909d636dd3afb9223dd65578013807895d481")
+        api_key = appconfig.elevenLabs.API_KEY
         if not api_key:
-            logging.warning("No ElevenLabs API Key found. Skipping TTS generation.")
+            _logger.warning("No ElevenLabs API Key found. Skipping TTS generation.")
             return
 
         # Use the provided voice_id (if any) or default to None
@@ -62,9 +61,9 @@ def _save_story_output(result, topic, voice_id=None):
             similarity_boost=0.75
         )
         if success:
-            logging.info(f"Audio TTS saved to {mp3_file_path}")
+            _logger.info(f"Audio TTS saved to {mp3_file_path}")
         else:
-            logging.warning("Audio generation failed. Queueing for later re-generation.")
+            _logger.warning("Audio generation failed. Queueing for later re-generation.")
             # Prepare metadata for retrying audio generation later
             metadata = {
                 "topic": topic,
@@ -93,9 +92,9 @@ def queue_failed_audio(metadata):
     try:
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=4)
-        logging.info(f"Queued failed audio generation to {file_path}")
+        _logger.info(f"Queued failed audio generation to {file_path}")
     except Exception as e:
-        logging.error(f"Failed to write queue file {file_path}: {e}")
+        _logger.error(f"Failed to write queue file {file_path}: {e}")
 
 
 def process_audio_queue():
@@ -113,15 +112,15 @@ def process_audio_queue():
                 with open(file_path, "r", encoding="utf-8") as f:
                     metadata = json.load(f)
             except Exception as e:
-                logging.error(f"Error reading queued file {file_path}: {e}")
+                _logger.error(f"Error reading queued file {file_path}: {e}")
                 continue
 
-            api_key = os.environ.get("ELEVENLABS_API_KEY", "sk_15cb1ec5322909d636dd3afb9223dd65578013807895d481")
+            api_key = appconfig.elevenLabs.API_KEY
             if not api_key:
-                logging.error("No ElevenLabs API Key found. Skipping queued audio generation.")
+                _logger.error("No ElevenLabs API Key found. Skipping queued audio generation.")
                 break
 
-            logging.info(f"Attempting queued audio generation for {metadata.get('mp3_file_path')}")
+            _logger.info(f"Attempting queued audio generation for {metadata.get('mp3_file_path')}")
             success = generate_elevenlabs_audio(
                 text=metadata["story"],
                 api_key=api_key,
@@ -132,13 +131,13 @@ def process_audio_queue():
                 similarity_boost=metadata.get("similarity_boost", 0.75)
             )
             if success:
-                logging.info(f"Queued audio generated successfully for {metadata.get('mp3_file_path')}. Removing from queue.")
+                _logger.info(f"Queued audio generated successfully for {metadata.get('mp3_file_path')}. Removing from queue.")
                 try:
                     os.remove(file_path)
                 except Exception as e:
-                    logging.error(f"Could not remove queue file {file_path}: {e}")
+                    _logger.error(f"Could not remove queue file {file_path}: {e}")
             else:
-                logging.warning(f"Queued audio generation failed for {metadata.get('mp3_file_path')}. Will retry on next run.")
+                _logger.warning(f"Queued audio generation failed for {metadata.get('mp3_file_path')}. Will retry on next run.")
 
 
 def _read_sources_from_folder(folder_path):
@@ -148,7 +147,7 @@ def _read_sources_from_folder(folder_path):
     """
     combined_texts = []
     if not os.path.isdir(folder_path):
-        logging.warning(f"Sources folder does not exist: {folder_path}")
+        _logger.warning(f"Sources folder does not exist: {folder_path}")
         return ""
 
     for filename in os.listdir(folder_path):
@@ -160,7 +159,7 @@ def _read_sources_from_folder(folder_path):
                     if text:
                         combined_texts.append(text)
             except Exception as e:
-                logging.error(f"Failed to read {file_path}: {e}")
+                _logger.error(f"Failed to read {file_path}: {e}")
 
     # Combine them into one big block of text separated by double newlines
     return "\n\n".join(combined_texts)
@@ -170,45 +169,47 @@ def cli_main():
     parser = argparse.ArgumentParser(
         description="Generate short, informal story scripts via a local LLM endpoint."
     )
-    parser.add_argument("--topic", required=True, help="Topic for the story script")
-    parser.add_argument("--sources-folder", default="sources", help="Folder with source files")
+    parser.add_argument("--topic",type=str, required=True, help="Topic for the story script")
+    parser.add_argument("--sources-folder", type=str, default=appconfig.SOURCES_FOLDER, help="Folder with source files")
 
-    parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", "http://localhost:1234/v1/chat/completions"),
+    parser.add_argument("--endpoint", type=str, default=appconfig.llm.ENDPOINT,
                         help="Local LLM API endpoint.")
-    parser.add_argument("--model", default=os.getenv("LLM_MODEL"),
+    parser.add_argument("--model", type=str, default=appconfig.llm.MODEL,
                         help="Which model to use for generating the story.")
     temperature_default = 0.7
     try:
-        temperature_default = float(os.getenv("LLM_TEMPRATURE", 0.7))
+        temperature_default = float(appconfig.llm.TEMPERATURE)
     except (ValueError, TypeError):
-        logging.warning("Invalid LLM_TEMPRATURE environment variable. Using default value of 0.7.")
+        _logger.warning("Invalid LLM_TEMPRATURE configuration variable. Using default value of 0.7.")
 
     parser.add_argument("--temperature", type=float, default=temperature_default,
                         metavar="T", choices=[0.0, 0.2, 0.5, 0.7, 1.0],
                         help="Sampling temperature (higher => more random).")
-    parser.add_argument("--show-thinking", action="store_true", default=os.getenv("LLM_SHOW_THINKING", False),
+    parser.add_argument("--show-thinking", action="store_true", default=appconfig.llm.SHOW_THINKING,
                         help="If passed, print chain-of-thought (if available).")
-    parser.add_argument("--chunk-size", type=int, default=os.getenv("LLM_CHUNK_SIZE", 1000),
+    parser.add_argument("--chunk-size", type=int, default=os.getenv("LLM_CHUNK_SIZE", 5000),
                         help="Word chunk size for splitting sources.")
     # Optionally add --voice-id if you want user to specify a voice
-    parser.add_argument("--voice-id", default=os.getenv("ELEVENLABS_VOICE_ID", None), help="ElevenLabs voice ID override")
+    parser.add_argument("--voice-id", type=str, default=os.getenv("ELEVENLABS_VOICE_ID", None), help="ElevenLabs voice ID override")
     args = parser.parse_args()
 
     if not args.model:
         raise ValueError("The --model argument must be provided, either via command line or the LLM_MODEL environment variable.")
 
     start_exec = time.time()
-
     # === Process any queued failed audio generations first ===
-    process_audio_queue()
+    # process_audio_queue()
+
+    raw_sources = None
 
     # 1) Read all the files from the sources folder into one combined text
-    logging.info(f"Reading all files in folder '{args.sources_folder}' for sources...")
-    raw_sources = _read_sources_from_folder(args.sources_folder)
+    if args.sources_folder and len(args.sources_folder) >= 1:
+        _logger.debug(f"Reading all files in folder '{args.sources_folder}' for sources...")
+        raw_sources = _read_sources_from_folder(args.sources_folder)
 
     # 2) Chunkify & Summarize them into a single cohesive summary
-    if raw_sources.strip():
-        logging.info("Splitting & summarizing sources via LLM (multi-chunk)...")
+    if raw_sources and raw_sources.strip():
+        _logger.debug("Splitting & summarizing sources via LLM (multi-chunk)...")
         cleansed_sources = chunkify_and_summarize(
             raw_sources=raw_sources,
             endpoint=args.endpoint,
@@ -216,18 +217,24 @@ def cli_main():
             temperature=args.temperature,
             chunk_size=args.chunk_size
         )
-        logging.info("Sources cleansed. Proceeding with story generation...")
+        _logger.debug("Sources cleansed. Proceeding with story generation...")
     else:
+        _logger.debug("No sources found. Skipping cleansing step.")
         cleansed_sources = ""
 
     # 3) Generate the story script from these cleansed/merged sources
+
     result = generate_story_script(
         topic=args.topic,
         sources=cleansed_sources,
         endpoint=args.endpoint,
         model=args.model,
-        temperature=args.temperature
+        temperature=args.temperature,
+        show_thinking=args.show_thinking
     )
+
+    print(f"=== STORY GENERATION RESULT ===\n{result}")
+    exit()
 
     # 4) Print chain-of-thought if requested
     if args.show_thinking and result.get("thinking"):
@@ -254,7 +261,7 @@ def cli_main():
 
 
     total_exec_time = time.time() - start_exec
-    logging.info(f"Total execution time (CLI start to finish): {total_exec_time:.2f} seconds")
+    _logger.info(f"Total execution time (CLI start to finish): {total_exec_time:.2f} seconds")
 
 
 if __name__ == "__main__":
