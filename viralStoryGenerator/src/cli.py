@@ -1,18 +1,20 @@
-# viralStoryGenerator/cli.py
-
+# viralStoryGenerator/src/cli.py
 import argparse
 import time
 import logging
 import os
 import datetime
 import json
+from dotenv import load_dotenv
 
 from viralStoryGenerator.src.llm import generate_story_script
 from viralStoryGenerator.src.source_cleanser import chunkify_and_summarize
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
 
 # Directory where failed audio generations are queued
-AUDIO_QUEUE_DIR = "AudioQueue"
+AUDIO_QUEUE_DIR = os.environ.get("AUDIO_QUEUE_DIR", "AudioQueue")
+load_dotenv()
+
 
 def _save_story_output(result, topic, voice_id=None):
     now = datetime.datetime.now()
@@ -170,19 +172,30 @@ def cli_main():
     )
     parser.add_argument("--topic", required=True, help="Topic for the story script")
     parser.add_argument("--sources-folder", default="sources", help="Folder with source files")
-    parser.add_argument("--endpoint", default="http://192.168.1.190:1234/v1/chat/completions",
+
+    parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", "http://localhost:1234/v1/chat/completions"),
                         help="Local LLM API endpoint.")
-    parser.add_argument("--model", default="deepseek-r1-distill-qwen-14b@q4_k_m",
+    parser.add_argument("--model", default=os.getenv("LLM_MODEL"),
                         help="Which model to use for generating the story.")
-    parser.add_argument("--temperature", type=float, default=0.7,
+    temperature_default = 0.7
+    try:
+        temperature_default = float(os.getenv("LLM_TEMPRATURE", 0.7))
+    except (ValueError, TypeError):
+        logging.warning("Invalid LLM_TEMPRATURE environment variable. Using default value of 0.7.")
+
+    parser.add_argument("--temperature", type=float, default=temperature_default,
+                        metavar="T", choices=[0.0, 0.2, 0.5, 0.7, 1.0],
                         help="Sampling temperature (higher => more random).")
-    parser.add_argument("--show-thinking", action="store_true",
+    parser.add_argument("--show-thinking", action="store_true", default=os.getenv("LLM_SHOW_THINKING", False),
                         help="If passed, print chain-of-thought (if available).")
-    parser.add_argument("--chunk-size", type=int, default=1500,
+    parser.add_argument("--chunk-size", type=int, default=os.getenv("LLM_CHUNK_SIZE", 1000),
                         help="Word chunk size for splitting sources.")
     # Optionally add --voice-id if you want user to specify a voice
-    parser.add_argument("--voice-id", default=None, help="ElevenLabs voice ID override")
+    parser.add_argument("--voice-id", default=os.getenv("ELEVENLABS_VOICE_ID", None), help="ElevenLabs voice ID override")
     args = parser.parse_args()
+
+    if not args.model:
+        raise ValueError("The --model argument must be provided, either via command line or the LLM_MODEL environment variable.")
 
     start_exec = time.time()
 
