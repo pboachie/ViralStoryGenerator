@@ -148,7 +148,7 @@ CEO knew about security flaws? #TechScandal #DataLeak #CorporateDrama
 ## Current Sources:
 {sources}
 
-Generate story script and description now.
+Generate story script and description now using the source(s) provided tailored for the age group 13-25 years old. Be sure to use info from the sources if any..
 """.strip()
 
 def get_fix_prompt(raw_text):
