@@ -5,3 +5,5 @@ __pycache__
 .env
 *.txt
 *.mp3
+*launch.json
+*_cache.db*
