@@ -7,6 +7,7 @@ import re
 import time
 import logging
 from viralStoryGenerator.prompts.prompts import get_system_instructions, get_user_prompt, get_fix_prompt
+from viralStoryGenerator.src.cli import cli_main
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -179,7 +180,6 @@ def generate_story_script(topic,
         "usage": usage_info
     }
 
-from viralStoryGenerator.cli import cli_main
 
 if __name__ == "__main__":
     cli_main()

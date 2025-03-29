@@ -5,7 +5,7 @@ import json
 import re
 import time
 import logging
-from viralStoryGenerator.storyboard import generate_storyboard
+from viralStoryGenerator.src.storyboard import generate_storyboard
 from viralStoryGenerator.prompts.prompts import get_system_instructions, get_user_prompt, get_fix_prompt
 
 # Configure basic logging
@@ -87,6 +87,34 @@ def generate_story_script(topic,
         completion_text = completion_text.replace(thinking, "").strip()
 
     story, description = _check_format(completion_text)
+
+    # Generate the storyboard
+    if story.strip():
+        try:
+            logging.info("Generating storyboard based on the story script...")
+
+            storyboard = generate_storyboard(
+                story=story,
+                topic=topic,
+                llm_endpoint=endpoint,
+                model=model,
+                temperature=temperature,
+                voice_id=None
+            )
+
+            logging.info("Storyboard generation successful.")
+
+        except Exception as e:
+            logging.error(f"Storyboard generation failed: {e}")
+            return {
+                "story": "",
+                "video_description": "",
+                "thinking": "",
+                "generation_time": 0,
+                "usage": {},
+                "storyboard": ""
+            }
+
     if story is None or description is None:
         fixed_text = _reformat_text(completion_text, endpoint, model, temperature)
         match = re.search(r'(<think>.*?</think>)', fixed_text, re.DOTALL)
@@ -100,7 +128,8 @@ def generate_story_script(topic,
                 "video_description": "",
                 "thinking": thinking,
                 "generation_time": generation_time,
-                "usage": usage_info
+                "usage": usage_info,
+                "storyboard": ""
             }
         else:
             completion_text = fixed_text
@@ -109,5 +138,6 @@ def generate_story_script(topic,
         "video_description": description,
         "thinking": thinking,
         "generation_time": generation_time,
-        "usage": usage_info
+        "usage": usage_info,
+        "storyboard": storyboard
     }

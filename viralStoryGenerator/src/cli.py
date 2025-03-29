@@ -7,9 +7,9 @@ import os
 import datetime
 import json
 
-from viralStoryGenerator.llm import generate_story_script
-from viralStoryGenerator.source_cleanser import chunkify_and_summarize
-from viralStoryGenerator.elevenlabs_tts import generate_elevenlabs_audio
+from viralStoryGenerator.src.llm import generate_story_script
+from viralStoryGenerator.src.source_cleanser import chunkify_and_summarize
+from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
 
 # Directory where failed audio generations are queued
 AUDIO_QUEUE_DIR = "AudioQueue"
@@ -114,7 +114,7 @@ def process_audio_queue():
                 logging.error(f"Error reading queued file {file_path}: {e}")
                 continue
 
-            api_key = os.environ.get("ELEVENLABS_API_KEY", None)
+            api_key = os.environ.get("ELEVENLABS_API_KEY", "sk_15cb1ec5322909d636dd3afb9223dd65578013807895d481")
             if not api_key:
                 logging.error("No ElevenLabs API Key found. Skipping queued audio generation.")
                 break
@@ -218,14 +218,18 @@ def cli_main():
 
     # 4) Print chain-of-thought if requested
     if args.show_thinking and result.get("thinking"):
-        print("\n=== CHAIN-OF-THOUGHT (DEBUG) ===")
-        print(result["thinking"], "\n")
+        print("\n=== STORY CHAIN-OF-THOUGHT (DEBUG) ===")
+        print(result.get("thinking", ""))
+
+        print("\n=== STORYBOARD CHAIN-OF-THOUGHT (DEBUG) ===")
+        print(result.get("storyboard", {}).get("thinking", ""))
 
     # 5) Print final story
-    if "story" in result and "video_description" in result and result["story"]:
+    if "story" in result and "video_description" in result and 'storyboard' in result and result["story"] and result["video_description"] and result['storyboard']:
         print("\n=== AGENT OUTPUT ===")
         print(f"### Story Script:\n{result['story']}\n")
         print(f"### Video Description:\n{result['video_description']}\n")
+        print(f"### Storyboard:\n{result['storyboard']['scenes']}\n")
     else:
         print("\n=== RAW OUTPUT (Unformatted) ===")
         print(result)

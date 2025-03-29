@@ -3,9 +3,9 @@ import json
 import logging
 import datetime
 import requests
-import re  # Imported for chain-of-thought extraction
+import re
 
-from viralStoryGenerator.elevenlabs_tts import generate_elevenlabs_audio
+from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
 from viralStoryGenerator.prompts.prompts import get_storyboard_prompt
 
 # Configure logging (if not already configured globally)
@@ -64,6 +64,7 @@ def generate_storyboard_structure(story, llm_endpoint, model, temperature):
 
     try:
         storyboard_data = json.loads(content)
+        storyboard_data["thinking"] = thinking
 
     except Exception as e:
         logging.error(f"Failed to parse storyboard JSON: {e}")
@@ -120,6 +121,7 @@ def generate_storyboard(story, topic, llm_endpoint, model, temperature, voice_id
     if not storyboard_data or "scenes" not in storyboard_data:
         logging.error("Storyboard structure generation failed.")
         return None
+
 
     now = datetime.datetime.now()
     date_str = now.strftime("%Y-%m-%d")

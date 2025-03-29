@@ -1,4 +1,4 @@
-# viralStoryGenerator/source_cleanser.py
+# viralStoryGenerator/src/source_cleanser.py
 
 import requests
 import json
