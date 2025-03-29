@@ -1,9 +1,10 @@
 # viralStoryGenerator/src/logger.py
+from dotenv import load_dotenv
 import logging
 import os
 
-
 # Create a logger
+load_dotenv()
 logger = logging.getLogger(__name__)
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 if log_level == "DEBUG":
@@ -19,7 +20,6 @@ elif log_level == "CRITICAL":
 else:
     logger.setLevel(logging.DEBUG)  # Default to DEBUG if LOG_LEVEL is not recognized
 
-
 # Create a console handler
 ch = logging.StreamHandler()
 ch.setLevel(logging.DEBUG)
@@ -33,7 +33,6 @@ ch.setFormatter(formatter)
 # Add console handler to logger
 logger.addHandler(ch)
 
-
 # Create a file handler for production environment
 if os.environ.get("ENVIRONMENT") == "production":
     fh = logging.FileHandler('app.log')
@@ -41,6 +40,8 @@ if os.environ.get("ENVIRONMENT") == "production":
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 
+# Prevent duplicate logs by disabling propagation to the root logger
+logger.propagate = False
 
 # How to use:
 # from viralStoryGenerator.src.logger import logger
