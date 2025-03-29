@@ -4,19 +4,19 @@ import requests
 import json
 import re
 import time
-import logging
 from viralStoryGenerator.src.storyboard import generate_storyboard
 from viralStoryGenerator.prompts.prompts import get_system_instructions, get_user_prompt, get_fix_prompt
+from viralStoryGenerator.src.logger import logger as _logger
+from viralStoryGenerator.utils import config
 
-# Configure basic logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+appconfig = config.config
 
 # Precompiled regex patterns for efficiency
 STORY_PATTERN = re.compile(r"(?s)### Story Script:\s*(.*?)\n### Video Description:")
 DESC_PATTERN = re.compile(r"### Video Description:\s*(.*)$")
 THINK_PATTERN = re.compile(r'(<think>.*?</think>)', re.DOTALL)
 
-def _reformat_text(raw_text, endpoint, model, temperature=0.7):
+def _reformat_text(raw_text, endpoint, model, temperature):
     """
     Makes a second LLM call to reformat 'raw_text' if the first attempt was off-format.
     """
@@ -26,28 +26,32 @@ def _reformat_text(raw_text, endpoint, model, temperature=0.7):
         "model": model,
         "messages": [{"role": "user", "content": fix_prompt.strip()}],
         "temperature": temperature,
-        "max_tokens": 8192, # TODO: Change to a var
-        "stream": False
+        "max_tokens": appconfig.llm.MAX_TOKENS,
+        "stream": False # To be implemented in the future
     }
     try:
-        logging.debug("Reformatting text using LLM...")
-        response = requests.post(endpoint, headers=headers, data=json.dumps(data), timeout=15) #timeout to be a variable
+        _logger.debug("Reformatting text using LLM...")
+        response = requests.post(endpoint, headers=headers, data=json.dumps(data), timeout=appconfig.httpOptions.TIMEOUT) #timeout to be a variable
+
+        # if deevelopment, dump result to console
+        if appconfig.ENVIRONMENT == "development":
+            _logger.debug(f"Reformatting response: {response.text}")
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        logging.error(f"An error occurred while calling the LLM for reformatting: {e}")
+        _logger.error(f"An error occurred while calling the LLM for reformatting: {e}")
         return raw_text
     response_json = response.json()
 
     try:
         response_json = response.json()
     except json.JSONDecodeError as e:
-        logging.error(f"JSON decode error during reformatting: {e}")
+        _logger.error(f"JSON decode error during reformatting: {e}")
         return raw_text
 
     try:
         content = response_json["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as e:
-        logging.error(f"Unexpected response structure: {e}")
+        _logger.error(f"Unexpected response structure: {e}")
         return raw_text
 
     return content
@@ -81,12 +85,12 @@ def _extract_chain_of_thought(text):
     return text, chain
 
 
-def generate_story_script(topic,
-                          sources,
-                          endpoint="http://192.168.1.190:1234/v1/chat/completions",
-                          model="deepseek-r1-distill-qwen-14b@q4_k_m",
-                          temperature=0.7,
-                          show_thinking=False):
+def generate_story_script(topic: str,
+                          sources: str,
+                          endpoint: str,
+                          model: str,
+                          temperature=float,
+                          show_thinking: bool = False) -> dict:
     """
     Sends a request to a locally hosted LLM to generate the story script and video description.
     Attempts to ensure the output meets the format:
@@ -103,16 +107,16 @@ def generate_story_script(topic,
             {"role": "user", "content": user_prompt}
         ],
         "temperature": temperature,
-        "max_tokens": 8192,
+        "max_tokens": appconfig.llm.MAX_TOKENS,
         "stream": False
     }
 
     start_time = time.time()
     try:
-        response = requests.post(endpoint, json=data, timeout=30)
+        response = requests.post(endpoint, json=data, timeout=appconfig.httpOptions.TIMEOUT)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error calling the LLM: {e}")
+        _logger.error(f"Error calling the LLM: {e}")
         return {
             "story": "",
             "video_description": "",
@@ -125,7 +129,7 @@ def generate_story_script(topic,
     try:
         response_json = response.json()
     except json.JSONDecodeError as e:
-        logging.error(f"Error decoding JSON response: {e}")
+        _logger.error(f"Error decoding JSON response: {e}")
         return {
             "story": "",
             "video_description": "",
@@ -138,7 +142,7 @@ def generate_story_script(topic,
     try:
         completion_text = response_json["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as e:
-        logging.error(f"Unexpected response structure: {e}")
+        _logger.error(f"Unexpected response structure: {e}")
         return {
             "story": "",
             "video_description": "",
@@ -147,8 +151,18 @@ def generate_story_script(topic,
             "usage": usage_info
         }
 
+    # Check if the thinking part is present in the response
+    if show_thinking:
+        _logger.debug("Thinking is enabled; extracting chain-of-thought...")
+        # if reasoning_content is found in response, extract it
+        if response_json["choices"][0]["message"]["reasoning_content"] and response_json["choices"][0]["message"]["reasoning_content"] != "":
+            thinking = response_json["choices"][0]["message"]["reasoning_content"]
+        else:
+            completion_text, thinking = _extract_chain_of_thought(completion_text)
+    else:
+        thinking = ""
+
     # Extract chain-of-thought if present
-    completion_text, thinking = _extract_chain_of_thought(completion_text)
 
     # Check if format is correct
     story, description = _check_format(completion_text)
@@ -156,21 +170,22 @@ def generate_story_script(topic,
     # Generate the storyboard
     if story.strip():
         try:
-            logging.info("Generating storyboard based on the story script...")
+            _logger.info("Generating storyboard based on the story script...")
 
-            storyboard = generate_storyboard(
-                story=story,
-                topic=topic,
-                llm_endpoint=endpoint,
-                model=model,
-                temperature=temperature,
-                voice_id=None
-            )
+            # storyboard = generate_storyboard(
+            #     story=story,
+            #     topic=topic,
+            #     llm_endpoint=endpoint,
+            #     model=model,
+            #     temperature=temperature,
+            #     voice_id=appconfig.elevenLabs.VOICE_ID
+            # )
+            storyboard = None
 
-            logging.info("Storyboard generation successful.")
+            _logger.info("Storyboard generation successful.")
 
         except Exception as e:
-            logging.error(f"Storyboard generation failed: {e}")
+            _logger.error(f"Storyboard generation failed: {e}")
             return {
                 "story": "",
                 "video_description": "",
@@ -208,14 +223,14 @@ def generate_story_script(topic,
     }
 
     # if story is None or description is None:
-    #     logging.info("Initial completion was off-format. Attempting reformatting...")
+    #     _logger.info("Initial completion was off-format. Attempting reformatting...")
     #     fixed_text = _reformat_text(completion_text, endpoint, model, temperature)
     #     fixed_text, extra_thinking = _extract_chain_of_thought(fixed_text)
     #     if not thinking and extra_thinking:
     #         thinking = extra_thinking
     #     story, description = _check_format(fixed_text)
     #     if story is None or description is None:
-    #         logging.warning("Reformatting did not produce the expected format; returning raw output.")
+    #         _logger.warning("Reformatting did not produce the expected format; returning raw output.")
     #         return {
     #             "story": completion_text,
     #             "video_description": "",

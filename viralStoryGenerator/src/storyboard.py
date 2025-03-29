@@ -1,15 +1,15 @@
 import os
 import json
-import logging
 import datetime
 import requests
 import re
 
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
 from viralStoryGenerator.prompts.prompts import get_storyboard_prompt
+from viralStoryGenerator.src.logger import logger as _logger
+from viralStoryGenerator.utils import config
 
-# Configure logging (if not already configured globally)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+appconfig = config.config
 
 def generate_storyboard_structure(story, llm_endpoint, model, temperature):
     """
@@ -30,27 +30,31 @@ def generate_storyboard_structure(story, llm_endpoint, model, temperature):
             {"role": "user", "content": prompt}
         ],
         "temperature": temperature,
-        "max_tokens": 8192,
+        "max_tokens": appconfig.llm.MAX_TOKENS,
         "stream": False
     }
     headers = {"Content-Type": "application/json"}
 
     try:
-        response = requests.post(llm_endpoint, headers=headers, data=json.dumps(data))
+        response = requests.post(llm_endpoint, headers=headers, data=json.dumps(data), timeout=appconfig.httpOptions.TIMEOUT)
         response.raise_for_status()
     except Exception as e:
-        logging.error(f"Failed to generate storyboard structure: {e}")
+        _logger.error(f"Failed to generate storyboard structure: {e}")
         return None
 
     response_json = response.json()
     content = response_json["choices"][0]["message"]["content"]
 
     # Remove chain-of-thought if present.
-    match = re.search(r'(<think>.*?</think>)', content, re.DOTALL)
-    if match:
-        thinking = match.group(1)
-        # logging.info(f"Chain-of-thought found: {thinking}")
-        content = content.replace(thinking, "").strip()
+    if not response_json["choices"][0]["message"].get("reasoning_content"):
+        match = re.search(r'(<think>.*?</think>)', content, re.DOTALL)
+        if match:
+            thinking = match.group(1)
+            # _logger.debug(f"Chain-of-thought found: {thinking}")
+            content = content.replace(thinking, "").strip()
+    else:
+        thinking = response_json["choices"][0]["message"]["reasoning_content"]
+        # _logger.debug(f"Chain-of-thought found: {thinking}")
 
     # Remove markdown code block markers if present.
     if content.startswith("```"):
@@ -59,7 +63,7 @@ def generate_storyboard_structure(story, llm_endpoint, model, temperature):
             content = code_block_match.group(1).strip()
 
     if not content:
-        logging.error("LLM response content is empty after removing chain-of-thought and markdown formatting.")
+        _logger.error("LLM response content is empty after removing chain-of-thought and markdown formatting.")
         return None
 
     try:
@@ -67,7 +71,7 @@ def generate_storyboard_structure(story, llm_endpoint, model, temperature):
         storyboard_data["thinking"] = thinking
 
     except Exception as e:
-        logging.error(f"Failed to parse storyboard JSON: {e}")
+        _logger.error(f"Failed to parse storyboard JSON: {e}")
         return None
 
     return storyboard_data
@@ -92,7 +96,7 @@ def generate_dalle_image(image_prompt, output_image_path, openai_api_key):
         response = requests.post(url, headers=headers, json=payload)
         response.raise_for_status()
     except Exception as e:
-        logging.error(f"DALL·E 3 API call failed: {e}")
+        _logger.error(f"DALL·E 3 API call failed: {e}")
         return None
 
     try:
@@ -103,10 +107,10 @@ def generate_dalle_image(image_prompt, output_image_path, openai_api_key):
         image_response.raise_for_status()
         with open(output_image_path, "wb") as f:
             f.write(image_response.content)
-        logging.info(f"Image saved to {output_image_path}")
+        _logger.info(f"Image saved to {output_image_path}")
         return output_image_path
     except Exception as e:
-        logging.error(f"Failed to download DALL·E image: {e}")
+        _logger.error(f"Failed to download DALL·E image: {e}")
         return None
 
 def generate_storyboard(story, topic, llm_endpoint, model, temperature, voice_id=None):
@@ -119,7 +123,7 @@ def generate_storyboard(story, topic, llm_endpoint, model, temperature, voice_id
     """
     storyboard_data = generate_storyboard_structure(story, llm_endpoint, model, temperature)
     if not storyboard_data or "scenes" not in storyboard_data:
-        logging.error("Storyboard structure generation failed.")
+        _logger.error("Storyboard structure generation failed.")
         return None
 
 
@@ -130,12 +134,12 @@ def generate_storyboard(story, topic, llm_endpoint, model, temperature, voice_id
     os.makedirs(folder_path, exist_ok=True)
 
     # Get API keys from ENV
-    openai_api_key = os.environ.get("OPENAI_API_KEY", "sk-svcacct-D-bcMpovTDwBpAGHe-EmgUwwdkz7q6JChfWgOx6dS97A4v3IhhzF21Uqyc96Z755LL1fObPT3BlbkFJuanvq8Dbe_FCs9YmheMfHsR1lRWzHoPsr_Aa-1pnd8rYzDImCrsCFLDu4JoGAKghkaS5aAA")
-    elevenlabs_api_key = os.environ.get("ELEVENLABS_API_KEY", "sk_15cb1ec5322909d636dd3afb9223dd65578013807895d481")
+    openai_api_key = appconfig.llm.API_KEY
+    elevenlabs_api_key = appconfig.elevenLabs.API_KEY
     if not openai_api_key:
-        logging.error("No OpenAI API key found for DALL·E 3 image generation.")
+        _logger.error("No OpenAI API key found for DALL·E 3 image generation.")
     if not elevenlabs_api_key:
-        logging.error("No ElevenLabs API key found for audio generation.")
+        _logger.error("No ElevenLabs API key found for audio generation.")
 
     cumulative_time = 0
     scene_texts = []
@@ -169,11 +173,11 @@ def generate_storyboard(story, topic, llm_endpoint, model, temperature, voice_id
     combined_narration = "\n".join(scene_texts).strip()
     # Check if the combined narration exactly matches the original story.
     if combined_narration != story.strip():
-        logging.warning("The combined scene narration does not exactly match the original story text.")
+        _logger.warning("The combined scene narration does not exactly match the original story text.")
 
-    logging.info(f"Generated storyboard for '{topic}' with {len(storyboard_data['scenes'])} scenes.")
-    logging.info(f"Total duration: {cumulative_time} seconds")
-    logging.info(f"Length: {len(combined_narration)}. Combined_narration: {combined_narration}")
+    _logger.info(f"Generated storyboard for '{topic}' with {len(storyboard_data['scenes'])} scenes.")
+    _logger.info(f"Total duration: {cumulative_time} seconds")
+    _logger.info(f"Length: {len(combined_narration)}. Combined_narration: {combined_narration}")
     # Generate a single combined audio file for all scenes using ElevenLabs TTS with timing info.
     if elevenlabs_api_key and combined_narration:
         audio_filename = f"{topic}_combined_{date_str}.mp3"
@@ -207,8 +211,8 @@ def generate_storyboard(story, topic, llm_endpoint, model, temperature, voice_id
     try:
         with open(storyboard_json_path, "w", encoding="utf-8") as f:
             json.dump(storyboard_data, f, indent=4)
-        logging.info(f"Storyboard JSON saved to {storyboard_json_path}")
+        _logger.info(f"Storyboard JSON saved to {storyboard_json_path}")
     except Exception as e:
-        logging.error(f"Failed to save storyboard JSON: {e}")
+        _logger.error(f"Failed to save storyboard JSON: {e}")
 
     return storyboard_data
