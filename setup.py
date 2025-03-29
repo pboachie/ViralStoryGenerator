@@ -7,7 +7,8 @@ setup(
     description="Generate short story scripts via a local LLM endpoint.",
     packages=find_packages(),
     install_requires=[
-        "requests",
+        "requests==2.32.3",
+        "python-dotenv==1.1.0",
     ],
     python_requires=">=3.7",
     entry_points={
