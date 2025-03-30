@@ -39,9 +39,9 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Viral Story Generator API",
-    description="API for generating viral stories from web content",
-    version="0.1.2"
+    title=config.APP_TITLE,
+    description=config.APP_DESCRIPTION,
+    version=config.VERSION
 )
 
 # Prometheus metrics
@@ -54,7 +54,7 @@ RATE_LIMIT_HIT = Counter('api_rate_limit_hit_total', 'Rate limit exceeded count'
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.config.http.CORS_ORIGINS,
+    allow_origins=config.http.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -62,13 +62,13 @@ app.add_middleware(
 
 # Initialize Redis client for rate limiting
 redis_client = None
-if config.config.http.RATE_LIMIT_ENABLED and config.config.redis.ENABLED:
+if config.http.RATE_LIMIT_ENABLED and config.redis.ENABLED:
     try:
         redis_client = redis.Redis(
-            host=config.config.redis.HOST,
-            port=config.config.redis.PORT,
-            db=config.config.redis.DB,
-            password=config.config.redis.PASSWORD,
+            host=config.redis.HOST,
+            port=config.redis.PORT,
+            db=config.redis.DB,
+            password=config.redis.PASSWORD,
             decode_responses=True
         )
         redis_client.ping()  # Test connection
@@ -96,8 +96,8 @@ class RateLimiter:
         Returns:
             Tuple of (is_allowed, current_count, limit)
         """
-        window = config.config.http.RATE_LIMIT_WINDOW
-        limit = config.config.http.RATE_LIMIT_REQUESTS
+        window = config.http.RATE_LIMIT_WINDOW
+        limit = config.http.RATE_LIMIT_REQUESTS
 
         # Create a unique key for each client IP and endpoint combination
         rate_key = f"rate_limit:{client_ip}:{endpoint}"
@@ -159,7 +159,7 @@ async def metrics_middleware(request: Request, call_next):
 # Rate limiting middleware
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    if config.config.http.RATE_LIMIT_ENABLED:
+    if config.http.RATE_LIMIT_ENABLED:
         client_ip = request.client.host
         endpoint = request.url.path
 
@@ -176,14 +176,14 @@ async def rate_limit_middleware(request: Request, call_next):
             _logger.warning(f"Rate limit exceeded for {client_ip} on {endpoint}: {current}/{limit}")
 
             # Calculate remaining window time for retry-after header
-            retry_after = config.config.http.RATE_LIMIT_WINDOW
+            retry_after = config.http.RATE_LIMIT_WINDOW
 
             # Custom rate limit exceeded response
             return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 content={
                     "error": "Rate limit exceeded",
-                    "detail": f"Too many requests. Maximum {limit} requests per {config.config.http.RATE_LIMIT_WINDOW} second window."
+                    "detail": f"Too many requests. Maximum {limit} requests per {config.http.RATE_LIMIT_WINDOW} second window."
                 },
                 headers={
                     "X-RateLimit-Limit": str(limit),
@@ -197,7 +197,7 @@ async def rate_limit_middleware(request: Request, call_next):
     response = await call_next(request)
 
     # Add rate limit headers to response if enabled
-    if config.config.http.RATE_LIMIT_ENABLED:
+    if config.http.RATE_LIMIT_ENABLED:
         # Include rate limit information in response headers
         response.headers["X-RateLimit-Limit"] = str(limit)
         response.headers["X-RateLimit-Remaining"] = str(limit - current)
@@ -282,10 +282,10 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 # Authentication dependency
 async def get_api_key(request: Request, api_key: str = Depends(api_key_header)):
     # Skip authentication if API key security is disabled
-    if not config.config.http.API_KEY_ENABLED:
+    if not config.http.API_KEY_ENABLED:
         return None
 
-    if api_key != config.config.http.API_KEY:
+    if api_key != config.http.API_KEY:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API Key",

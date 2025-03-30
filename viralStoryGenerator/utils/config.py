@@ -13,8 +13,8 @@ class config:
     LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
     ENVIRONMENT = os.environ.get("ENVIRONMENT", "development").lower()
     VERSION = os.environ.get("APP_VERSION", "0.1.2")
-    APP_NAME = os.environ.get("APP_NAME", "Viral Story Generator")
-    DESCRIPTION = os.environ.get("APP_DESCRIPTION", "API for generating viral stories from web content")
+    APP_TITLE = os.environ.get("APP_TITLE", "Viral Story Generator API")
+    APP_DESCRIPTION = os.environ.get("APP_DESCRIPTION", "API for generating viral stories from web content")
 
     class elevenLabs:
         API_KEY = os.environ.get("ELEVENLABS_API_KEY")
