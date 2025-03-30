@@ -21,6 +21,7 @@ setup(
         "requests==2.32.3",
         "python-dotenv==1.1.0",
         "crawl4ai==0.5.0.post8",
+        "redis==5.2.1",
     ],
     python_requires=">=3.7",
     entry_points={
