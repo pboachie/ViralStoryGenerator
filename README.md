@@ -9,6 +9,7 @@ Welcome to **Viral Story Generator** – your one-stop tool for creating engagin
 - **Audio TTS:** Converts the narrative into high-quality MP3 audio using ElevenLabs TTS. 🔊
 - **Storyboard Creation:** Produces JSON-formatted storyboards for video planning and production.
 - **Source Cleansing:** Merges and summarizes multiple source files into a coherent narrative.
+- **Web Scraping:** Utilizes crawl4ai to extract content from web sources.
 
 ---
 
@@ -22,10 +23,11 @@ python setup.py install
 Ensure you have the required dependencies installed:
 - `requests`
 - `python-dotenv`
+- `crawl4ai`
 
 You can install these via pip if needed:
 ```bash
-pip install requests python-dotenv
+pip install requests python-dotenv crawl4ai
 ```
 
 ---
@@ -73,6 +75,24 @@ viralStoryGenerator --topic "Who really invented the wheel"
 For additional options and help, execute:
 ```bash
 viralStoryGenerator --help
+```
+
+---
+
+## Dependencies & Citations
+
+### Crawl4AI
+This project uses Crawl4AI for web scraping:
+
+```bibtex
+@software{crawl4ai2024,
+  author = {UncleCode},
+  title = {Crawl4AI: Open-source LLM Friendly Web Crawler & Scraper},
+  year = {2024},
+  publisher = {GitHub},
+  journal = {GitHub Repository},
+  howpublished = {\url{https://github.com/unclecode/crawl4ai}}
+}
 ```
 
 ---

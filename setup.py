@@ -1,6 +1,17 @@
 # setup.py
 from setuptools import setup, find_packages
 
+# Citation for crawl4ai:
+# @software{crawl4ai2024,
+#   author = {UncleCode},
+#   title = {Crawl4AI: Open-source LLM Friendly Web Crawler & Scraper},
+#   year = {2024},
+#   publisher = {GitHub},
+#   journal = {GitHub Repository},
+#   howpublished = {\url{https://github.com/unclecode/crawl4ai}},
+#   commit = 9c58e4c
+# }
+
 setup(
     name="viralStoryGenerator",
     version="0.1.2",
