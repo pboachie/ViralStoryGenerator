@@ -7,6 +7,7 @@ import asyncio
 import logging
 import uuid
 import time
+import os
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,7 +20,7 @@ from ..utils.redis_manager import RedisQueueManager
 from ..utils.crawl4ai_scraper import scrape_urls
 from ..utils.config import config
 from ..src.llm import process_with_llm
-from ..src.source_cleanser import cleanse_sources
+from ..src.source_cleanser import chunkify_and_summarize
 from ..src.storyboard import generate_storyboard
 from ..src.elevenlabs_tts import generate_audio
 
@@ -78,6 +79,7 @@ class StoryGenerationRequest(BaseModel):
     topic: str = Field(..., description="Topic for the story")
     generate_audio: bool = Field(False, description="Whether to generate audio")
     temperature: Optional[float] = Field(None, description="LLM temperature")
+    chunk_size: Optional[int] = Field(None, description="Word chunk size for splitting sources")
 
 class JobResponse(BaseModel):
     job_id: str = Field(..., description="Job ID for tracking progress")
@@ -125,10 +127,12 @@ async def generate_story(
 
         # Queue the job for processing
         request_data = {
+            "id": job_id,  # Include job_id in the request data
             "urls": [str(url) for url in request.urls],
             "topic": request.topic,
             "generate_audio": request.generate_audio,
-            "temperature": request.temperature or config.llm.TEMPERATURE
+            "temperature": request.temperature or config.llm.TEMPERATURE,
+            "chunk_size": request.chunk_size or int(os.environ.get("LLM_CHUNK_SIZE", config.llm.CHUNK_SIZE))
         }
 
         queue_manager.add_request(request_data)
@@ -221,25 +225,41 @@ async def process_story_generation(job_id: str, request_data: Dict[str, Any]):
         # Update status
         queue_manager.store_result(job_id, {
             "status": "processing",
-            "message": "Cleansing and processing content"
+            "message": "Chunking and summarizing content"
         })
 
-        # Prepare content for processing (similar to what source_cleanser would do)
-        sources = []
-        for url, content in valid_content:
-            sources.append({
-                "filename": url,  # Using URL as filename for identification
-                "content": content
-            })
+        # Prepare content for processing by combining all scraped content into one text
+        combined_content = ""
+        for _, content in valid_content:
+            combined_content += content + "\n\n"
 
-        # Cleanse sources
-        cleansed_content = cleanse_sources(sources)
+        # Process through chunking
+        temperature = request_data.get("temperature", config.llm.TEMPERATURE)
+        endpoint = config.llm.ENDPOINT
+        model = config.llm.MODEL
+        chunk_size = request_data.get("chunk_size", int(os.environ.get("LLM_CHUNK_SIZE", config.llm.CHUNK_SIZE)))
+
+        # Apply chunking and summarization
+        cleansed_content = chunkify_and_summarize(
+            raw_sources=combined_content,
+            endpoint=endpoint,
+            model=model,
+            temperature=temperature,
+            chunk_size=chunk_size
+        )
 
         # Process with LLM
-        temperature = request_data.get("temperature", config.llm.TEMPERATURE)
+        queue_manager.store_result(job_id, {
+            "status": "processing",
+            "message": "Generating story script"
+        })
         story_script = process_with_llm(request_data["topic"], cleansed_content, temperature)
 
         # Generate storyboard
+        queue_manager.store_result(job_id, {
+            "status": "processing",
+            "message": "Creating storyboard"
+        })
         storyboard = generate_storyboard(story_script)
 
         result = {
