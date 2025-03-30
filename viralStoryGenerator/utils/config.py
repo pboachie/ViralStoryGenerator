@@ -64,6 +64,34 @@ class config:
         UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./uploads")
         MAX_UPLOAD_SIZE_MB = int(os.environ.get("MAX_UPLOAD_SIZE_MB", 50))
 
+        # Base URL for serving files - used for constructing absolute URLs in responses
+        BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
+
+    class storage:
+        # Storage configuration
+        PROVIDER = os.environ.get("STORAGE_PROVIDER", "local")  # local, s3, azure, gcs
+
+        # Local storage settings
+        LOCAL_STORAGE_PATH = os.environ.get("LOCAL_STORAGE_PATH", "./storage")
+        AUDIO_STORAGE_PATH = os.environ.get("AUDIO_STORAGE_PATH", "./storage/audio")
+        STORY_STORAGE_PATH = os.environ.get("STORY_STORAGE_PATH", "./storage/stories")
+        STORYBOARD_STORAGE_PATH = os.environ.get("STORYBOARD_STORAGE_PATH", "./storage/storyboards")
+
+        # File retention policy (in days, 0 = keep forever)
+        FILE_RETENTION_DAYS = int(os.environ.get("FILE_RETENTION_DAYS", 30))
+
+        # S3 settings (if using S3)
+        S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "")
+        S3_REGION = os.environ.get("S3_REGION", "us-east-1")
+        S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "")
+        S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "")
+        S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "")  # For non-AWS S3-compatible storage
+
+        # Azure Blob Storage settings (if using Azure)
+        AZURE_ACCOUNT_NAME = os.environ.get("AZURE_ACCOUNT_NAME", "")
+        AZURE_ACCOUNT_KEY = os.environ.get("AZURE_ACCOUNT_KEY", "")
+        AZURE_CONTAINER_NAME = os.environ.get("AZURE_CONTAINER_NAME", "viralstories")
+
     class redis:
         # Redis connection settings
         HOST = os.environ.get("REDIS_HOST", "localhost")
