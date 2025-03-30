@@ -27,7 +27,7 @@ Ensure you have the required dependencies installed:
 
 You can install these via pip if needed:
 ```bash
-pip install requests python-dotenv crawl4ai
+pip install .
 ```
 
 ---
@@ -67,15 +67,16 @@ Copy the sample environment file to a new file named `.env` and update the value
 ---
 
 ## Usage
-Run the CLI tool by specifying the topic and sources folder:
-```bash
-viralStoryGenerator --topic "Who really invented the wheel"
-```
+The Viral Story Generator is now available as an HTTP service. You can interact with it using the REST API endpoints.
 
-For additional options and help, execute:
-```bash
-viralStoryGenerator --help
-```
+### API Endpoints
+Access the service through the following endpoints:
+
+- **Generate a story:** Send a POST request to the story generation endpoint with your topic
+- **Check status:** Monitor the progress of your story generation task
+- **Retrieve results:** Get your completed story, audio, and storyboard
+
+For detailed API documentation, refer to the API documentation when the server is running.
 
 ---
 
@@ -179,9 +180,10 @@ Enjoy creating viral stories and engaging content! 💥🔥
   - Added a new configuration class in `utils/config.py` to load environment variables from `.env`.
   - Updated `.env.sample` with parameters such as `HTTP_TIMEOUT` and `LLM_MAX_TOKENS`.
 
-- **CLI & Debugging:**
-  - Updated CLI behavior in `src/cli.py` to support processing source files and chunking via the LLM.
-  - Refined the launch configurations in `.vscode/launch.json` to point to the correct main script with optional arguments.
+- **API & HTTP Service:**
+  - Migrated from CLI-based to HTTP service architecture.
+  - Implemented REST API endpoints in `src/api.py` for story generation and retrieval.
+  - Added worker processes with Redis queue support in `src/api_worker.py`.
 
 - **Dependency Management:**
   - Pinned dependency versions in `setup.py` (e.g., `requests==2.32.3` and `python-dotenv==1.1.0`).
