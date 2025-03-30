@@ -29,3 +29,23 @@ class config:
 
     class httpOptions:
         TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", 90)) # Use longer timeout for Reasoning LLM Models
+
+    class redis:
+        # Redis connection settings
+        HOST = os.environ.get("REDIS_HOST", "localhost")
+        PORT = int(os.environ.get("REDIS_PORT", 6379))
+        DB = int(os.environ.get("REDIS_DB", 0))
+        PASSWORD = os.environ.get("REDIS_PASSWORD", None)
+
+        # Queue configuration
+        QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "crawl4ai_queue")
+        RESULT_PREFIX = os.environ.get("REDIS_RESULT_PREFIX", "crawl4ai_result:")
+        TTL = int(os.environ.get("REDIS_RESULT_TTL", 3600))  # 1-hour default TTL for results
+
+        # Worker configuration
+        WORKER_BATCH_SIZE = int(os.environ.get("REDIS_WORKER_BATCH_SIZE", 5))
+        WORKER_SLEEP_INTERVAL = int(os.environ.get("REDIS_WORKER_SLEEP_INTERVAL", 1))
+        WORKER_MAX_CONCURRENT = int(os.environ.get("REDIS_WORKER_MAX_CONCURRENT", 3))
+
+        # Enable/disable Redis queue (fallback to direct scraping if disabled)
+        ENABLED = os.environ.get("REDIS_ENABLED", "True").lower() in ["true", "1", "yes"]

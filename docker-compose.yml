@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - viral-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    command: redis-server --appendonly yes
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_ENABLED=True
+      - LOG_LEVEL=INFO
+      - ENVIRONMENT=production
+    networks:
+      - viral-network
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 1G
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_ENABLED=True
+      - LOG_LEVEL=INFO
+      - ENVIRONMENT=production
+      # Worker-specific settings
+      - REDIS_WORKER_BATCH_SIZE=5
+      - REDIS_WORKER_MAX_CONCURRENT=3
+    networks:
+      - viral-network
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '0.7'
+          memory: 1G
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+
+networks:
+  viral-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+    driver: local
