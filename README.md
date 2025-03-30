@@ -191,7 +191,7 @@ Enjoy creating viral stories and engaging content! 💥🔥
 
 - **Logging:**
   - Updated the logging configuration in `src/logger.py` to prevent duplicate logs and include file logging in production.
-  
+
 - **Docker & Containerization:**
   - Added Docker configuration for development and production environments.
   - Included scalable services for backend, scraper, and Redis.
