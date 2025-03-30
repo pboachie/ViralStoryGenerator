@@ -8,3 +8,4 @@ __pycache__
 *launch.json
 *_cache.db*
 /build/*
+build/*
