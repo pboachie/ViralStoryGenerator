@@ -26,7 +26,7 @@ setup(
     python_requires=">=3.7",
     entry_points={
         "console_scripts": [
-            "viralStoryGenerator=viralStoryGenerator.main:cli_main",
+            "viralStoryGenerator=viralStoryGenerator.main:main",
         ],
     },
     license_files=["LICENSE"]
