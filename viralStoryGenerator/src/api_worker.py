@@ -13,7 +13,7 @@ from ..utils.redis_manager import RedisQueueManager
 from ..utils.crawl4ai_scraper import scrape_urls
 from ..utils.config import config
 from .llm import process_with_llm
-from .source_cleanser import cleanse_sources
+from .source_cleanser import chunkify_and_summarize
 from .storyboard import generate_storyboard
 from .elevenlabs_tts import generate_audio
 
@@ -78,22 +78,44 @@ async def process_story_generation(job_id: str, request_data: Dict[str, Any], qu
             "message": "Cleansing and processing content"
         })
 
-        # Prepare content for processing (similar to what source_cleanser would do)
-        sources = []
-        for url, content in valid_content:
-            sources.append({
-                "filename": url,  # Using URL as filename for identification
-                "content": content
-            })
+        # Prepare content for processing by combining all scraped content into one text
+        combined_content = ""
+        for _, content in valid_content:
+            combined_content += content + "\n\n"
 
-        # Cleanse sources
-        cleansed_content = cleanse_sources(sources)
+        # Process through chunking
+        temperature = request_data.get("temperature", config.llm.TEMPERATURE)
+        endpoint = config.llm.ENDPOINT
+        model = config.llm.MODEL
+        chunk_size = int(os.environ.get("LLM_CHUNK_SIZE", config.llm.CHUNK_SIZE))
+
+        # Update status to reflect chunking
+        queue_manager.store_result(job_id, {
+            "status": "processing",
+            "message": "Chunking and summarizing content"
+        })
+
+        # Apply chunking and summarization
+        cleansed_content = chunkify_and_summarize(
+            raw_sources=combined_content,
+            endpoint=endpoint,
+            model=model,
+            temperature=temperature,
+            chunk_size=chunk_size
+        )
 
         # Process with LLM
-        temperature = request_data.get("temperature", config.llm.TEMPERATURE)
+        queue_manager.store_result(job_id, {
+            "status": "processing",
+            "message": "Generating story script"
+        })
         story_script = process_with_llm(request_data["topic"], cleansed_content, temperature)
 
         # Generate storyboard
+        queue_manager.store_result(job_id, {
+            "status": "processing",
+            "message": "Creating storyboard"
+        })
         storyboard = generate_storyboard(story_script)
 
         result = {
