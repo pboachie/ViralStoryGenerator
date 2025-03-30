@@ -79,6 +79,65 @@ viralStoryGenerator --help
 
 ---
 
+## Docker Setup 🐳
+
+### Development Setup
+To run the application in a development environment using Docker:
+
+1. **Build and start the containers:**
+   ```bash
+   docker-compose up -d
+   ```
+
+2. **Check the status of the containers:**
+   ```bash
+   docker-compose ps
+   ```
+
+3. **View logs:**
+   ```bash
+   docker-compose logs -f
+   ```
+
+4. **Stop the containers:**
+   ```bash
+   docker-compose down
+   ```
+
+### Production Setup
+For production deployment with scaling and monitoring:
+
+1. **Copy and customize environment variables:**
+   ```bash
+   cp .env.sample .env
+   ```
+
+2. **Deploy with production configuration:**
+   ```bash
+   docker-compose -f docker-compose.prod.yml up -d
+   ```
+
+3. **Scale services as needed:**
+   ```bash
+   docker-compose -f docker-compose.prod.yml up -d --scale scraper=5 --scale backend=3
+   ```
+
+4. **Access monitoring dashboards:**
+   - Grafana: http://localhost:3000 (default credentials: admin/admin)
+   - Prometheus: http://localhost:9090
+
+### Container Architecture
+This project uses a containerized architecture with separate services:
+
+- **Redis**: Queue management and shared state
+- **Backend**: Main application for story generation
+- **Scraper**: Worker processes for crawl4ai web scraping
+- **Monitoring**: Prometheus and Grafana for observability (production only)
+
+Each service is independently scalable to handle increased load.
+
+---
+
 ## Dependencies & Citations
 
 ### Crawl4AI
@@ -132,3 +191,8 @@ Enjoy creating viral stories and engaging content! 💥🔥
 
 - **Logging:**
   - Updated the logging configuration in `src/logger.py` to prevent duplicate logs and include file logging in production.
+  
+- **Docker & Containerization:**
+  - Added Docker configuration for development and production environments.
+  - Included scalable services for backend, scraper, and Redis.
+  - Implemented monitoring with Prometheus and Grafana.
