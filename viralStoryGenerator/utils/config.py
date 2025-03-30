@@ -12,6 +12,9 @@ class config:
     SOURCES_FOLDER = os.environ.get("SOURCES_FOLDER")
     LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
     ENVIRONMENT = os.environ.get("ENVIRONMENT", "development").lower()
+    VERSION = os.environ.get("APP_VERSION", "0.1.2")
+    APP_NAME = os.environ.get("APP_NAME", "Viral Story Generator")
+    DESCRIPTION = os.environ.get("APP_DESCRIPTION", "API for generating viral stories from web content")
 
     class elevenLabs:
         API_KEY = os.environ.get("ELEVENLABS_API_KEY")
