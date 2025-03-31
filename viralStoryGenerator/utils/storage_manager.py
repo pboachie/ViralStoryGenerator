@@ -254,6 +254,61 @@ class StorageManager:
 
         return deleted_count
 
+    def retrieve_file(self, filename: str, file_type: str) -> Optional[bytes]:
+        """
+        Retrieve file data from storage
+
+        Args:
+            filename: Name of the file to retrieve
+            file_type: Type of file ('audio', 'story', 'storyboard')
+
+        Returns:
+            File content as bytes, or None if file not found
+        """
+        try:
+            if self.provider == "local":
+                # For local storage, read directly from file system
+                file_path = self._get_local_path(file_type, filename)
+                if os.path.exists(file_path):
+                    with open(file_path, "rb") as f:
+                        return f.read()
+                return None
+
+            elif self.provider == "s3":
+                # Download from S3
+                s3_key = f"{file_type}/{filename}"
+                try:
+                    response = self.s3_client.get_object(
+                        Bucket=config.storage.S3_BUCKET_NAME,
+                        Key=s3_key
+                    )
+                    return response['Body'].read()
+                except Exception as e:
+                    _logger.error(f"Error downloading from S3: {e}")
+                    return None
+
+            elif self.provider == "azure":
+                # Download from Azure Blob
+                blob_path = f"{file_type}/{filename}"
+                container_name = config.storage.AZURE_CONTAINER_NAME
+
+                try:
+                    blob_client = self.azure_blob_service_client.get_blob_client(
+                        container=container_name,
+                        blob=blob_path
+                    )
+                    download_stream = blob_client.download_blob()
+                    return download_stream.readall()
+                except Exception as e:
+                    _logger.error(f"Error downloading from Azure: {e}")
+                    return None
+
+            return None
+
+        except Exception as e:
+            _logger.error(f"Failed to retrieve file {filename}: {e}")
+            return None
+
     def _store_file_local(self, file_data: Union[str, bytes, BinaryIO],
                         file_type: str,
                         filename: str,
