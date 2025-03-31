@@ -13,7 +13,7 @@ import logging
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from viralStoryGenerator.utils.config import config
+from viralStoryGenerator.utils.config import config as app_config
 
 def main():
     parser = argparse.ArgumentParser(description="Run the ViralStoryGenerator API server")
@@ -25,7 +25,7 @@ def main():
 
     # Configure logging
     logging.basicConfig(
-        level=getattr(logging, config.LOG_LEVEL),
+        level=getattr(logging, app_config.LOG_LEVEL),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.StreamHandler(),
@@ -42,7 +42,7 @@ def main():
         host=args.host,
         port=args.port,
         reload=args.reload,
-        log_level=config.LOG_LEVEL.lower()
+        log_level=app_config.LOG_LEVEL.lower()
     )
 
 if __name__ == "__main__":

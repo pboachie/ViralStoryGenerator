@@ -4,7 +4,7 @@ import sys
 import os
 import multiprocessing
 from viralStoryGenerator.src.logger import logger as _logger
-from viralStoryGenerator.utils import config
+from viralStoryGenerator.utils.config import config as app_config
 from fastapi.staticfiles import StaticFiles
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,7 +40,7 @@ def main():
     _logger.debug(f"Arguments parsed: {args}")
 
     # Configure startup based on environment
-    is_development = config.config.ENVIRONMENT.lower() == "development"
+    is_development = app_config.ENVIRONMENT.lower() == "development"
 
     # Set arguments for API server
     uvicorn_args = [
@@ -68,15 +68,15 @@ def main():
 
 # Set up the FastAPI application
 app = FastAPI(
-    title=config.APP_TITLE,
-    description=config.APP_DESCRIPTION,
-    version=config.VERSION
+    title=app_config.APP_TITLE,
+    description=app_config.APP_DESCRIPTION,
+    version=app_config.VERSION
 )
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.http.CORS_ORIGINS,
+    allow_origins=app_config.http.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -86,29 +86,29 @@ app.add_middleware(
 app.include_router(api_router)
 
 # Create necessary directories
-os.makedirs(config.storage.AUDIO_STORAGE_PATH, exist_ok=True)
-os.makedirs(config.storage.STORY_STORAGE_PATH, exist_ok=True)
-os.makedirs(config.storage.STORYBOARD_STORAGE_PATH, exist_ok=True)
+os.makedirs(app_config.storage.AUDIO_STORAGE_PATH, exist_ok=True)
+os.makedirs(app_config.storage.STORY_STORAGE_PATH, exist_ok=True)
+os.makedirs(app_config.storage.STORYBOARD_STORAGE_PATH, exist_ok=True)
 
 # Mount static directories for serving files directly
-app.mount("/static/audio", StaticFiles(directory=config.storage.AUDIO_STORAGE_PATH), name="audio")
-app.mount("/static/stories", StaticFiles(directory=config.storage.STORY_STORAGE_PATH), name="stories")
-app.mount("/static/storyboards", StaticFiles(directory=config.storage.STORYBOARD_STORAGE_PATH), name="storyboards")
+app.mount("/static/audio", StaticFiles(directory=app_config.storage.AUDIO_STORAGE_PATH), name="audio")
+app.mount("/static/stories", StaticFiles(directory=app_config.storage.STORY_STORAGE_PATH), name="stories")
+app.mount("/static/storyboards", StaticFiles(directory=app_config.storage.STORYBOARD_STORAGE_PATH), name="storyboards")
 
 # Startup event handler
 @app.on_event("startup")
 async def startup_event():
     """Perform tasks when the application starts"""
     _logger.debug("Startup event triggered.")
-    _logger.info(f"Starting {config.APP_TITLE} v{config.VERSION}")
-    _logger.info(f"Environment: {config.ENVIRONMENT}")
-    _logger.info(f"Storage provider: {config.storage.PROVIDER}")
+    _logger.info(f"Starting {app_config.APP_TITLE} v{app_config.VERSION}")
+    _logger.info(f"Environment: {app_config.ENVIRONMENT}")
+    _logger.info(f"Storage provider: {app_config.storage.PROVIDER}")
 
     # Start the scheduled cleanup task
-    if config.storage.FILE_RETENTION_DAYS > 0:
+    if app_config.storage.FILE_RETENTION_DAYS > 0:
         cleanup_started = cleanup_task.start()
         if cleanup_started:
-            _logger.info(f"Scheduled file cleanup enabled: Every {config.storage.CLEANUP_INTERVAL_HOURS} hours, {config.storage.FILE_RETENTION_DAYS} days retention")
+            _logger.info(f"Scheduled file cleanup enabled: Every {app_config.storage.CLEANUP_INTERVAL_HOURS} hours, {app_config.storage.FILE_RETENTION_DAYS} days retention")
         else:
             _logger.warning("Failed to start scheduled file cleanup")
     _logger.debug("Startup event completed.")
@@ -135,9 +135,9 @@ async def health_check():
     _logger.debug("Health check response generated.")
     return {
         "status": "healthy",
-        "version": config.VERSION,
-        "environment": config.ENVIRONMENT,
-        "storage_provider": config.storage.PROVIDER,
+        "version": app_config.VERSION,
+        "environment": app_config.ENVIRONMENT,
+        "storage_provider": app_config.storage.PROVIDER,
         "cleanup": cleanup_status
     }
 
@@ -146,8 +146,8 @@ async def health_check():
 async def root():
     """Root endpoint"""
     return {
-        "app": config.APP_TITLE,
-        "version": config.VERSION,
+        "app": app_config.APP_TITLE,
+        "version": app_config.VERSION,
         "docs_url": "/docs"
     }
 

@@ -80,6 +80,9 @@ class config:
         # File retention policy (in days, 0 = keep forever)
         FILE_RETENTION_DAYS = int(os.environ.get("FILE_RETENTION_DAYS", 30))
 
+        # Cleanup interval in hours
+        CLEANUP_INTERVAL_HOURS = int(os.environ.get("CLEANUP_INTERVAL_HOURS", 24))
+
         # S3 settings (if using S3)
         S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "")
         S3_REGION = os.environ.get("S3_REGION", "us-east-1")

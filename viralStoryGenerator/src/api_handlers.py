@@ -10,7 +10,7 @@ from viralStoryGenerator.src.llm import generate_story_script
 from viralStoryGenerator.src.source_cleanser import chunkify_and_summarize
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
 from viralStoryGenerator.src.logger import logger as _logger
-from viralStoryGenerator.utils import config
+from viralStoryGenerator.utils.config import config
 from viralStoryGenerator.utils.redis_manager import RedisManager
 
 # Directory where failed audio generations are queued

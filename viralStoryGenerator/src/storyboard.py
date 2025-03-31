@@ -7,7 +7,7 @@ import re
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
 from viralStoryGenerator.prompts.prompts import get_storyboard_prompt
 from viralStoryGenerator.src.logger import logger as _logger
-from viralStoryGenerator.utils import config
+from viralStoryGenerator.utils.config import config
 
 appconfig = config.config
 
