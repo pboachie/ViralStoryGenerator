@@ -98,7 +98,7 @@ async def startup_event():
     _logger.info(f"Starting {config.APP_TITLE} v{config.VERSION}")
     _logger.info(f"Environment: {config.ENVIRONMENT}")
     _logger.info(f"Storage provider: {config.storage.PROVIDER}")
-    
+
     # Start the scheduled cleanup task
     if config.storage.FILE_RETENTION_DAYS > 0:
         cleanup_started = cleanup_task.start()
@@ -112,7 +112,7 @@ async def startup_event():
 async def shutdown_event():
     """Perform tasks when the application shuts down"""
     _logger.info("Application shutting down")
-    
+
     # Stop the scheduled cleanup task
     cleanup_task.stop()
 
@@ -122,7 +122,7 @@ async def health_check():
     """Health check endpoint for monitoring"""
     # Include cleanup task status if it's running
     cleanup_status = cleanup_task.status() if cleanup_task.is_running else None
-    
+
     return {
         "status": "healthy",
         "version": config.VERSION,
