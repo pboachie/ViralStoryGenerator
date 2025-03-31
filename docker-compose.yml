@@ -26,13 +26,32 @@ services:
       redis:
         condition: service_healthy
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_ENABLED=True
-      - LOG_LEVEL=INFO
-      - ENVIRONMENT=development
-      - API_QUEUE_NAME=api_requests
-      - API_RESULT_PREFIX="api_result:"
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_ENABLED=${REDIS_ENABLED}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ENVIRONMENT=${ENVIRONMENT}
+      - API_QUEUE_NAME=${API_QUEUE_NAME}
+      - API_RESULT_PREFIX=${API_RESULT_PREFIX}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID}
+      - LLM_ENDPOINT=${LLM_ENDPOINT}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS}
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER}
+      - LOCAL_STORAGE_PATH=${LOCAL_STORAGE_PATH}
+      - AUDIO_STORAGE_PATH=${AUDIO_STORAGE_PATH}
+      - STORY_STORAGE_PATH=${STORY_STORAGE_PATH}
+      - STORYBOARD_STORAGE_PATH=${STORYBOARD_STORAGE_PATH}
+      - FILE_RETENTION_DAYS=${FILE_RETENTION_DAYS}
+      - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS}
+      - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED}
+      - RATE_LIMIT_REQUESTS=${RATE_LIMIT_REQUESTS}
+      - RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW}
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - API_KEY_ENABLED=${API_KEY_ENABLED}
+      - API_KEY=${API_KEY}
     networks:
       - viral-network
     restart: unless-stopped
@@ -57,12 +76,11 @@ services:
       redis:
         condition: service_healthy
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_ENABLED=True
-      - LOG_LEVEL=INFO
-      - ENVIRONMENT=development
-      # Worker-specific settings
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_ENABLED=${REDIS_ENABLED}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ENVIRONMENT=${ENVIRONMENT}
       - REDIS_WORKER_BATCH_SIZE=5
       - REDIS_WORKER_MAX_CONCURRENT=3
     networks:
@@ -89,11 +107,11 @@ services:
       redis:
         condition: service_healthy
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_ENABLED=True
-      - LOG_LEVEL=INFO
-      - ENVIRONMENT=development
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_ENABLED=${REDIS_ENABLED}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ENVIRONMENT=${ENVIRONMENT}
       - REDIS_QUEUE_NAME=api_requests
       - REDIS_RESULT_PREFIX="api_result:"
       - REDIS_WORKER_BATCH_SIZE=3

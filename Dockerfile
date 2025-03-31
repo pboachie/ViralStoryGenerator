@@ -9,6 +9,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Copy the .env file to the container
+COPY .env .env
+
+# Ensure the .env file is loaded by the application
+ENV DOTENV_PATH=.env
+
 # Install the package in development mode
 RUN pip install -e .
 
