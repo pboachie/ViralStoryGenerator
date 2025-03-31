@@ -403,29 +403,37 @@ async def stream_audio(
     Returns:
     - Streaming response with audio data and appropriate headers for HTML5 audio players
     """
-    file_path = os.path.join(config.storage.AUDIO_STORAGE_PATH, filename)
+    # Get file size and check existence
+    file_size = None
+    file_path = None
 
-    if not os.path.exists(file_path):
-        # Try to get from cloud storage if not on local filesystem
-        if config.storage.PROVIDER != "local":
-            try:
-                # Retrieve file from cloud storage to a temporary location
-                temp_file = os.path.join(tempfile.gettempdir(), filename)
-                file_data = storage_manager.retrieve_file(filename, "audio")
-
-                if file_data:
-                    with open(temp_file, "wb") as f:
-                        f.write(file_data)
-                    file_path = temp_file
-                else:
-                    raise HTTPException(status_code=404, detail="Audio file not found in storage")
-            except Exception as e:
-                _logger.error(f"Error retrieving audio from storage: {e}")
-                raise HTTPException(status_code=404, detail="Audio file not found")
-        else:
+    if config.storage.PROVIDER == "local":
+        # For local files, check the file system directly
+        file_path = os.path.join(config.storage.AUDIO_STORAGE_PATH, filename)
+        if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="Audio file not found")
+        file_size = os.path.getsize(file_path)
+    else:
+        # For cloud storage, check if file exists by getting metadata
+        try:
+            # First try getting a full file to check its existence and size
+            file_data = storage_manager.retrieve_file(filename, "audio")
+            if not file_data:
+                raise HTTPException(status_code=404, detail="Audio file not found in storage")
 
-    file_size = os.path.getsize(file_path)
+            # For S3 or Azure, we need the file size for range requests
+            if isinstance(file_data, bytes):
+                file_size = len(file_data)
+                # Save to temporary file for streaming
+                file_path = os.path.join(tempfile.gettempdir(), filename)
+                with open(file_path, "wb") as f:
+                    f.write(file_data)
+            else:
+                # This shouldn't happen as we're not specifying a range yet
+                raise HTTPException(status_code=500, detail="Unexpected response format from storage")
+        except Exception as e:
+            _logger.error(f"Error retrieving audio from storage: {e}")
+            raise HTTPException(status_code=404, detail="Audio file not found")
 
     # Handle range requests for audio seeking
     start = 0
@@ -437,7 +445,7 @@ async def stream_audio(
             # Parse range header (e.g., "bytes=0-1023")
             range_header = range.replace("bytes=", "").split("-")
             start = int(range_header[0]) if range_header[0] else 0
-            end = int(range_header[1]) if range_header[1] else file_size - 1
+            end = int(range_header[1]) if range_header[1] and range_header[1].isdigit() else file_size - 1
 
             # Validate range
             if end >= file_size:
@@ -463,18 +471,55 @@ async def stream_audio(
 
     # Function to stream file content in chunks
     async def file_streamer():
-        with open(file_path, "rb") as f:
-            f.seek(start)
-            remaining = content_length
-            chunk_size = 64 * 1024  # 64KB chunks for efficient streaming
+        if config.storage.PROVIDER == "local" or file_path:
+            # Stream from local file
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                remaining = content_length
+                chunk_size = 64 * 1024  # 64KB chunks for efficient streaming
 
-            while remaining > 0:
-                chunk = f.read(min(chunk_size, remaining))
-                if not chunk:
-                    break
+                while remaining > 0:
+                    chunk = f.read(min(chunk_size, remaining))
+                    if not chunk:
+                        break
 
-                yield chunk
-                remaining -= len(chunk)
+                    yield chunk
+                    remaining -= len(chunk)
+        else:
+            # Stream directly from cloud storage
+            try:
+                # Get a streaming response with the specified range
+                stream = storage_manager.retrieve_file(
+                    filename=filename,
+                    file_type="audio",
+                    start_byte=start,
+                    end_byte=end
+                )
+
+                # Handle different return types from different storage providers
+                if hasattr(stream, 'read'):
+                    # File-like object (S3)
+                    remaining = content_length
+                    chunk_size = 64 * 1024
+
+                    while remaining > 0:
+                        chunk = stream.read(min(chunk_size, remaining))
+                        if not chunk:
+                            break
+                        yield chunk
+                        remaining -= len(chunk)
+                elif hasattr(stream, 'chunks'):
+                    # Azure Blob storage download stream
+                    async for chunk in stream.chunks():
+                        yield chunk
+                else:
+                    # Unexpected type, try to convert to bytes and yield
+                    if stream:
+                        yield stream
+            except Exception as e:
+                _logger.error(f"Error streaming from storage: {e}")
+                # We can't raise HTTP exceptions here, so just stop the stream
+                yield b''
 
     return StreamingResponse(
         file_streamer(),
