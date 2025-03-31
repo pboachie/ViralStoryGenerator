@@ -36,6 +36,12 @@ services:
     networks:
       - viral-network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     deploy:
       replicas: 1
       resources:
@@ -88,6 +94,8 @@ services:
       dockerfile: Dockerfile.worker
     depends_on:
       redis:
+        condition: service_healthy
+      backend:
         condition: service_healthy
     environment:
       - REDIS_HOST=redis

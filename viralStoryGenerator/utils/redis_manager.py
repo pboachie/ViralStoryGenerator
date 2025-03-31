@@ -13,8 +13,17 @@ from viralStoryGenerator.utils.config import config as app_config
 class RedisManager:
     """Redis manager for handling task queuing and state management"""
 
-    def __init__(self):
+    def __init__(self, host=None, port=None, db=None, password=None, queue_name=None, result_prefix=None, ttl=None):
         """Initialize Redis connection"""
+        # Default to values from config if parameters aren't provided
+        self.host = host or app_config.redis.HOST
+        self.port = port or app_config.redis.PORT
+        self.db = db or app_config.redis.DB
+        self.password = password or app_config.redis.PASSWORD
+        self.queue_name = queue_name or app_config.redis.QUEUE_NAME
+        self.result_prefix = result_prefix or app_config.redis.RESULT_PREFIX
+        self.ttl = ttl or app_config.redis.TTL
+
         if not app_config.redis.ENABLED:
             _logger.warning("Redis is disabled in config. Task queuing will not work properly.")
             self.client = None
@@ -22,18 +31,14 @@ class RedisManager:
 
         try:
             self.client = redis.Redis(
-                host=app_config.redis.HOST,
-                port=app_config.redis.PORT,
-                db=app_config.redis.DB,
-                password=app_config.redis.PASSWORD,
+                host=self.host,
+                port=self.port,
+                db=self.db,
+                password=self.password,
                 decode_responses=True
             )
             self.client.ping()  # Test connection
-            _logger.info(f"Connected to Redis at {app_config.redis.HOST}:{app_config.redis.PORT}")
-
-            self.queue_name = app_config.redis.QUEUE_NAME
-            self.result_prefix = app_config.redis.RESULT_PREFIX
-            self.ttl = app_config.redis.TTL
+            _logger.info(f"Connected to Redis at {self.host}:{self.port}")
 
         except redis.exceptions.ConnectionError as e:
             _logger.error(f"Failed to connect to Redis: {str(e)}")

@@ -36,7 +36,11 @@ from viralStoryGenerator.src.api_handlers import (
     process_audio_queue
 )
 
-router = APIRouter()
+router = APIRouter(
+    prefix="",
+    tags=["api"],
+    responses={404: {"description": "Not found"}},
+)
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -44,6 +48,8 @@ app = FastAPI(
     description=config.APP_DESCRIPTION,
     version=config.VERSION
 )
+
+app.include_router(router)
 
 # Mount static file directory for local storage
 os.makedirs(config.storage.LOCAL_STORAGE_PATH, exist_ok=True)
@@ -851,6 +857,5 @@ async def process_story_generation(job_id: str, request_data: Dict[str, Any]):
 
 def start_api_server(host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
     """Start the FastAPI server with uvicorn"""
-    # Include the router in the app
-    app.include_router(router)
+    _logger.info(f"Starting API server on {host}:{port}")
     uvicorn.run("viralStoryGenerator.src.api:app", host=host, port=port, reload=reload)
