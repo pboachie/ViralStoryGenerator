@@ -8,7 +8,7 @@ from viralStoryGenerator.utils.config import config as app_config
 from fastapi.staticfiles import StaticFiles
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from viralStoryGenerator.src.api import app as api_router
+from viralStoryGenerator.src.api import router as api_router
 from viralStoryGenerator.utils.scheduled_cleanup import cleanup_task
 
 def main():

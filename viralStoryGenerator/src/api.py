@@ -9,7 +9,7 @@ import time
 import os
 import tempfile
 from typing import List, Dict, Any, Optional, Tuple
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, status, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
@@ -35,6 +35,8 @@ from viralStoryGenerator.src.api_handlers import (
     process_story_task,
     process_audio_queue
 )
+
+router = APIRouter()
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -336,8 +338,7 @@ async def health_check():
     """
     return JSONResponse(content={"status": "ok"})
 
-# API routes
-@app.post("/api/stories", dependencies=[Depends(get_api_key)])
+@router.post("/api/stories", dependencies=[Depends(get_api_key)])
 async def generate_story(
     topic: str,
     background_tasks: BackgroundTasks,
@@ -361,7 +362,7 @@ async def generate_story(
     _logger.debug(f"Story generation task created for topic: {topic}")
     return task
 
-@app.get("/api/stories/{task_id}", dependencies=[Depends(get_api_key)])
+@router.get("/api/stories/{task_id}", dependencies=[Depends(get_api_key)])
 async def check_story_status(task_id: str):
     _logger.debug(f"Check story status endpoint called for task_id: {task_id}")
     """
@@ -379,8 +380,7 @@ async def check_story_status(task_id: str):
     _logger.debug(f"Story status retrieved for task_id: {task_id}")
     return task_info
 
-# Direct file serving for local storage
-@app.get("/audio/{filename}")
+@router.get("/audio/{filename}")
 async def serve_audio_file(filename: str):
     """Serve audio files directly"""
     file_path = os.path.join(config.storage.AUDIO_STORAGE_PATH, filename)
@@ -392,7 +392,7 @@ async def serve_audio_file(filename: str):
         filename=filename
     )
 
-@app.get("/api/audio/stream/{filename}")
+@router.get("/api/audio/stream/{filename}")
 async def stream_audio(
     filename: str,
     range: str = None
@@ -532,7 +532,7 @@ async def stream_audio(
         status_code=status_code
     )
 
-@app.get("/story/{filename}")
+@router.get("/story/{filename}")
 async def serve_story_file(filename: str):
     """Serve story text files directly"""
     file_path = os.path.join(config.storage.STORY_STORAGE_PATH, filename)
@@ -544,7 +544,7 @@ async def serve_story_file(filename: str):
         filename=filename
     )
 
-@app.get("/storyboard/{filename}")
+@router.get("/storyboard/{filename}")
 async def serve_storyboard_file(filename: str):
     """Serve storyboard JSON files directly"""
     file_path = os.path.join(config.storage.STORYBOARD_STORAGE_PATH, filename)
@@ -556,7 +556,7 @@ async def serve_storyboard_file(filename: str):
         filename=filename
     )
 
-@app.get("/api/stories/{task_id}/download/{file_type}", dependencies=[Depends(get_api_key)])
+@router.get("/api/stories/{task_id}/download/{file_type}", dependencies=[Depends(get_api_key)])
 async def download_story_file(task_id: str, file_type: str):
     """
     Download a generated file from a completed story task
@@ -597,7 +597,7 @@ async def download_story_file(task_id: str, file_type: str):
         filename = os.path.basename(file_path)
         return FileResponse(path=file_path, media_type=media_type, filename=filename)
 
-@app.post("/api/generate", response_model=JobResponse)
+@router.post("/api/generate", response_model=JobResponse)
 async def generate_story_from_urls(
     request: StoryGenerationRequest,
     background_tasks: BackgroundTasks,
@@ -635,7 +635,7 @@ async def generate_story_from_urls(
         _logger.error(f"Error queueing job: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to queue job: {str(e)}")
 
-@app.get("/api/status/{job_id}")
+@router.get("/api/status/{job_id}")
 async def get_job_status(
     job_id: str,
     queue_manager: RedisQueueManager = Depends(get_queue_manager)
@@ -851,4 +851,6 @@ async def process_story_generation(job_id: str, request_data: Dict[str, Any]):
 
 def start_api_server(host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
     """Start the FastAPI server with uvicorn"""
+    # Include the router in the app
+    app.include_router(router)
     uvicorn.run("viralStoryGenerator.src.api:app", host=host, port=port, reload=reload)
