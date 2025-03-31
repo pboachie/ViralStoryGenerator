@@ -172,7 +172,7 @@ async def scrape_urls(
     for url, result in zip(urls, results):
         if isinstance(result, Exception):
             # Log errors and append None for failed crawls
-            logging.error(f"Error crawling {url}: {result}")
+            _logger.error(f"Error crawling {url}: {result}")
             output.append((url, None))
         else:
             # Append successful crawl results as Markdown
