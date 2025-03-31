@@ -216,7 +216,7 @@ class StorageManager:
 
     def cleanup_old_files(self, max_age_days: int = None) -> int:
         """
-        Delete files older than specified age
+        Delete files older than specified age from all storage providers
 
         Args:
             max_age_days: Maximum file age in days (default from config)
@@ -232,63 +232,158 @@ class StorageManager:
             return 0
 
         deleted_count = 0
-        # Implementation depends on provider
-        if self.provider == "local":
-            # For local storage, scan the directories
-            now = time.time()
-            max_age_seconds = max_age_days * 24 * 60 * 60
+        current_time = time.time()
+        max_age_seconds = max_age_days * 24 * 60 * 60
+        cutoff_time = current_time - max_age_seconds
+        
+        # Log start of cleanup
+        _logger.info(f"Starting file cleanup for files older than {max_age_days} days")
+        
+        try:
+            # Local storage cleanup
+            if self.provider == "local":
+                for file_type in ["audio", "story", "storyboard"]:
+                    storage_dir = self._get_storage_dir(file_type)
+                    if not os.path.exists(storage_dir):
+                        continue
+                        
+                    for filename in os.listdir(storage_dir):
+                        file_path = os.path.join(storage_dir, filename)
+                        if os.path.isfile(file_path):
+                            # Check file modification time
+                            file_mtime = os.path.getmtime(file_path)
+                            if file_mtime < cutoff_time:
+                                try:
+                                    os.remove(file_path)
+                                    deleted_count += 1
+                                    _logger.debug(f"Deleted old file {file_path}")
+                                except Exception as e:
+                                    _logger.error(f"Failed to delete old file {file_path}: {e}")
+            
+            # S3 storage cleanup
+            elif self.provider == "s3":
+                for prefix in ["audio/", "story/", "storyboard/"]:
+                    try:
+                        # List objects in the bucket with the given prefix
+                        paginator = self.s3_client.get_paginator('list_objects_v2')
+                        pages = paginator.paginate(
+                            Bucket=config.storage.S3_BUCKET_NAME,
+                            Prefix=prefix
+                        )
+                        
+                        for page in pages:
+                            if 'Contents' not in page:
+                                continue
+                                
+                            for obj in page['Contents']:
+                                # Check object's last modified time
+                                if obj['LastModified'].timestamp() < cutoff_time:
+                                    try:
+                                        self.s3_client.delete_object(
+                                            Bucket=config.storage.S3_BUCKET_NAME,
+                                            Key=obj['Key']
+                                        )
+                                        deleted_count += 1
+                                        _logger.debug(f"Deleted old S3 object: {obj['Key']}")
+                                    except Exception as e:
+                                        _logger.error(f"Failed to delete old S3 object {obj['Key']}: {e}")
+                    except Exception as e:
+                        _logger.error(f"Error listing S3 objects for cleanup with prefix {prefix}: {e}")
+            
+            # Azure Blob storage cleanup
+            elif self.provider == "azure":
+                container_name = config.storage.AZURE_CONTAINER_NAME
+                container_client = self.azure_blob_service_client.get_container_client(container_name)
+                
+                for prefix in ["audio/", "story/", "storyboard/"]:
+                    try:
+                        # List all blobs with the given prefix
+                        blob_list = container_client.list_blobs(name_starts_with=prefix)
+                        
+                        for blob in blob_list:
+                            # Check blob's last modified time
+                            if blob.last_modified.timestamp() < cutoff_time:
+                                try:
+                                    blob_client = container_client.get_blob_client(blob.name)
+                                    blob_client.delete_blob()
+                                    deleted_count += 1
+                                    _logger.debug(f"Deleted old Azure blob: {blob.name}")
+                                except Exception as e:
+                                    _logger.error(f"Failed to delete old Azure blob {blob.name}: {e}")
+                    except Exception as e:
+                        _logger.error(f"Error listing Azure blobs for cleanup with prefix {prefix}: {e}")
+        
+            _logger.info(f"File cleanup complete: {deleted_count} files removed")
+            return deleted_count
+            
+        except Exception as e:
+            _logger.error(f"Error during file cleanup: {e}")
+            return 0
 
-            for root_dir in [config.storage.AUDIO_STORAGE_PATH,
-                            config.storage.STORY_STORAGE_PATH,
-                            config.storage.STORYBOARD_STORAGE_PATH]:
-                for filename in os.listdir(root_dir):
-                    file_path = os.path.join(root_dir, filename)
-                    if os.path.isfile(file_path):
-                        file_age = now - os.path.getmtime(file_path)
-                        if file_age > max_age_seconds:
-                            try:
-                                os.remove(file_path)
-                                deleted_count += 1
-                            except Exception as e:
-                                _logger.error(f"Failed to delete old file {file_path}: {e}")
-
-        return deleted_count
-
-    def retrieve_file(self, filename: str, file_type: str) -> Optional[bytes]:
+    def retrieve_file(self, filename: str, file_type: str, 
+                    start_byte: int = None, end_byte: int = None) -> Optional[Union[bytes, BinaryIO]]:
         """
-        Retrieve file data from storage
+        Retrieve file data from storage with optional range support for streaming
 
         Args:
             filename: Name of the file to retrieve
             file_type: Type of file ('audio', 'story', 'storyboard')
+            start_byte: Optional starting byte for range requests
+            end_byte: Optional ending byte for range requests
 
         Returns:
             File content as bytes, or None if file not found
+            For range requests: file-like object that can be iterated for streaming
         """
         try:
             if self.provider == "local":
                 # For local storage, read directly from file system
                 file_path = self._get_local_path(file_type, filename)
-                if os.path.exists(file_path):
-                    with open(file_path, "rb") as f:
-                        return f.read()
-                return None
+                if not os.path.exists(file_path):
+                    return None
+                
+                # If range is specified, return a file object for streaming
+                if start_byte is not None:
+                    file_obj = open(file_path, "rb")
+                    file_obj.seek(start_byte)
+                    return file_obj
+                
+                # Otherwise return the entire file as bytes
+                with open(file_path, "rb") as f:
+                    return f.read()
 
             elif self.provider == "s3":
-                # Download from S3
+                # Download from S3 with optional range
                 s3_key = f"{file_type}/{filename}"
                 try:
-                    response = self.s3_client.get_object(
-                        Bucket=config.storage.S3_BUCKET_NAME,
-                        Key=s3_key
-                    )
+                    # Prepare range string if needed
+                    range_header = None
+                    if start_byte is not None:
+                        if end_byte is not None:
+                            range_header = f"bytes={start_byte}-{end_byte}"
+                        else:
+                            range_header = f"bytes={start_byte}-"
+
+                    # Get object with optional range
+                    params = {'Bucket': config.storage.S3_BUCKET_NAME, 'Key': s3_key}
+                    if range_header:
+                        params['Range'] = range_header
+                    
+                    response = self.s3_client.get_object(**params)
+                    
+                    # For range requests, return the streaming body for efficient handling
+                    if start_byte is not None:
+                        return response['Body']
+                    
+                    # For full requests, read all data
                     return response['Body'].read()
+                    
                 except Exception as e:
                     _logger.error(f"Error downloading from S3: {e}")
                     return None
 
             elif self.provider == "azure":
-                # Download from Azure Blob
+                # Download from Azure Blob with optional range
                 blob_path = f"{file_type}/{filename}"
                 container_name = config.storage.AZURE_CONTAINER_NAME
 
@@ -297,8 +392,24 @@ class StorageManager:
                         container=container_name,
                         blob=blob_path
                     )
+                    
+                    # For range requests
+                    if start_byte is not None:
+                        if end_byte is not None:
+                            download_stream = blob_client.download_blob(
+                                offset=start_byte, 
+                                length=end_byte-start_byte+1
+                            )
+                        else:
+                            download_stream = blob_client.download_blob(
+                                offset=start_byte
+                            )
+                        return download_stream
+                    
+                    # For full downloads
                     download_stream = blob_client.download_blob()
                     return download_stream.readall()
+                    
                 except Exception as e:
                     _logger.error(f"Error downloading from Azure: {e}")
                     return None
