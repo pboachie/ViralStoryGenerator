@@ -43,21 +43,6 @@ def main():
     is_development = app_config.ENVIRONMENT.lower() == "development"
 
     # Set arguments for API server
-    uvicorn_args = [
-        "viralStoryGenerator.src.api:app",
-        "--host", args.host,
-        "--port", str(args.port),
-        "--log-level", args.log_level
-    ]
-
-    # Use reload in development mode if specified
-    if args.reload or is_development:
-        uvicorn_args.append("--reload")
-
-    # Use multiple workers in production mode
-    if not is_development:
-        uvicorn_args.extend(["--workers", str(args.workers)])
-
     # Run API server via the start_api_server function in api.py
     _logger.info(f"Starting ViralStoryGenerator API with {args.workers} workers on {args.host}:{args.port}...")
     _logger.debug("Starting API server...")
