@@ -5,7 +5,7 @@ import os
 from typing import List, Union, Optional, Tuple, Dict, Any
 import time
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
-from .redis_manager import RedisQueueManager
+from .redis_manager import RedisManager as RedisQueueManager
 
 # Configure logging
 logger = logging.getLogger(__name__)

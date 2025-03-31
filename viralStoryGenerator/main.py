@@ -15,6 +15,7 @@ def main():
     """
     Main entry point for ViralStoryGenerator API.
     """
+    _logger.debug("Parsing command-line arguments...")
     parser = argparse.ArgumentParser(
         description="ViralStoryGenerator API - Generate viral stories via HTTP"
     )
@@ -36,6 +37,7 @@ def main():
 
     # Parse arguments
     args = parser.parse_args()
+    _logger.debug(f"Arguments parsed: {args}")
 
     # Configure startup based on environment
     is_development = config.config.ENVIRONMENT.lower() == "development"
@@ -58,9 +60,11 @@ def main():
 
     # Run API server via the start_api_server function in api.py
     _logger.info(f"Starting ViralStoryGenerator API with {args.workers} workers on {args.host}:{args.port}...")
+    _logger.debug("Starting API server...")
 
     from viralStoryGenerator.src.api import start_api_server
     start_api_server(host=args.host, port=args.port, reload=args.reload or is_development)
+    _logger.debug("API server started successfully.")
 
 # Set up the FastAPI application
 app = FastAPI(
@@ -95,6 +99,7 @@ app.mount("/static/storyboards", StaticFiles(directory=config.storage.STORYBOARD
 @app.on_event("startup")
 async def startup_event():
     """Perform tasks when the application starts"""
+    _logger.debug("Startup event triggered.")
     _logger.info(f"Starting {config.APP_TITLE} v{config.VERSION}")
     _logger.info(f"Environment: {config.ENVIRONMENT}")
     _logger.info(f"Storage provider: {config.storage.PROVIDER}")
@@ -106,23 +111,28 @@ async def startup_event():
             _logger.info(f"Scheduled file cleanup enabled: Every {config.storage.CLEANUP_INTERVAL_HOURS} hours, {config.storage.FILE_RETENTION_DAYS} days retention")
         else:
             _logger.warning("Failed to start scheduled file cleanup")
+    _logger.debug("Startup event completed.")
 
 # Shutdown event handler
 @app.on_event("shutdown")
 async def shutdown_event():
     """Perform tasks when the application shuts down"""
+    _logger.debug("Shutdown event triggered.")
     _logger.info("Application shutting down")
 
     # Stop the scheduled cleanup task
     cleanup_task.stop()
+    _logger.debug("Shutdown event completed.")
 
 # Health check endpoint
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring"""
+    _logger.debug("Health check endpoint called.")
     # Include cleanup task status if it's running
     cleanup_status = cleanup_task.status() if cleanup_task.is_running else None
 
+    _logger.debug("Health check response generated.")
     return {
         "status": "healthy",
         "version": config.VERSION,

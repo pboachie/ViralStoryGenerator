@@ -9,7 +9,7 @@ import signal
 import sys
 from typing import Dict, Any
 
-from ..utils.redis_manager import RedisQueueManager
+from ..utils.redis_manager import RedisManager as RedisQueueManager
 from ..utils.crawl4ai_scraper import scrape_urls
 from ..utils.config import config
 from .llm import process_with_llm
