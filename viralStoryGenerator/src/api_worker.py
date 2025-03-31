@@ -3,7 +3,6 @@ API Worker for processing ViralStoryGenerator API requests.
 This module consumes requests from the API queue and processes them.
 """
 import asyncio
-import logging
 import os
 import signal
 import sys
@@ -16,17 +15,7 @@ from .llm import process_with_llm
 from .source_cleanser import chunkify_and_summarize
 from .storyboard import generate_storyboard
 from .elevenlabs_tts import generate_audio
-
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('api_worker.log')
-    ]
-)
-logger = logging.getLogger(__name__)
+from viralStoryGenerator.src.logger import logger as _logger
 
 # API queue configuration
 API_QUEUE_NAME = os.environ.get("API_QUEUE_NAME", "api_requests")
@@ -37,10 +26,11 @@ shutdown_event = asyncio.Event()
 
 def handle_shutdown(sig, frame):
     """Handle shutdown signals gracefully."""
-    logger.info(f"Received signal {sig}, shutting down API worker...")
+    _logger.info(f"Received signal {sig}, shutting down API worker...")
     shutdown_event.set()
 
 async def process_story_generation(job_id: str, request_data: Dict[str, Any], queue_manager: RedisQueueManager):
+    _logger.debug(f"Processing story generation for job_id: {job_id}")
     """
     Process a story generation request asynchronously.
 
@@ -49,7 +39,7 @@ async def process_story_generation(job_id: str, request_data: Dict[str, Any], qu
         request_data: Request data containing URLs and parameters
         queue_manager: Redis queue manager instance
     """
-    logger.info(f"Processing job {job_id} for topic: {request_data['topic']}")
+    _logger.info(f"Processing job {job_id} for topic: {request_data['topic']}")
 
     try:
         # Update status to processing
@@ -137,21 +127,23 @@ async def process_story_generation(job_id: str, request_data: Dict[str, Any], qu
                 # In a real-world scenario, you would host this file and return a URL
                 result["audio_url"] = f"/audio/{audio_path.name}"
             except Exception as e:
-                logger.error(f"Error generating audio: {str(e)}")
+                _logger.error(f"Error generating audio: {str(e)}")
                 result["audio_url"] = None
 
         # Store the final result
         queue_manager.store_result(job_id, result)
-        logger.info(f"Completed job {job_id}")
+        _logger.info(f"Completed job {job_id}")
+        _logger.debug(f"Story generation completed for job_id: {job_id}")
 
     except Exception as e:
-        logger.error(f"Error processing job {job_id}: {str(e)}")
+        _logger.error(f"Error processing job {job_id}: {str(e)}")
         queue_manager.store_result(job_id, {
             "status": "failed",
             "message": f"Job failed: {str(e)}"
         })
 
 async def run_worker():
+    _logger.debug("Starting worker loop...")
     """Run the API queue worker with graceful shutdown handling."""
     # Worker configuration
     batch_size = int(os.environ.get("REDIS_WORKER_BATCH_SIZE",
@@ -161,7 +153,7 @@ async def run_worker():
     max_concurrent = int(os.environ.get("REDIS_WORKER_MAX_CONCURRENT",
                                        config.redis.WORKER_MAX_CONCURRENT))
 
-    logger.info(f"Starting API worker with batch_size={batch_size}, max_concurrent={max_concurrent}")
+    _logger.info(f"Starting API worker with batch_size={batch_size}, max_concurrent={max_concurrent}")
 
     try:
         queue_manager = RedisQueueManager(
@@ -169,7 +161,7 @@ async def run_worker():
             result_prefix=API_RESULT_PREFIX
         )
     except Exception as e:
-        logger.error(f"Failed to initialize Redis queue manager: {str(e)}")
+        _logger.error(f"Failed to initialize Redis queue manager: {str(e)}")
         return
 
     while not shutdown_event.is_set():
@@ -192,7 +184,7 @@ async def run_worker():
                 await asyncio.sleep(sleep_interval)
                 continue
 
-            logger.info(f"Processing batch of {len(batch)} API requests")
+            _logger.info(f"Processing batch of {len(batch)} API requests")
 
             # Process requests in batches with max_concurrent limit
             tasks = []
@@ -211,11 +203,13 @@ async def run_worker():
             await asyncio.sleep(0.1)
 
         except Exception as e:
-            logger.error(f"Error in API worker: {str(e)}")
+            _logger.error(f"Error in API worker: {str(e)}")
             await asyncio.sleep(sleep_interval)
+    _logger.debug("Worker loop completed.")
 
 def main():
     """Entry point for the API worker process."""
+    _logger.debug("Initializing API worker...")
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
@@ -224,21 +218,22 @@ def main():
         # Windows-specific asyncio setup for signal handling
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    logger.info(f"Starting API Queue Worker (queue={API_QUEUE_NAME}, result_prefix={API_RESULT_PREFIX})")
+    _logger.info(f"Starting API Queue Worker (queue={API_QUEUE_NAME}, result_prefix={API_RESULT_PREFIX})")
 
     # Check if Redis is enabled in configuration
     if not config.redis.ENABLED:
-        logger.error("Redis is disabled in configuration. Enable it to use the API worker.")
+        _logger.error("Redis is disabled in configuration. Enable it to use the API worker.")
         sys.exit(1)
 
     try:
         asyncio.run(run_worker())
     except KeyboardInterrupt:
-        logger.info("API worker stopped by keyboard interrupt")
+        _logger.info("API worker stopped by keyboard interrupt")
     except Exception as e:
-        logger.exception(f"API worker failed with error: {str(e)}")
+        _logger.exception(f"API worker failed with error: {str(e)}")
 
-    logger.info("API Queue Worker shutdown complete")
+    _logger.info("API Queue Worker shutdown complete")
+    _logger.debug("API worker initialized.")
 
 if __name__ == "__main__":
     main()

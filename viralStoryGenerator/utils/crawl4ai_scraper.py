@@ -1,14 +1,11 @@
 #/viralStoryGenerator/utils/crawl4ai_scraper.py
 import asyncio
-import logging
 import os
 from typing import List, Union, Optional, Tuple, Dict, Any
 import time
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from .redis_manager import RedisManager as RedisQueueManager
-
-# Configure logging
-logger = logging.getLogger(__name__)
+from viralStoryGenerator.src.logger import logger as _logger
 
 # Initialize Redis queue manager with environment variables if available
 def get_redis_manager() -> RedisQueueManager:
@@ -18,6 +15,7 @@ def get_redis_manager() -> RedisQueueManager:
     Returns:
         RedisQueueManager: An instance of the Redis queue manager
     """
+    _logger.debug("Initializing Redis queue manager...")
     host = os.environ.get('REDIS_HOST', 'localhost')
     port = int(os.environ.get('REDIS_PORT', 6379))
     db = int(os.environ.get('REDIS_DB', 0))
@@ -26,9 +24,11 @@ def get_redis_manager() -> RedisQueueManager:
     try:
         return RedisQueueManager(host=host, port=port, db=db, password=password)
     except Exception as e:
-        logger.error(f"Failed to initialize Redis queue manager: {str(e)}")
-        logger.warning("Continuing without Redis queue management")
+        _logger.error(f"Failed to initialize Redis queue manager: {str(e)}")
+        _logger.warning("Continuing without Redis queue management")
         return None
+    finally:
+        _logger.debug("Redis queue manager initialized.")
 
 # Queue-based version that uses Redis if available
 async def queue_scrape_request(
@@ -53,7 +53,7 @@ async def queue_scrape_request(
     """
     manager = get_redis_manager()
     if not manager:
-        logger.warning("Redis queue manager not available, falling back to direct scraping")
+        _logger.warning("Redis queue manager not available, falling back to direct scraping")
         return None
 
     # Prepare request data
@@ -73,12 +73,12 @@ async def queue_scrape_request(
             if result:
                 return result
             else:
-                logger.warning(f"Timed out waiting for result of request {request_id}")
+                _logger.warning(f"Timed out waiting for result of request {request_id}")
                 return request_id
 
         return request_id
     except Exception as e:
-        logger.error(f"Failed to queue scraping request: {str(e)}")
+        _logger.error(f"Failed to queue scraping request: {str(e)}")
         return None
 
 async def get_scrape_result(request_id: str) -> Union[List[Tuple[str, Optional[str]]], None]:
@@ -93,7 +93,7 @@ async def get_scrape_result(request_id: str) -> Union[List[Tuple[str, Optional[s
     """
     manager = get_redis_manager()
     if not manager:
-        logger.error("Redis queue manager not available, cannot retrieve result")
+        _logger.error("Redis queue manager not available, cannot retrieve result")
         return None
 
     try:
@@ -102,7 +102,7 @@ async def get_scrape_result(request_id: str) -> Union[List[Tuple[str, Optional[s
             return result['data']
         return None
     except Exception as e:
-        logger.error(f"Failed to get scrape result: {str(e)}")
+        _logger.error(f"Failed to get scrape result: {str(e)}")
         return None
 
 async def scrape_urls(
@@ -147,13 +147,14 @@ async def scrape_urls(
             asyncio.run(main())
         ```
     """
+    _logger.debug(f"Scraping URLs: {urls}")
     # Try to use the Redis queue first
     queued_request_id = await queue_scrape_request(urls, browser_config, run_config)
     if queued_request_id:
         result = await get_scrape_result(queued_request_id)
         if result:
             return result
-        logger.info("Falling back to direct scraping after queue attempt")
+        _logger.info("Falling back to direct scraping after queue attempt")
 
     # Convert single URL string to a list for uniform processing
     if isinstance(urls, str):
@@ -177,6 +178,7 @@ async def scrape_urls(
             # Append successful crawl results as Markdown
             output.append((url, result.markdown))
 
+    _logger.debug(f"Scraping completed for URLs: {urls}")
     return output
 
 # Worker function to process queued requests in a background process
@@ -199,10 +201,10 @@ async def process_queue_worker(
     """
     manager = get_redis_manager()
     if not manager:
-        logger.error("Redis queue manager not available, cannot start worker")
+        _logger.error("Redis queue manager not available, cannot start worker")
         return
 
-    logger.info(f"Starting queue worker process with batch_size={batch_size}, max_concurrent={max_concurrent}")
+    _logger.info(f"Starting queue worker process with batch_size={batch_size}, max_concurrent={max_concurrent}")
 
     while True:
         try:
@@ -224,7 +226,7 @@ async def process_queue_worker(
                 await asyncio.sleep(sleep_interval)
                 continue
 
-            logger.info(f"Processing batch of {len(batch)} requests")
+            _logger.info(f"Processing batch of {len(batch)} requests")
 
             # Process requests in batches with max_concurrent limit
             for i in range(0, len(batch), max_concurrent):
@@ -247,9 +249,9 @@ async def process_queue_worker(
 
                             # Store result in Redis
                             manager.store_result(req_id, result)
-                            logger.info(f"Successfully processed request {req_id}")
+                            _logger.info(f"Successfully processed request {req_id}")
                         except Exception as e:
-                            logger.error(f"Error processing request {req_id}: {str(e)}")
+                            _logger.error(f"Error processing request {req_id}: {str(e)}")
                             # Store error as result
                             manager.store_result(req_id, {'error': str(e)})
 
@@ -262,5 +264,5 @@ async def process_queue_worker(
             await asyncio.sleep(0.1)
 
         except Exception as e:
-            logger.error(f"Error in queue worker: {str(e)}")
+            _logger.error(f"Error in queue worker: {str(e)}")
             await asyncio.sleep(sleep_interval)

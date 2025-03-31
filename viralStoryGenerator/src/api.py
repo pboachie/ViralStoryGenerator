@@ -4,7 +4,6 @@ This module provides HTTP endpoints that replicate CLI functionality
 but accept URLs instead of file paths.
 """
 import asyncio
-import logging
 import uuid
 import time
 import os
@@ -21,7 +20,7 @@ from starlette.responses import Response
 import uvicorn
 import redis
 
-from ..utils.redis_manager import RedisQueueManager
+from ..utils.redis_manager import RedisManager as RedisQueueManager
 from ..utils.storage_manager import storage_manager
 from ..utils.crawl4ai_scraper import scrape_urls
 from ..utils.config import config
@@ -29,16 +28,13 @@ from ..src.llm import process_with_llm
 from ..src.source_cleanser import chunkify_and_summarize
 from ..src.storyboard import generate_storyboard
 from ..src.elevenlabs_tts import generate_elevenlabs_audio
+from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.src.api_handlers import (
     create_story_task,
     get_task_status,
     process_story_task,
     process_audio_queue
 )
-from viralStoryGenerator.src.logger import logger as _logger
-
-# Configure logging
-logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -146,6 +142,7 @@ rate_limiter = RateLimiter(redis_client)
 # Middleware for metrics
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
+    _logger.debug(f"Metrics middleware triggered for {request.method} {request.url.path}")
     ACTIVE_REQUESTS.inc()
     request_start_time = time.time()
 
@@ -161,11 +158,13 @@ async def metrics_middleware(request: Request, call_next):
         REQUEST_COUNT.labels(method=request.method, endpoint=request.url.path, status=status_code).inc()
         ACTIVE_REQUESTS.dec()
 
+    _logger.debug(f"Metrics middleware completed for {request.method} {request.url.path}")
     return response
 
 # Rate limiting middleware
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
+    _logger.debug(f"Rate limit middleware triggered for {request.method} {request.url.path}")
     if config.http.RATE_LIMIT_ENABLED:
         client_ip = request.client.host
         endpoint = request.url.path
@@ -209,6 +208,7 @@ async def rate_limit_middleware(request: Request, call_next):
         response.headers["X-RateLimit-Limit"] = str(limit)
         response.headers["X-RateLimit-Remaining"] = str(limit - current)
 
+    _logger.debug(f"Rate limit middleware completed for {request.method} {request.url.path}")
     return response
 
 # Request logging middleware
@@ -259,7 +259,7 @@ def get_queue_manager() -> RedisQueueManager:
 
         return manager
     except Exception as e:
-        logger.error(f"Failed to initialize Redis queue: {str(e)}")
+        _logger.error(f"Failed to initialize Redis queue: {str(e)}")
         raise HTTPException(status_code=500, detail="Redis queue service unavailable")
 
 # Error handler
@@ -344,6 +344,7 @@ async def generate_story(
     sources_folder: Optional[str] = None,
     voice_id: Optional[str] = None
 ):
+    _logger.debug(f"Generate story endpoint called with topic: {topic}")
     """
     Create a new story generation task
 
@@ -357,10 +358,12 @@ async def generate_story(
     - status: initial status of the task
     """
     task = create_story_task(topic, sources_folder, voice_id)
+    _logger.debug(f"Story generation task created for topic: {topic}")
     return task
 
 @app.get("/api/stories/{task_id}", dependencies=[Depends(get_api_key)])
 async def check_story_status(task_id: str):
+    _logger.debug(f"Check story status endpoint called for task_id: {task_id}")
     """
     Check the status of a story generation task
 
@@ -373,6 +376,7 @@ async def check_story_status(task_id: str):
     task_info = get_task_status(task_id)
     if not task_info:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _logger.debug(f"Story status retrieved for task_id: {task_id}")
     return task_info
 
 # Direct file serving for local storage
@@ -628,7 +632,7 @@ async def generate_story_from_urls(
         )
 
     except Exception as e:
-        logger.error(f"Error queueing job: {str(e)}")
+        _logger.error(f"Error queueing job: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to queue job: {str(e)}")
 
 @app.get("/api/status/{job_id}")
@@ -648,7 +652,7 @@ async def get_job_status(
         return result
 
     except Exception as e:
-        logger.error(f"Error checking job status: {str(e)}")
+        _logger.error(f"Error checking job status: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to check job status: {str(e)}")
 
 # Function to generate audio from text
@@ -668,7 +672,7 @@ def generate_audio(text: str) -> Dict[str, Any]:
         voice_id = config.elevenLabs.VOICE_ID
 
         if not api_key:
-            logger.error("No ElevenLabs API key configured. Cannot generate audio.")
+            _logger.error("No ElevenLabs API key configured. Cannot generate audio.")
             raise ValueError("ElevenLabs API key not configured")
 
         # Generate a unique filename
@@ -707,7 +711,7 @@ def generate_audio(text: str) -> Dict[str, Any]:
         return file_info
 
     except Exception as e:
-        logger.error(f"Error generating audio: {str(e)}")
+        _logger.error(f"Error generating audio: {str(e)}")
         raise
 
 async def process_story_generation(job_id: str, request_data: Dict[str, Any]):
@@ -719,7 +723,7 @@ async def process_story_generation(job_id: str, request_data: Dict[str, Any]):
         job_id: Unique identifier for the job
         request_data: Request data containing URLs and parameters
     """
-    logger.info(f"Starting job {job_id} for topic: {request_data['topic']}")
+    _logger.info(f"Starting job {job_id} for topic: {request_data['topic']}")
 
     try:
         queue_manager = RedisQueueManager(
@@ -822,16 +826,16 @@ async def process_story_generation(job_id: str, request_data: Dict[str, Any]):
                 }
 
             except Exception as e:
-                logger.error(f"Error generating audio: {str(e)}")
+                _logger.error(f"Error generating audio: {str(e)}")
                 result["audio_url"] = None
                 result["audio_error"] = str(e)
 
         # Store the final result
         queue_manager.store_result(job_id, result)
-        logger.info(f"Completed job {job_id}")
+        _logger.info(f"Completed job {job_id}")
 
     except Exception as e:
-        logger.error(f"Error processing job {job_id}: {str(e)}")
+        _logger.error(f"Error processing job {job_id}: {str(e)}")
         try:
             # Store the error
             queue_manager = RedisQueueManager(
@@ -843,7 +847,7 @@ async def process_story_generation(job_id: str, request_data: Dict[str, Any]):
                 "message": f"Job failed: {str(e)}"
             })
         except Exception:
-            logger.exception("Failed to store job failure")
+            _logger.exception("Failed to store job failure")
 
 def start_api_server(host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
     """Start the FastAPI server with uvicorn"""
