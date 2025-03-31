@@ -2,10 +2,63 @@ import requests
 import time
 import json
 import base64
+import os
+import uuid
+import tempfile
+from typing import Dict, Any
 from viralStoryGenerator.src.logger import logger as _logger
+from viralStoryGenerator.utils.config import config
 
 DEFAULT_VOICE_ID = "JZ3e95uoTACVf6tXaaEi"
 DEFAULT_MODEL_ID = "eleven_multilingual_v2"
+
+def generate_audio(text: str) -> Dict[str, Any]:
+    """
+    Generate audio from text using ElevenLabs TTS
+
+    Args:
+        text: Text to convert to speech
+
+    Returns:
+        Dict with file information including path and URL
+    """
+    try:
+        # Check for API key
+        api_key = config.elevenLabs.API_KEY
+        voice_id = config.elevenLabs.VOICE_ID
+
+        if not api_key:
+            _logger.error("No ElevenLabs API key configured. Cannot generate audio.")
+            raise ValueError("ElevenLabs API key not configured")
+
+        # Generate a unique filename
+        filename = f"{uuid.uuid4()}.mp3"
+        temp_path = os.path.join(tempfile.gettempdir(), filename)
+
+        # Generate the audio file
+        success = generate_elevenlabs_audio(
+            text=text,
+            api_key=api_key,
+            output_mp3_path=temp_path,
+            voice_id=voice_id,
+            model_id="eleven_multilingual_v2",
+            stability=0.5,
+            similarity_boost=0.75
+        )
+
+        if not success:
+            raise ValueError("Failed to generate audio with ElevenLabs API")
+
+        # Return a simple file info structure
+        return {
+            "name": filename,
+            "path": temp_path,
+            "file_path": temp_path
+        }
+
+    except Exception as e:
+        _logger.error(f"Error generating audio: {str(e)}")
+        raise
 
 def generate_elevenlabs_audio(
     text,
