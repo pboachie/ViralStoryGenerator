@@ -53,7 +53,8 @@ services:
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -90,7 +91,8 @@ services:
       context: .
       dockerfile: Dockerfile.worker
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -124,7 +126,6 @@ services:
       - ./data:/app/data
       - ${ENV_FILE:-./.env}:/app/.env:ro
 
-  # Monitoring service for production
   prometheus:
     image: prom/prometheus:latest
     volumes:
@@ -139,6 +140,8 @@ services:
       - "9090:9090"
     networks:
       - viral-network
+    depends_on:
+      - redis
     deploy:
       placement:
         constraints:
@@ -158,13 +161,13 @@ services:
       - "3000:3000"
     networks:
       - viral-network
+    depends_on:
+      - prometheus
     deploy:
       placement:
         constraints:
           - node.role == manager
     restart: always
-    depends_on:
-      - prometheus
 
 networks:
   viral-network:

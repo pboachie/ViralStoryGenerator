@@ -14,7 +14,7 @@ from ..utils.config import config
 from .llm import process_with_llm
 from .source_cleanser import chunkify_and_summarize
 from .storyboard import generate_storyboard
-from .elevenlabs_tts import generate_audio
+from .api import generate_audio
 from viralStoryGenerator.src.logger import logger as _logger
 
 # API queue configuration
