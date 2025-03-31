@@ -1,0 +1,142 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - viral-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    command: redis-server --appendonly yes
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_ENABLED=${REDIS_ENABLED}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ENVIRONMENT=${ENVIRONMENT}
+      - API_QUEUE_NAME=${API_QUEUE_NAME}
+      - API_RESULT_PREFIX=${API_RESULT_PREFIX}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID}
+      - LLM_ENDPOINT=${LLM_ENDPOINT}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS}
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER}
+      - LOCAL_STORAGE_PATH=${LOCAL_STORAGE_PATH}
+      - AUDIO_STORAGE_PATH=${AUDIO_STORAGE_PATH}
+      - STORY_STORAGE_PATH=${STORY_STORAGE_PATH}
+      - STORYBOARD_STORAGE_PATH=${STORYBOARD_STORAGE_PATH}
+      - FILE_RETENTION_DAYS=${FILE_RETENTION_DAYS}
+      - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS}
+      - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED}
+      - RATE_LIMIT_REQUESTS=${RATE_LIMIT_REQUESTS}
+      - RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW}
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - API_KEY_ENABLED=${API_KEY_ENABLED}
+      - API_KEY=${API_KEY}
+    networks:
+      - viral-network
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 1G
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_ENABLED=${REDIS_ENABLED}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ENVIRONMENT=${ENVIRONMENT}
+      - REDIS_WORKER_BATCH_SIZE=5
+      - REDIS_WORKER_MAX_CONCURRENT=3
+    networks:
+      - viral-network
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '0.7'
+          memory: 1G
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+
+  api-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_ENABLED=${REDIS_ENABLED}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ENVIRONMENT=${ENVIRONMENT}
+      - REDIS_QUEUE_NAME=api_requests
+      - REDIS_RESULT_PREFIX="api_result:"
+      - REDIS_WORKER_BATCH_SIZE=3
+      - REDIS_WORKER_MAX_CONCURRENT=2
+    command: python -m viralStoryGenerator.src.api_worker
+    networks:
+      - viral-network
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '0.7'
+          memory: 1G
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+
+networks:
+  viral-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+    driver: local

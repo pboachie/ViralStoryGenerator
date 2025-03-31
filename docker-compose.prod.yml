@@ -1,0 +1,222 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    restart: always
+    networks:
+      - viral-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    command: redis-server --appendonly yes
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+    ports:
+      - "9121:9121"
+    networks:
+      - viral-network
+    restart: always
+    depends_on:
+      - redis
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 128M
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_ENABLED=${REDIS_ENABLED}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ENVIRONMENT=${ENVIRONMENT}
+      - API_QUEUE_NAME=${API_QUEUE_NAME}
+      - API_RESULT_PREFIX=${API_RESULT_PREFIX}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID}
+      - LLM_ENDPOINT=${LLM_ENDPOINT}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS}
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER}
+      - LOCAL_STORAGE_PATH=${LOCAL_STORAGE_PATH}
+      - AUDIO_STORAGE_PATH=${AUDIO_STORAGE_PATH}
+      - STORY_STORAGE_PATH=${STORY_STORAGE_PATH}
+      - STORYBOARD_STORAGE_PATH=${STORYBOARD_STORAGE_PATH}
+      - FILE_RETENTION_DAYS=${FILE_RETENTION_DAYS}
+      - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS}
+      - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED}
+      - RATE_LIMIT_REQUESTS=${RATE_LIMIT_REQUESTS}
+      - RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW}
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - API_KEY_ENABLED=${API_KEY_ENABLED}
+      - API_KEY=${API_KEY}
+    networks:
+      - viral-network
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: ${BACKEND_REPLICAS:-2}
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+        window: 120s
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+        reservations:
+          cpus: '0.25'
+          memory: 512M
+    volumes:
+      - ./data:/app/data
+      - ${ENV_FILE:-./.env}:/app/.env:ro
+
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_ENABLED=${REDIS_ENABLED}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ENVIRONMENT=${ENVIRONMENT}
+      - REDIS_WORKER_BATCH_SIZE=${WORKER_BATCH_SIZE:-5}
+      - REDIS_WORKER_MAX_CONCURRENT=${WORKER_CONCURRENT:-3}
+      - API_QUEUE_NAME=${API_QUEUE_NAME}
+      - API_RESULT_PREFIX=${API_RESULT_PREFIX}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID}
+      - LLM_ENDPOINT=${LLM_ENDPOINT}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS}
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER}
+      - LOCAL_STORAGE_PATH=${LOCAL_STORAGE_PATH}
+      - AUDIO_STORAGE_PATH=${AUDIO_STORAGE_PATH}
+      - STORY_STORAGE_PATH=${STORY_STORAGE_PATH}
+      - STORYBOARD_STORAGE_PATH=${STORYBOARD_STORAGE_PATH}
+      - FILE_RETENTION_DAYS=${FILE_RETENTION_DAYS}
+      - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS}
+      - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED}
+      - RATE_LIMIT_REQUESTS=${RATE_LIMIT_REQUESTS}
+      - RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW}
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - API_KEY_ENABLED=${API_KEY_ENABLED}
+      - API_KEY=${API_KEY}
+    networks:
+      - viral-network
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: ${SCRAPER_REPLICAS:-3}
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+        window: 120s
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    volumes:
+      - ./data:/app/data
+      - ${ENV_FILE:-./.env}:/app/.env:ro
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./monitoring/prometheus/:/etc/prometheus/
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    networks:
+      - viral-network
+    depends_on:
+      - redis
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+    restart: always
+
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning/:/etc/grafana/provisioning/
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"
+    networks:
+      - viral-network
+    depends_on:
+      - prometheus
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+    restart: always
+
+networks:
+  viral-network:
+    driver: overlay
+    attachable: true
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:
