@@ -8,11 +8,13 @@ import logging
 import uuid
 import time
 import os
+import tempfile
 from typing import List, Dict, Any, Optional, Tuple
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, AnyHttpUrl, Field
 from prometheus_client import Counter, Histogram, Gauge, generate_latest
 from starlette.responses import Response
@@ -20,12 +22,13 @@ import uvicorn
 import redis
 
 from ..utils.redis_manager import RedisQueueManager
+from ..utils.storage_manager import storage_manager
 from ..utils.crawl4ai_scraper import scrape_urls
 from ..utils.config import config
 from ..src.llm import process_with_llm
 from ..src.source_cleanser import chunkify_and_summarize
 from ..src.storyboard import generate_storyboard
-from ..src.elevenlabs_tts import generate_audio
+from ..src.elevenlabs_tts import generate_elevenlabs_audio
 from viralStoryGenerator.src.api_handlers import (
     create_story_task,
     get_task_status,
@@ -43,6 +46,10 @@ app = FastAPI(
     description=config.APP_DESCRIPTION,
     version=config.VERSION
 )
+
+# Mount static file directory for local storage
+os.makedirs(config.storage.LOCAL_STORAGE_PATH, exist_ok=True)
+app.mount("/static", StaticFiles(directory=config.storage.LOCAL_STORAGE_PATH), name="static")
 
 # Prometheus metrics
 REQUEST_COUNT = Counter('api_requests_total', 'Total API requests', ['method', 'endpoint', 'status'])
@@ -264,16 +271,37 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"error": "An unexpected error occurred", "detail": str(exc)},
     )
 
-# Periodic task scheduler (simplified)
+# Periodic task scheduler
 @app.on_event("startup")
 async def startup_event():
     _logger.info("API server starting up...")
     # Process any queued audio files at startup
     process_audio_queue()
 
+    # Start the cleanup background task if enabled
+    if config.storage.FILE_RETENTION_DAYS > 0:
+        asyncio.create_task(scheduled_cleanup())
+
 @app.on_event("shutdown")
 async def shutdown_event():
     _logger.info("API server shutting down...")
+
+async def scheduled_cleanup():
+    """Run periodic cleanup of old files based on retention policy"""
+    while True:
+        try:
+            # Sleep first to avoid cleanup right at startup
+            await asyncio.sleep(24 * 60 * 60)  # Run once per day
+
+            # Get the retention period from config
+            retention_days = config.storage.FILE_RETENTION_DAYS
+
+            if retention_days > 0:
+                _logger.info(f"Running scheduled cleanup of files older than {retention_days} days")
+                deleted_count = storage_manager.cleanup_old_files(retention_days)
+                _logger.info(f"Cleanup complete: {deleted_count} files removed")
+        except Exception as e:
+            _logger.error(f"Error in scheduled cleanup: {e}")
 
 # Setup API security if enabled in config
 API_KEY_NAME = "X-API-Key"
@@ -346,6 +374,138 @@ async def check_story_status(task_id: str):
     if not task_info:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     return task_info
+
+# Direct file serving for local storage
+@app.get("/audio/{filename}")
+async def serve_audio_file(filename: str):
+    """Serve audio files directly"""
+    file_path = os.path.join(config.storage.AUDIO_STORAGE_PATH, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    return FileResponse(
+        path=file_path,
+        media_type="audio/mpeg",
+        filename=filename
+    )
+
+@app.get("/api/audio/stream/{filename}")
+async def stream_audio(
+    filename: str,
+    range: str = None
+):
+    """
+    Stream audio file with support for range requests (needed for seeking in audio players)
+
+    Parameters:
+    - filename: Name of the audio file to stream
+    - range: HTTP Range header for partial content requests
+
+    Returns:
+    - Streaming response with audio data and appropriate headers for HTML5 audio players
+    """
+    file_path = os.path.join(config.storage.AUDIO_STORAGE_PATH, filename)
+
+    if not os.path.exists(file_path):
+        # Try to get from cloud storage if not on local filesystem
+        if config.storage.PROVIDER != "local":
+            try:
+                # Retrieve file from cloud storage to a temporary location
+                temp_file = os.path.join(tempfile.gettempdir(), filename)
+                file_data = storage_manager.retrieve_file(filename, "audio")
+
+                if file_data:
+                    with open(temp_file, "wb") as f:
+                        f.write(file_data)
+                    file_path = temp_file
+                else:
+                    raise HTTPException(status_code=404, detail="Audio file not found in storage")
+            except Exception as e:
+                _logger.error(f"Error retrieving audio from storage: {e}")
+                raise HTTPException(status_code=404, detail="Audio file not found")
+        else:
+            raise HTTPException(status_code=404, detail="Audio file not found")
+
+    file_size = os.path.getsize(file_path)
+
+    # Handle range requests for audio seeking
+    start = 0
+    end = file_size - 1
+    status_code = 200
+
+    if range is not None:
+        try:
+            # Parse range header (e.g., "bytes=0-1023")
+            range_header = range.replace("bytes=", "").split("-")
+            start = int(range_header[0]) if range_header[0] else 0
+            end = int(range_header[1]) if range_header[1] else file_size - 1
+
+            # Validate range
+            if end >= file_size:
+                end = file_size - 1
+
+            # Use 206 Partial Content for range requests
+            if start > 0 or end < file_size - 1:
+                status_code = 206
+        except ValueError:
+            # If range header is invalid, ignore it
+            pass
+
+    # Calculate content length
+    content_length = end - start + 1
+
+    # Define headers
+    headers = {
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(content_length),
+        "Cache-Control": "public, max-age=3600"  # Allow caching for 1 hour
+    }
+
+    # Function to stream file content in chunks
+    async def file_streamer():
+        with open(file_path, "rb") as f:
+            f.seek(start)
+            remaining = content_length
+            chunk_size = 64 * 1024  # 64KB chunks for efficient streaming
+
+            while remaining > 0:
+                chunk = f.read(min(chunk_size, remaining))
+                if not chunk:
+                    break
+
+                yield chunk
+                remaining -= len(chunk)
+
+    return StreamingResponse(
+        file_streamer(),
+        media_type="audio/mpeg",
+        headers=headers,
+        status_code=status_code
+    )
+
+@app.get("/story/{filename}")
+async def serve_story_file(filename: str):
+    """Serve story text files directly"""
+    file_path = os.path.join(config.storage.STORY_STORAGE_PATH, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Story file not found")
+    return FileResponse(
+        path=file_path,
+        media_type="text/plain",
+        filename=filename
+    )
+
+@app.get("/storyboard/{filename}")
+async def serve_storyboard_file(filename: str):
+    """Serve storyboard JSON files directly"""
+    file_path = os.path.join(config.storage.STORYBOARD_STORAGE_PATH, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Storyboard file not found")
+    return FileResponse(
+        path=file_path,
+        media_type="application/json",
+        filename=filename
+    )
 
 @app.get("/api/stories/{task_id}/download/{file_type}", dependencies=[Depends(get_api_key)])
 async def download_story_file(task_id: str, file_type: str):
@@ -446,6 +606,65 @@ async def get_job_status(
         logger.error(f"Error checking job status: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to check job status: {str(e)}")
 
+# Function to generate audio from text
+def generate_audio(text: str) -> Dict[str, Any]:
+    """
+    Generate audio from text using ElevenLabs TTS
+
+    Args:
+        text: Text to convert to speech
+
+    Returns:
+        Dict with file information including path and URL
+    """
+    try:
+        # Check for API key
+        api_key = config.elevenLabs.API_KEY
+        voice_id = config.elevenLabs.VOICE_ID
+
+        if not api_key:
+            logger.error("No ElevenLabs API key configured. Cannot generate audio.")
+            raise ValueError("ElevenLabs API key not configured")
+
+        # Generate a unique filename
+        filename = f"{uuid.uuid4()}.mp3"
+        temp_path = os.path.join(tempfile.gettempdir(), filename)
+
+        # Generate the audio file
+        success = generate_elevenlabs_audio(
+            text=text,
+            api_key=api_key,
+            output_mp3_path=temp_path,
+            voice_id=voice_id,
+            model_id="eleven_multilingual_v2",
+            stability=0.5,
+            similarity_boost=0.75
+        )
+
+        if not success:
+            raise ValueError("Failed to generate audio with ElevenLabs API")
+
+        # Store the audio file using the storage manager
+        with open(temp_path, "rb") as f:
+            audio_data = f.read()
+
+        # Store the audio file in the configured storage
+        file_info = storage_manager.store_file(
+            file_data=audio_data,
+            file_type="audio",
+            filename=filename,
+            content_type="audio/mpeg"
+        )
+
+        # Clean up temp file
+        os.remove(temp_path)
+
+        return file_info
+
+    except Exception as e:
+        logger.error(f"Error generating audio: {str(e)}")
+        raise
+
 async def process_story_generation(job_id: str, request_data: Dict[str, Any]):
     """
     Process a story generation request asynchronously.
@@ -538,12 +757,29 @@ async def process_story_generation(job_id: str, request_data: Dict[str, Any]):
             })
 
             try:
-                audio_path = generate_audio(story_script)
-                # In a real-world scenario, you would host this file and return a URL
-                result["audio_url"] = f"/audio/{audio_path.name}"
+                # Generate audio and store it in the configured storage
+                file_info = generate_audio(story_script)
+
+                # Add audio URL to result
+                if config.storage.PROVIDER == "local":
+                    # For local storage, construct URL using server's base URL
+                    result["audio_url"] = f"{config.http.BASE_URL}/audio/{os.path.basename(file_info.get('file_path', ''))}"
+                else:
+                    # For cloud storage providers, use the URL directly
+                    result["audio_url"] = file_info.get("url", None)
+
+                # For tracking, add file path details
+                result["audio_file"] = {
+                    "path": file_info.get("file_path", ""),
+                    "filename": file_info.get("filename", ""),
+                    "provider": file_info.get("provider", "local"),
+                    "storage_id": file_info.get("id", "")
+                }
+
             except Exception as e:
                 logger.error(f"Error generating audio: {str(e)}")
                 result["audio_url"] = None
+                result["audio_error"] = str(e)
 
         # Store the final result
         queue_manager.store_result(job_id, result)
