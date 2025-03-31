@@ -10,13 +10,13 @@ from viralStoryGenerator.src.llm import generate_story_script
 from viralStoryGenerator.src.source_cleanser import chunkify_and_summarize
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
 from viralStoryGenerator.src.logger import logger as _logger
-from viralStoryGenerator.utils.config import config
+from viralStoryGenerator.utils.config import config as appconfig
 from viralStoryGenerator.utils.redis_manager import RedisManager
 
 # Directory where failed audio generations are queued
-AUDIO_QUEUE_DIR = config.config.AUDIO_QUEUE_DIR
+AUDIO_QUEUE_DIR = appconfig.AUDIO_QUEUE_DIR
 # Redis manager for task queue
-redis_manager = RedisManager() if config.config.redis.ENABLED else None
+redis_manager = RedisManager() if appconfig.redis.ENABLED else None
 
 class StoryTask:
     """Class to manage story generation tasks"""
@@ -103,7 +103,7 @@ def _save_story_output(result, topic, voice_id=None) -> Dict[str, str]:
         result_paths["audio"] = mp3_file_path
 
         # We'll assume your ElevenLabs API key is stored somewhere
-        api_key = config.config.elevenLabs.API_KEY
+        api_key = appconfig.elevenLabs.API_KEY
         if not api_key:
             _logger.warning("No ElevenLabs API Key found. Skipping TTS generation.")
             return result_paths
@@ -175,7 +175,7 @@ def process_audio_queue():
                 _logger.error(f"Error reading queued file {file_path}: {e}")
                 continue
 
-            api_key = config.config.elevenLabs.API_KEY
+            api_key = appconfig.elevenLabs.API_KEY
             if not api_key:
                 _logger.error("No ElevenLabs API Key found. Skipping queued audio generation.")
                 break
@@ -307,10 +307,10 @@ def process_story_task(task_id: str, topic: str, sources_folder: Optional[str] =
             _logger.debug("Splitting & summarizing sources via LLM (multi-chunk)...")
             cleansed_sources = chunkify_and_summarize(
                 raw_sources=raw_sources,
-                endpoint=config.config.llm.ENDPOINT,
-                model=config.config.llm.MODEL,
-                temperature=config.config.llm.TEMPERATURE,
-                chunk_size=config.config.llm.CHUNK_SIZE
+                endpoint=appconfig.llm.ENDPOINT,
+                model=appconfig.llm.MODEL,
+                temperature=appconfig.llm.TEMPERATURE,
+                chunk_size=appconfig.llm.CHUNK_SIZE
             )
             _logger.debug("Sources cleansed. Proceeding with story generation...")
         else:
@@ -321,10 +321,10 @@ def process_story_task(task_id: str, topic: str, sources_folder: Optional[str] =
         result = generate_story_script(
             topic=topic,
             sources=cleansed_sources,
-            endpoint=config.config.llm.ENDPOINT,
-            model=config.config.llm.MODEL,
-            temperature=config.config.llm.TEMPERATURE,
-            show_thinking=config.config.llm.SHOW_THINKING
+            endpoint=appconfig.llm.ENDPOINT,
+            model=appconfig.llm.MODEL,
+            temperature=appconfig.llm.TEMPERATURE,
+            show_thinking=appconfig.llm.SHOW_THINKING
         )
 
         # 4) Save the final outputs including audio generation
