@@ -97,9 +97,8 @@ services:
       - REDIS_ENABLED=True
       - LOG_LEVEL=INFO
       - ENVIRONMENT=development
-      # API worker specific settings
       - REDIS_QUEUE_NAME=api_requests
-      - REDIS_RESULT_PREFIX=api_result:
+      - REDIS_RESULT_PREFIX="api_result:"
       - REDIS_WORKER_BATCH_SIZE=3
       - REDIS_WORKER_MAX_CONCURRENT=2
     command: python -m viralStoryGenerator.src.api_worker
