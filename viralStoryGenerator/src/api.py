@@ -7,7 +7,6 @@ import asyncio
 import uuid
 import time
 import os
-import tempfile
 from typing import List, Dict, Any, Optional, Tuple
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, status, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,8 +16,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, AnyHttpUrl, Field
 from prometheus_client import Counter, Histogram, Gauge, generate_latest
 from starlette.responses import Response
-import uvicorn
 import redis
+import uvicorn
+import tempfile
 
 from ..utils.redis_manager import RedisManager as RedisQueueManager
 from ..utils.storage_manager import storage_manager
@@ -37,9 +37,9 @@ from viralStoryGenerator.src.api_handlers import (
 )
 
 router = APIRouter(
-    prefix="",
-    tags=["api"],
-    responses={404: {"description": "Not found"}},
+    prefix="/api",
+    tags=["stories"],
+    responses={404: {"description": "Not found"}}
 )
 
 # Initialize FastAPI app
@@ -49,6 +49,7 @@ app = FastAPI(
     version=config.VERSION
 )
 
+# Include the router in the app
 app.include_router(router)
 
 # Mount static file directory for local storage
@@ -87,7 +88,6 @@ if config.http.RATE_LIMIT_ENABLED and config.redis.ENABLED:
     except Exception as e:
         _logger.warning(f"Failed to connect to Redis for rate limiting: {e}. Using local memory rate limiting fallback.")
         redis_client = None
-
 
 class RateLimiter:
     """Rate limiter using sliding window algorithm"""
@@ -344,7 +344,7 @@ async def health_check():
     """
     return JSONResponse(content={"status": "ok"})
 
-@router.post("/api/stories", dependencies=[Depends(get_api_key)])
+@app.post("/api/stories", dependencies=[Depends(get_api_key)])
 async def generate_story(
     topic: str,
     background_tasks: BackgroundTasks,
@@ -368,7 +368,7 @@ async def generate_story(
     _logger.debug(f"Story generation task created for topic: {topic}")
     return task
 
-@router.get("/api/stories/{task_id}", dependencies=[Depends(get_api_key)])
+@app.get("/api/stories/{task_id}", dependencies=[Depends(get_api_key)])
 async def check_story_status(task_id: str):
     _logger.debug(f"Check story status endpoint called for task_id: {task_id}")
     """
@@ -386,7 +386,7 @@ async def check_story_status(task_id: str):
     _logger.debug(f"Story status retrieved for task_id: {task_id}")
     return task_info
 
-@router.get("/audio/{filename}")
+@app.get("/audio/{filename}")
 async def serve_audio_file(filename: str):
     """Serve audio files directly"""
     file_path = os.path.join(config.storage.AUDIO_STORAGE_PATH, filename)
@@ -398,7 +398,7 @@ async def serve_audio_file(filename: str):
         filename=filename
     )
 
-@router.get("/api/audio/stream/{filename}")
+@app.get("/api/audio/stream/{filename}")
 async def stream_audio(
     filename: str,
     range: str = None
@@ -538,7 +538,7 @@ async def stream_audio(
         status_code=status_code
     )
 
-@router.get("/story/{filename}")
+@app.get("/story/{filename}")
 async def serve_story_file(filename: str):
     """Serve story text files directly"""
     file_path = os.path.join(config.storage.STORY_STORAGE_PATH, filename)
@@ -550,7 +550,7 @@ async def serve_story_file(filename: str):
         filename=filename
     )
 
-@router.get("/storyboard/{filename}")
+@app.get("/storyboard/{filename}")
 async def serve_storyboard_file(filename: str):
     """Serve storyboard JSON files directly"""
     file_path = os.path.join(config.storage.STORYBOARD_STORAGE_PATH, filename)
@@ -562,7 +562,7 @@ async def serve_storyboard_file(filename: str):
         filename=filename
     )
 
-@router.get("/api/stories/{task_id}/download/{file_type}", dependencies=[Depends(get_api_key)])
+@app.get("/api/stories/{task_id}/download/{file_type}", dependencies=[Depends(get_api_key)])
 async def download_story_file(task_id: str, file_type: str):
     """
     Download a generated file from a completed story task
@@ -603,7 +603,7 @@ async def download_story_file(task_id: str, file_type: str):
         filename = os.path.basename(file_path)
         return FileResponse(path=file_path, media_type=media_type, filename=filename)
 
-@router.post("/api/generate", response_model=JobResponse)
+@app.post("/api/generate", response_model=JobResponse)
 async def generate_story_from_urls(
     request: StoryGenerationRequest,
     background_tasks: BackgroundTasks,
@@ -641,7 +641,7 @@ async def generate_story_from_urls(
         _logger.error(f"Error queueing job: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to queue job: {str(e)}")
 
-@router.get("/api/status/{job_id}")
+@app.get("/api/status/{job_id}")
 async def get_job_status(
     job_id: str,
     queue_manager: RedisQueueManager = Depends(get_queue_manager)
