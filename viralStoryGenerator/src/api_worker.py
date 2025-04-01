@@ -6,15 +6,21 @@ import asyncio
 import os
 import signal
 import sys
+import time
 from typing import Dict, Any
 
-from ..utils.redis_manager import RedisManager as RedisQueueManager
-from ..utils.crawl4ai_scraper import scrape_urls
-from ..utils.config import config
-from .llm import process_with_llm
-from .source_cleanser import chunkify_and_summarize
-from .storyboard import generate_storyboard
-from .elevenlabs_tts import generate_audio
+from viralStoryGenerator.models import (
+    StoryGenerationResult,
+    JobResponse,
+    JobStatusResponse
+)
+from viralStoryGenerator.utils.redis_manager import RedisManager as RedisQueueManager
+from viralStoryGenerator.utils.crawl4ai_scraper import scrape_urls
+from viralStoryGenerator.utils.config import config
+from viralStoryGenerator.src.llm import process_with_llm
+from viralStoryGenerator.src.source_cleanser import chunkify_and_summarize
+from viralStoryGenerator.src.storyboard import generate_storyboard
+from viralStoryGenerator.src.elevenlabs_tts import generate_audio
 from viralStoryGenerator.src.logger import logger as _logger
 
 # API queue configuration
@@ -29,24 +35,32 @@ def handle_shutdown(sig, frame):
     _logger.info(f"Received signal {sig}, shutting down API worker...")
     shutdown_event.set()
 
-async def process_story_generation(job_id: str, request_data: Dict[str, Any], queue_manager: RedisQueueManager):
-    _logger.debug(f"Processing story generation for job_id: {job_id}")
+async def process_story_request(job_id: str, request_data: Dict[str, Any], queue_manager: RedisQueueManager = None):
     """
     Process a story generation request asynchronously.
 
     Args:
         job_id: Unique identifier for the job
         request_data: Request data containing URLs and parameters
-        queue_manager: Redis queue manager instance
+        queue_manager: Redis queue manager instance (optional, will be initialized if None)
     """
+    _logger.debug(f"Processing story generation for job_id: {job_id}")
     _logger.info(f"Processing job {job_id} for topic: {request_data['topic']}")
+
+    # Initialize queue manager if not provided
+    if queue_manager is None:
+        queue_manager = RedisQueueManager(
+            queue_name=API_QUEUE_NAME,
+            result_prefix=API_RESULT_PREFIX
+        )
 
     try:
         # Update status to processing
-        queue_manager.store_result(job_id, {
+        initial_status = {
             "status": "processing",
             "message": "Scraping content from URLs"
-        })
+        }
+        queue_manager.store_result(job_id, initial_status)
 
         # Scrape content from URLs
         urls = request_data["urls"]
@@ -56,17 +70,20 @@ async def process_story_generation(job_id: str, request_data: Dict[str, Any], qu
         valid_content = [(url, content) for url, content in scraped_content if content]
 
         if not valid_content:
-            queue_manager.store_result(job_id, {
+            failed_status = {
                 "status": "failed",
-                "message": "Failed to scrape any content from the provided URLs"
-            })
+                "message": "Failed to scrape any content from the provided URLs",
+                "error": "No valid content could be extracted from the provided URLs"
+            }
+            queue_manager.store_result(job_id, failed_status)
             return
 
         # Update status
-        queue_manager.store_result(job_id, {
+        processing_status = {
             "status": "processing",
             "message": "Cleansing and processing content"
-        })
+        }
+        queue_manager.store_result(job_id, processing_status)
 
         # Prepare content for processing by combining all scraped content into one text
         combined_content = ""
@@ -80,10 +97,11 @@ async def process_story_generation(job_id: str, request_data: Dict[str, Any], qu
         chunk_size = int(os.environ.get("LLM_CHUNK_SIZE", config.llm.CHUNK_SIZE))
 
         # Update status to reflect chunking
-        queue_manager.store_result(job_id, {
+        chunking_status = {
             "status": "processing",
             "message": "Chunking and summarizing content"
-        })
+        }
+        queue_manager.store_result(job_id, chunking_status)
 
         # Apply chunking and summarization
         cleansed_content = chunkify_and_summarize(
@@ -95,56 +113,70 @@ async def process_story_generation(job_id: str, request_data: Dict[str, Any], qu
         )
 
         # Process with LLM
-        queue_manager.store_result(job_id, {
+        generating_status = {
             "status": "processing",
             "message": "Generating story script"
-        })
+        }
+        queue_manager.store_result(job_id, generating_status)
         story_script = process_with_llm(request_data["topic"], cleansed_content, temperature)
 
         # Generate storyboard
-        queue_manager.store_result(job_id, {
+        storyboard_status = {
             "status": "processing",
             "message": "Creating storyboard"
-        })
+        }
+        queue_manager.store_result(job_id, storyboard_status)
         storyboard = generate_storyboard(story_script)
 
-        result = {
+        # Prepare result that conforms to StoryGenerationResult model
+        result_data = {
             "status": "completed",
             "story_script": story_script,
             "storyboard": storyboard,
-            "sources": [url for url, _ in valid_content]
+            "sources": [str(url) for url, _ in valid_content],
+            "audio_url": None,  # Will be updated if audio is generated
+            "created_at": time.time(),
+            "updated_at": time.time()
         }
 
         # Generate audio if requested
         if request_data.get("generate_audio", False):
-            queue_manager.store_result(job_id, {
+            audio_status = {
                 "status": "processing",
                 "message": "Generating audio"
-            })
+            }
+            queue_manager.store_result(job_id, audio_status)
 
             try:
-                audio_path = generate_audio(story_script)
-                # In a real-world scenario, you would host this file and return a URL
-                result["audio_url"] = f"/audio/{audio_path.name}"
+                audio_path = await generate_audio(story_script)
+                # Set audio URL based on the filename
+                result_data["audio_url"] = f"/audio/{os.path.basename(audio_path)}"
+                _logger.info(f"Audio generated successfully for job {job_id}")
             except Exception as e:
                 _logger.error(f"Error generating audio: {str(e)}")
-                result["audio_url"] = None
+                # Don't fail the job, just note the audio generation failed
+                result_data["audio_url"] = None
 
-        # Store the final result
-        queue_manager.store_result(job_id, result)
+        # Store the final result that matches JobStatusResponse structure
+        queue_manager.store_result(job_id, result_data)
         _logger.info(f"Completed job {job_id}")
         _logger.debug(f"Story generation completed for job_id: {job_id}")
 
     except Exception as e:
-        _logger.error(f"Error processing job {job_id}: {str(e)}")
-        queue_manager.store_result(job_id, {
+        error_msg = f"Error processing job {job_id}: {str(e)}"
+        _logger.error(error_msg)
+        error_result = {
             "status": "failed",
-            "message": f"Job failed: {str(e)}"
-        })
+            "message": f"Job failed: {str(e)}",
+            "error": str(e),
+            "updated_at": time.time()
+        }
+        queue_manager.store_result(job_id, error_result)
 
 async def run_worker():
-    _logger.debug("Starting worker loop...")
     """Run the API queue worker with graceful shutdown handling."""
+    _logger.debug("Starting worker loop...")
+
     # Worker configuration
     batch_size = int(os.environ.get("REDIS_WORKER_BATCH_SIZE",
                                    config.redis.WORKER_BATCH_SIZE))
@@ -193,7 +225,7 @@ async def run_worker():
                 for request in sub_batch:
                     request_id = request['id']
                     request_data = request['data']
-                    tasks.append(process_story_generation(request_id, request_data, queue_manager))
+                    tasks.append(process_story_request(request_id, request_data, queue_manager))
 
                 # Wait for all tasks in sub-batch to complete
                 await asyncio.gather(*tasks)
@@ -205,6 +237,7 @@ async def run_worker():
         except Exception as e:
             _logger.error(f"Error in API worker: {str(e)}")
             await asyncio.sleep(sleep_interval)
+
     _logger.debug("Worker loop completed.")
 
 def main():
@@ -234,6 +267,24 @@ def main():
 
     _logger.info("API Queue Worker shutdown complete")
     _logger.debug("API worker initialized.")
+
+async def process_story_generation(job_id: str, request_data: Dict[str, Any]) -> None:
+    """
+    Process a story generation request asynchronously.
+    This function is called directly from the API endpoint.
+
+    Args:
+        job_id: Unique identifier for the job
+        request_data: Request data containing URLs and parameters
+    """
+    # Initialize queue manager
+    queue_manager = RedisQueueManager(
+        queue_name=API_QUEUE_NAME,
+        result_prefix=API_RESULT_PREFIX
+    )
+
+    # Process the story generation request
+    await process_story_request(job_id, request_data, queue_manager)
 
 if __name__ == "__main__":
     main()
