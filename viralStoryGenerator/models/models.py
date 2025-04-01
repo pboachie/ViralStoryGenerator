@@ -73,7 +73,7 @@ class HealthResponse(BaseModel):
     services: Dict[str, ServiceStatusDetail] = Field(..., description="Status of individual services")
     version: str = Field(..., description="API version")
     environment: str = Field(..., description="Environment name")
-    uptime: float = Field(..., description="Server uptime in seconds")
+    uptime: Union[float, str] = Field(..., description="Server uptime in seconds or uptime text")
 
 
 class JobStatusResponse(BaseModel):
