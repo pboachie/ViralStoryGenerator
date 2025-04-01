@@ -16,7 +16,11 @@ setup(
     name="viralStoryGenerator",
     version="0.1.2",
     description="Generate short story scripts via a local LLM endpoint.",
-    packages=find_packages(),
+    packages=find_packages(include=["viralStoryGenerator", "viralStoryGenerator.*"]),
+    package_data={
+        "viralStoryGenerator": ["src/*", "utils/*", "models/*", "prompts/*"]
+    },
+    include_package_data=True,
     install_requires=[
         "requests>=2.28.2",
         "python-dotenv>=1.0.0",
@@ -32,10 +36,11 @@ setup(
         "prometheus-client>=0.16.0",
         "beautifulsoup4>=4.12.0",
         "lxml>=4.9.2",
-        "schedule>=1.2.0",
+        "schedule>=1.2.2",
         "pytest>=7.3.1",
         "httpx>=0.24.0",
         "boto3>=1.26.114",
+        "playwright>=1.51.0",
         "azure-storage-blob>=12.16.0"
     ],
     python_requires=">=3.7",
