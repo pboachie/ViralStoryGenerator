@@ -1,17 +1,20 @@
 # viralStoryGenerator/main.py
+import os
 import argparse
 import asyncio
-import os
 import multiprocessing
-from viralStoryGenerator.src.logger import logger as _logger
-from viralStoryGenerator.utils.config import config as app_config
+import uvicorn
+import threading
+import time
 from fastapi.staticfiles import StaticFiles
+
+from viralStoryGenerator.src.logger import logger as _logger, log_startup
+from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.src.api import app as api_router
 from viralStoryGenerator.utils.scheduled_cleanup import cleanup_task
 from viralStoryGenerator.utils.storage_manager import storage_manager
-from viralStoryGenerator.src.api_handlers import (
-    process_audio_queue
-)
+from viralStoryGenerator.src.api_handlers import process_audio_queue
+
 def main():
     """
     Main entry point for ViralStoryGenerator API.
@@ -38,36 +41,59 @@ def main():
 
     # Parse arguments
     args = parser.parse_args()
-    _logger.debug(f"Arguments parsed: {args}")
 
-    # Configure startup based on environment
-    is_development = app_config.ENVIRONMENT.lower() == "development"
+    # Log startup information using the new colored logger
+    log_startup(
+        environment=app_config.ENVIRONMENT,
+        version=app_config.VERSION,
+        storage_provider=app_config.storage.PROVIDER
+    )
 
-    # Set arguments for API server
-    # Run API server via the start_api_server function in api.py
-    _logger.info(f"Starting ViralStoryGenerator API with {args.workers} workers on {args.host}:{args.port}...")
-    _logger.debug("Starting API server...")
+    # Start scheduled cleanup in separate thread
+    cleanup_thread = threading.Thread(target=scheduled_cleanup)
+    cleanup_thread.daemon = True
+    cleanup_thread.start()
+    _logger.info("Cleanup scheduler thread started")
 
-    from viralStoryGenerator.src.api import start_api_server
-    start_api_server(host=args.host, port=args.port, reload=args.reload or is_development)
-    _logger.debug("API server started successfully.")
+    # Start uvicorn server
+    uvicorn.run(
+        "viralStoryGenerator.src.api:app",
+        host=args.host,
+        port=args.port,
+        workers=args.workers,
+        reload=args.reload,
+        log_level=args.log_level,
+    )
+
 
 async def scheduled_cleanup():
-    """Run periodic cleanup of old files based on retention policy"""
+    """
+    Scheduled cleanup task to remove old files.
+    Runs on a predefined interval.
+    """
+    _logger.info("Scheduled cleanup task started. Interval: {0} hours, Retention: {1} days".format(
+        app_config.storage.CLEANUP_INTERVAL_HOURS,
+        app_config.storage.FILE_RETENTION_DAYS
+    ))
+
     while True:
         try:
-            # Sleep first to avoid cleanup right at startup
-            await asyncio.sleep(24 * 60 * 60)  # Run once per day
+            _logger.info("Running scheduled file cleanup")
 
-            # Get the retention period from config
-            retention_days = app_config.storage.FILE_RETENTION_DAYS
+            # Run the cleanup task
+            await cleanup_task()
 
-            if retention_days > 0:
-                _logger.info(f"Running scheduled cleanup of files older than {retention_days} days")
-                deleted_count = storage_manager.cleanup_old_files(retention_days)
-                _logger.info(f"Cleanup complete: {deleted_count} files removed")
+            # Process any queued audio generation
+            process_audio_queue()
+
+            # Sleep for the specified interval
+            _logger.debug(f"Next cleanup scheduled in {app_config.storage.CLEANUP_INTERVAL_HOURS} hours")
+            await asyncio.sleep(app_config.storage.CLEANUP_INTERVAL_HOURS * 3600)
+
         except Exception as e:
-            _logger.error(f"Error in scheduled cleanup: {e}")
+            _logger.error(f"Error in scheduled cleanup: {str(e)}")
+            # Sleep for a shorter time on error
+            await asyncio.sleep(3600)  # 1 hour
 
 
 # Create necessary directories
@@ -83,49 +109,42 @@ api_router.mount("/static/storyboards", StaticFiles(directory=app_config.storage
 # Startup event handler
 @api_router.on_event("startup")
 async def startup_event():
-    """Perform tasks when the application starts"""
+    """Handle application startup tasks"""
     _logger.debug("Startup event triggered.")
-    _logger.info(f"Starting {app_config.APP_TITLE} v{app_config.VERSION}")
-    _logger.info(f"Environment: {app_config.ENVIRONMENT}")
-    _logger.info(f"Storage provider: {app_config.storage.PROVIDER}")
-        # Process any queued audio files at startup
+
+    # Start scheduled cleanup task
+    asyncio.create_task(scheduled_cleanup())
+
+    # Process any queued audio generation tasks
     process_audio_queue()
 
-        # Start the cleanup background task if enabled
-    if app_config.storage.FILE_RETENTION_DAYS > 0:
-        asyncio.create_task(scheduled_cleanup())
-
-    # Start the scheduled cleanup task
-    if app_config.storage.FILE_RETENTION_DAYS > 0:
-        cleanup_started = cleanup_task.start()
-        if cleanup_started:
-            _logger.info(f"Scheduled file cleanup enabled: Every {app_config.storage.CLEANUP_INTERVAL_HOURS} hours, {app_config.storage.FILE_RETENTION_DAYS} days retention")
-        else:
-            _logger.warning("Failed to start scheduled file cleanup")
-    _logger.debug("Startup event completed.")
 
 # Shutdown event handler
 @api_router.on_event("shutdown")
 async def shutdown_event():
-    """Perform tasks when the application shuts down"""
+    """Handle application shutdown tasks"""
     _logger.debug("Shutdown event triggered.")
-    _logger.info("Application shutting down")
 
-    # Stop the scheduled cleanup task
-    cleanup_task.stop()
-    _logger.debug("Shutdown event completed.")
+    # Perform any necessary cleanup
+    if storage_manager:
+        try:
+            await storage_manager.close()
+            _logger.debug("Storage manager closed successfully.")
+        except Exception as e:
+            _logger.error(f"Error closing storage manager: {str(e)}")
 
 
 # Root endpoint
 @api_router.get("/")
 async def root():
-    """Root endpoint"""
+    """Root endpoint that returns basic application information"""
     return {
-        "app": app_config.APP_TITLE,
+        "app": "ViralStoryGenerator API",
         "version": app_config.VERSION,
-        "docs_url": "/docs"
+        "environment": app_config.ENVIRONMENT,
+        "docs": "/docs",
     }
 
+
 if __name__ == "__main__":
-    _logger.debug("Starting ViralStoryGenerator API...")
     main()
