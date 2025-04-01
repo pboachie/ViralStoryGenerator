@@ -673,6 +673,18 @@ class StorageManager:
         # Default to octet-stream
         return "application/octet-stream"
 
+    async def close(self):
+        """Close any open connections or resources"""
+        _logger.debug("Closing storage manager resources")
+        if self.provider == "s3":
+            # Close any S3 connections if needed
+            pass
+        elif self.provider == "azure":
+            # Close any Azure connections if needed
+            pass
+        # For local storage, nothing special needs to be done
+        return True
+
 # Initialize the mimetypes module
 mimetypes.init()
 
