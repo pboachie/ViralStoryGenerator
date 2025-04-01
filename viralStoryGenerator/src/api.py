@@ -1,6 +1,7 @@
 """
 HTTP API backend for ViralStoryGenerator.
 """
+import json
 import uuid
 import time
 import os
@@ -61,6 +62,33 @@ app = FastAPI(
 
 # Include the router in the app
 app.include_router(router)
+
+# Setup API security if enabled in config
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+# Authentication dependency
+async def get_api_key(request: Request, api_key: str = Depends(api_key_header)):
+    # Skip authentication if API key security is disabled
+    if not app_config.http.API_KEY_ENABLED:
+        return None
+
+    if api_key != app_config.http.API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API Key",
+        )
+    return api_key
+
+
+queue_router = APIRouter(
+    prefix="/api/queue",
+    tags=["Queue Management"],
+    responses={404: {"description": "Not found"}},
+    dependencies=[Depends(get_api_key)]  # Require API key for all endpoints in this router
+)
+
+app.include_router(queue_router)
 
 # Mount static file directory for local storage
 os.makedirs(app_config.storage.LOCAL_STORAGE_PATH, exist_ok=True)
@@ -270,24 +298,6 @@ async def global_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"error": "An unexpected error occurred", "detail": str(exc)},
     )
-
-
-# Setup API security if enabled in config
-API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
-
-# Authentication dependency
-async def get_api_key(request: Request, api_key: str = Depends(api_key_header)):
-    # Skip authentication if API key security is disabled
-    if not app_config.http.API_KEY_ENABLED:
-        return None
-
-    if api_key != app_config.http.API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API Key",
-        )
-    return api_key
 
 # Health and Metrics Endpoints
 @app.get("/metrics", tags=["Health and Metrics"])
@@ -745,6 +755,210 @@ async def get_job_status(
     except Exception as e:
         _logger.error(f"Error checking job status: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to check job status: {str(e)}")
+
+@queue_router.get("/status")
+async def get_queue_status(
+    queue_manager: RedisQueueManager = Depends(get_queue_manager)
+):
+    """
+    Get the current status of the queue system.
+    Returns metrics about queue length, processing jobs, and recent failures.
+    """
+    if not queue_manager.is_available():
+        raise HTTPException(status_code=503, detail="Redis service unavailable")
+
+    try:
+        # Get main queue length
+        queue_length = queue_manager.get_queue_length()
+
+        # Get processing queue length
+        processing_queue = f"{queue_manager.queue_name}_processing"
+        processing_length = queue_manager.client.llen(processing_queue)
+
+        # Get statistics on recent jobs
+        recent_jobs = []
+        keys = queue_manager.client.keys(f"{queue_manager.result_prefix}*")
+        recent_count = min(10, len(keys))  # Show up to 10 recent jobs
+
+        for key in keys[:recent_count]:
+            job_data = queue_manager.client.get(key)
+            if job_data:
+                job_info = json.loads(job_data)
+                job_id = key.replace(queue_manager.result_prefix, "")
+                recent_jobs.append({
+                    "job_id": job_id,
+                    "status": job_info.get("status", "unknown"),
+                    "created_at": job_info.get("created_at"),
+                    "updated_at": job_info.get("updated_at")
+                })
+
+        return {
+            "status": "available",
+            "queue_length": queue_length,
+            "processing_jobs": processing_length,
+            "recent_jobs": recent_jobs
+        }
+    except Exception as e:
+        _logger.error(f"Error getting queue status: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get queue status: {str(e)}")
+
+@queue_router.post("/clear-stalled")
+async def clear_stalled_jobs(
+    queue_manager: RedisQueueManager = Depends(get_queue_manager)
+):
+    """
+    Clear stalled jobs from the processing queue.
+    This is useful when jobs have crashed or timed out and remained in the processing queue.
+    """
+    if not queue_manager.is_available():
+        raise HTTPException(status_code=503, detail="Redis service unavailable")
+
+    try:
+        processing_queue = f"{queue_manager.queue_name}_processing"
+        stalled_jobs = queue_manager.client.lrange(processing_queue, 0, -1)
+
+        cleared_count = 0
+        recovered_count = 0
+
+        # Process each potentially stalled job
+        for job_data in stalled_jobs:
+            try:
+                job = json.loads(job_data)
+                job_id = job.get("id")
+
+                # Check if this job has been in the processing queue too long (over 10 minutes)
+                # This is a basic implementation - you could enhance this with actual timestamp tracking
+                result = queue_manager.get_result(job_id)
+                if result and result.get("updated_at"):
+                    job_time = result.get("updated_at")
+                    current_time = time.time()
+
+                    # If job has been processing for more than 10 minutes, consider it stalled
+                    if current_time - job_time > 600:  # 10 minutes in seconds
+                        # Remove from processing queue
+                        queue_manager.client.lrem(processing_queue, 0, job_data)
+
+                        # Option: re-queue the job for another attempt
+                        # Uncomment this section to enable job recovery
+                        # queue_manager.client.lpush(queue_manager.queue_name, job_data)
+                        # recovered_count += 1
+
+                        # Update the job status to failed
+                        queue_manager.store_result(job_id, {
+                            "status": "failed",
+                            "error": "Job stalled and was cleared from processing queue",
+                            "created_at": result.get("created_at", time.time()),
+                            "updated_at": time.time()
+                        })
+
+                        cleared_count += 1
+            except Exception as job_error:
+                _logger.error(f"Error processing stalled job: {str(job_error)}")
+
+        return {
+            "message": f"Cleared {cleared_count} stalled jobs, recovered {recovered_count} for reprocessing",
+            "cleared": cleared_count,
+            "recovered": recovered_count
+        }
+    except Exception as e:
+        _logger.error(f"Error clearing stalled jobs: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear stalled jobs: {str(e)}")
+
+@queue_router.delete("/purge")
+async def purge_queue(
+    confirmation: str,
+    queue_manager: RedisQueueManager = Depends(get_queue_manager)
+):
+    """
+    Purge all jobs from the queue system.
+    This is a destructive operation and requires a confirmation code.
+    """
+    if not queue_manager.is_available():
+        raise HTTPException(status_code=503, detail="Redis service unavailable")
+
+    # Safety check: require explicit confirmation
+    if confirmation != "CONFIRM_PURGE_ALL_JOBS":
+        raise HTTPException(status_code=400, detail="Invalid confirmation code. Use 'CONFIRM_PURGE_ALL_JOBS' to confirm this destructive action.")
+
+    try:
+        # Clear main queue
+        queue_length = queue_manager.get_queue_length()
+        queue_manager.client.delete(queue_manager.queue_name)
+
+        # Clear processing queue
+        processing_queue = f"{queue_manager.queue_name}_processing"
+        processing_length = queue_manager.client.llen(processing_queue)
+        queue_manager.client.delete(processing_queue)
+
+        # You might want to keep job results for historical purposes
+        # Uncomment this section to also delete job results
+        # result_keys = queue_manager.client.keys(f"{queue_manager.result_prefix}*")
+        # if result_keys:
+        #     queue_manager.client.delete(*result_keys)
+        # deleted_results = len(result_keys) if result_keys else 0
+
+        return {
+            "message": f"Queue system purged successfully",
+            "queued_jobs_removed": queue_length,
+            "processing_jobs_removed": processing_length,
+            # "result_records_removed": deleted_results
+        }
+    except Exception as e:
+        _logger.error(f"Error purging queue: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to purge queue: {str(e)}")
+
+@queue_router.get("/job/{job_id}/retry")
+async def retry_failed_job(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    queue_manager: RedisQueueManager = Depends(get_queue_manager)
+):
+    """
+    Retry a failed job by re-queuing it for processing
+    """
+    if not queue_manager.is_available():
+        raise HTTPException(status_code=503, detail="Redis service unavailable")
+
+    try:
+        # Get the original job data
+        result = queue_manager.get_result(job_id)
+        if not result:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+        if result.get("status") != "failed":
+            raise HTTPException(status_code=400, detail=f"Only failed jobs can be retried. Current status: {result.get('status')}")
+
+        # Create a new job from the original data
+        original_data = result.get("original_request")
+        if not original_data:
+            raise HTTPException(status_code=400, detail="Cannot retry job: missing original request data")
+
+        # Generate a new job ID or reuse the existing one
+        new_job_id = job_id  # Or use str(uuid.uuid4()) for a completely new job
+
+        # Prepare request data
+        request_data = {
+            "id": new_job_id,
+            **original_data
+        }
+
+        # Add to queue
+        success = queue_manager.add_request(request_data)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to queue job for retry")
+
+        # Start processing in the background
+        background_tasks.add_task(process_story_generation, new_job_id, request_data)
+
+        return {
+            "message": f"Job {job_id} has been requeued for processing",
+            "job_id": new_job_id
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.error(f"Error retrying job: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retry job: {str(e)}")
 
 def start_api_server(host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
     """Start the FastAPI server with uvicorn"""
