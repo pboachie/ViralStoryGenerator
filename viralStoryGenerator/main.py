@@ -10,6 +10,10 @@ from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from viralStoryGenerator.src.api import router as api_router
 from viralStoryGenerator.utils.scheduled_cleanup import cleanup_task
+from viralStoryGenerator.utils.health_check import get_service_status
+import time
+
+app_start_time = time.time()
 
 def main():
     """
@@ -114,16 +118,17 @@ async def shutdown_event():
 async def health_check():
     """Health check endpoint for monitoring"""
     _logger.debug("Health check endpoint called.")
-    # Include cleanup task status if it's running
-    cleanup_status = cleanup_task.status() if cleanup_task.is_running else None
+
+    # Fetch detailed service statuses
+    service_statuses = get_service_status()
 
     _logger.debug("Health check response generated.")
     return {
-        "status": "healthy",
+        "status": "healthy" if all(s["status"] == "up" for s in service_statuses.values()) else "degraded",
+        "services": service_statuses,
         "version": app_config.VERSION,
         "environment": app_config.ENVIRONMENT,
-        "storage_provider": app_config.storage.PROVIDER,
-        "cleanup": cleanup_status
+        "uptime": time.time() - app_start_time
     }
 
 # Root endpoint
