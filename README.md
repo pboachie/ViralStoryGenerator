@@ -32,6 +32,81 @@ pip install .
 
 ---
 
+## Local Development & Testing
+
+For local development and testing, follow these steps:
+
+### Setup Development Environment
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/yourusername/ViralStoryGenerator.git
+   cd ViralStoryGenerator
+   ```
+
+2. **Install in development mode:**
+   ```bash
+   pip install -e .
+   ```
+   This installs the package in "editable" mode, allowing you to modify the code and see changes immediately without reinstalling.
+
+3. **Set up environment variables:**
+   ```bash
+   cp .env.sample .env
+   ```
+   Edit the `.env` file with your local configuration.
+
+### Running Tests
+
+1. **Execute the test suite:**
+   ```bash
+   python -m pytest tests/
+   ```
+
+2. **Run specific test files:**
+   ```bash
+   python -m pytest tests/test_main.py
+   ```
+
+3. **Run with verbose output:**
+   ```bash
+   python -m pytest -v tests/
+   ```
+
+### Manual Testing
+
+1. **Start the API server locally:**
+   ```bash
+   python -m viralStoryGenerator api --host localhost --port 8000 --reload
+   ```
+   The `--reload` flag enables auto-reloading when code changes are detected.
+
+2. **Access the API documentation:**
+   Open your browser and navigate to:
+   ```
+   http://localhost:8000/docs
+   ```
+   This provides an interactive Swagger UI for testing endpoints.
+
+3. **Test individual components:**
+   ```bash
+   # Test LLM processing
+   python -c "from viralStoryGenerator.src.llm import process_with_llm; print(process_with_llm('Sample topic', 'Sample content', 0.7))"
+
+   # Test audio generation
+   python -c "from viralStoryGenerator.src.elevenlabs_tts import generate_audio; print(generate_audio('This is a test audio generation'))"
+   ```
+
+### Debugging
+
+- Set `LOG_LEVEL=DEBUG` in your `.env` file for detailed logging
+- Use Python's debugger:
+  ```bash
+  python -m pdb -c continue -m viralStoryGenerator api
+  ```
+
+---
+
 ## Configuration
 Copy the sample environment file to a new file named `.env` and update the values as needed:
 - `LOG_LEVEL` (e.g., DEBUG, INFO, etc.)
