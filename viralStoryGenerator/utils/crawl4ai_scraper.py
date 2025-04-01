@@ -35,7 +35,7 @@ async def queue_scrape_request(
     urls: Union[str, List[str]],
     browser_config: Optional[Dict[str, Any]] = None,
     run_config: Optional[Dict[str, Any]] = None,
-    wait_for_result: bool = True,
+    wait_for_result: bool = False,
     timeout: int = 300
 ) -> Union[str, None]:
     """
@@ -56,25 +56,39 @@ async def queue_scrape_request(
         _logger.warning("Redis queue manager not available, falling back to direct scraping")
         return None
 
+    # Generate a unique ID for this request
+    request_id = str(time.time()) + "_" + str(hash(str(urls)))
+
     # Prepare request data
     request_data = {
-        'urls': urls if isinstance(urls, list) else [urls],
-        'browser_config': browser_config,
-        'run_config': run_config
+        'id': request_id,
+        'data': {
+            'urls': urls if isinstance(urls, list) else [urls],
+            'browser_config': browser_config,
+            'run_config': run_config
+        }
     }
 
     try:
         # Add request to queue
-        request_id = manager.add_request(request_data)
+        success = manager.add_request(request_data)
+
+        if not success:
+            _logger.warning("Failed to add request to queue")
+            return None
 
         # Wait for result if specified
         if wait_for_result:
+            _logger.info(f"Waiting for result of request {request_id} (timeout: {timeout}s)")
+
             result = manager.wait_for_result(request_id, timeout=timeout)
-            if result:
-                return result
-            else:
-                _logger.warning(f"Timed out waiting for result of request {request_id}")
+            if result and result.get("status") == "completed":
+                _logger.info(f"Got result for request {request_id}")
                 return request_id
+            else:
+                _logger.warning(f"Timed out or error waiting for result of request {request_id}")
+                if result:
+                    _logger.debug(f"Result status: {result.get('status')}, error: {result.get('error')}")
 
         return request_id
     except Exception as e:
@@ -98,8 +112,24 @@ async def get_scrape_result(request_id: str) -> Union[List[Tuple[str, Optional[s
 
     try:
         result = manager.get_result(request_id)
-        if result and 'data' in result:
+        if not result:
+            _logger.debug(f"No result found for request ID: {request_id}")
+            return None
+
+        # Log what we received to help debug
+        _logger.debug(f"Received result for {request_id}: {str(result)[:100]}...")
+
+        # Check different possible data structures
+        if 'data' in result:
             return result['data']
+        elif 'status' in result and result.get('status') != 'completed':
+            _logger.debug(f"Request {request_id} not completed: {result.get('status')}")
+            return None
+        elif isinstance(result, list):
+            # Result might be directly a list of tuples
+            return result
+
+        _logger.warning(f"Unexpected result format for request {request_id}")
         return None
     except Exception as e:
         _logger.error(f"Failed to get scrape result: {str(e)}")
@@ -108,7 +138,8 @@ async def get_scrape_result(request_id: str) -> Union[List[Tuple[str, Optional[s
 async def scrape_urls(
     urls: Union[str, List[str]],
     browser_config: Optional[BrowserConfig] = None,
-    run_config: Optional[CrawlerRunConfig] = None
+    run_config: Optional[CrawlerRunConfig] = None,
+    direct_only: bool = False
 ) -> List[Tuple[str, Optional[str]]]:
     """
     Scrape the given URLs using Crawl4AI and return the content as Markdown.
@@ -118,6 +149,7 @@ async def scrape_urls(
         urls (Union[str, List[str]]): A single URL or a list of URLs to scrape.
         browser_config (Optional[BrowserConfig]): Configuration for the browser, e.g., headless mode.
         run_config (Optional[CrawlerRunConfig]): Configuration for the crawl run, e.g., extraction strategies.
+        direct_only (bool): If True, skip the queue and scrape directly (to avoid recursive queueing)
 
     Returns:
         List[Tuple[str, Optional[str]]]: A list of tuples, each containing the URL and its corresponding
@@ -128,27 +160,64 @@ async def scrape_urls(
         - Errors during crawling are logged using the `logging` module and do not halt the process.
         - If Redis queue manager is available, the request will be queued to prevent system overload.
         - The function will attempt to use the queue first, then fall back to direct scraping if needed.
-
     """
     _logger.debug(f"Scraping URLs: {urls}")
-    # Try to use the Redis queue first
-    queued_request_id = await queue_scrape_request(urls, browser_config, run_config)
-    if queued_request_id:
-        result = await get_scrape_result(queued_request_id)
-        if result:
-            return result
-        _logger.info("Falling back to direct scraping after queue attempt")
+
+    # If direct_only flag is set, skip the queue entirely
+    if not direct_only:
+        # Check if there's a queue worker running by checking the processing queue
+        manager = get_redis_manager()
+        queue_active = False
+        if manager and manager.is_available():
+            try:
+                # See if there's a processing queue with items, indicating a worker is running
+                processing_queue = f"{manager.queue_name}_processing"
+                processing_count = manager.client.llen(processing_queue)
+                if processing_count > 0:
+                    queue_active = True
+                    _logger.debug(f"Queue worker appears active (processing {processing_count} items)")
+            except Exception:
+                pass
+
+        # Try to use the Redis queue first
+        queued_request_id = await queue_scrape_request(urls, browser_config, run_config, wait_for_result=queue_active)
+        if queued_request_id:
+            # Give the worker a moment to pick up the job if it's active
+            if queue_active:
+                # Check for result a few times with short delays
+                for attempt in range(3):
+                    result = await get_scrape_result(queued_request_id)
+                    if result:
+                        _logger.info(f"Got result from queue for request {queued_request_id}")
+                        return result
+                    # Brief pause between checks
+                    await asyncio.sleep(0.5)
+
+            _logger.info("Falling back to direct scraping after queue attempt")
 
     # Convert single URL string to a list for uniform processing
     if isinstance(urls, str):
         urls = [urls]
 
-    # Initialize the AsyncWebCrawler with optional browser configuration
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        # Create a list of crawl tasks for each URL with optional run configuration
-        tasks = [crawler.arun(url, config=run_config) for url in urls]
-        # Execute all tasks concurrently, capturing exceptions without stopping
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        # Initialize the AsyncWebCrawler with optional browser configuration
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            # Create a list of crawl tasks for each URL with optional run configuration
+            tasks = [crawler.arun(url, config=run_config) for url in urls]
+            # Execute all tasks concurrently, capturing exceptions without stopping
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as e:
+        error_msg = str(e)
+
+        # Check for Playwright installation errors
+        if "Executable doesn't exist" in error_msg and "playwright" in error_msg.lower():
+            _logger.error("Playwright browser executable not found. Please install browsers by running: playwright install")
+
+            # Return failure for all URLs
+            return [(url, None) for url in urls]
+        else:
+            # Re-raise other exceptions
+            raise
 
     # Process results into a list of (url, markdown) tuples
     output = []
@@ -160,6 +229,19 @@ async def scrape_urls(
         else:
             # Append successful crawl results as Markdown
             output.append((url, result.markdown))
+
+    # Store the result in the queue for potential future requests
+    if not direct_only and 'queued_request_id' in locals() and queued_request_id:
+        manager = get_redis_manager()
+        if manager and manager.is_available():
+            try:
+                manager.store_result(queued_request_id, {
+                    "status": "completed",
+                    "data": output
+                })
+                _logger.debug(f"Stored direct scraping result in queue for request {queued_request_id}")
+            except Exception as e:
+                _logger.error(f"Failed to store direct scraping result: {str(e)}")
 
     _logger.debug(f"Scraping completed for URLs: {urls}")
     return output
@@ -217,35 +299,93 @@ async def process_queue_worker(
                 tasks = []
 
                 for request in sub_batch:
-                    request_id = request['id']
-                    request_data = request['data']
+                    # Validate request structure
+                    if not isinstance(request, dict):
+                        _logger.error(f"Invalid request format: {request}")
+                        if manager and hasattr(manager, 'complete_request'):
+                            manager.complete_request(request, False)
+                        continue
 
-                    # Create task to scrape URLs and store result
-                    async def process_request(req_id, req_data):
+                    # Extract request ID and data, with validation
+                    request_id = request.get('id')
+                    if not request_id:
+                        _logger.error("Request is missing ID")
+                        if manager and hasattr(manager, 'complete_request'):
+                            manager.complete_request(request, False)
+                        continue
+
+                    request_data = request.get('data')
+                    if not request_data:
+                        _logger.error(f"Request {request_id} is missing data")
+                        # Store error result and mark request as completed with failure
+                        manager.store_result(request_id, {
+                            "status": "failed",
+                            "error": "Request is missing required data field",
+                            "created_at": time.time(),
+                            "updated_at": time.time()
+                        })
+                        if manager and hasattr(manager, 'complete_request'):
+                            manager.complete_request(request, False)
+                        continue
+
+                    # Wrapped in a function to properly catch and manage exceptions for each task
+                    async def process_request(req_id, req_data, req_obj):
+                        success = False
                         try:
-                            urls = req_data.get('urls', [])
+                            # Validate required fields in req_data
+                            if not isinstance(req_data, dict):
+                                raise ValueError(f"Request data is not a dictionary: {type(req_data)}")
+
+                            urls = req_data.get('urls')
+                            if not urls:
+                                raise ValueError("No URLs specified in request data")
+
                             browser_config = req_data.get('browser_config')
                             run_config = req_data.get('run_config')
 
+                            # Log what we're about to process
+                            _logger.debug(f"Processing request {req_id} with URLs: {urls}")
+
                             # Perform the actual scraping
-                            result = await scrape_urls(urls, browser_config, run_config)
+                            result = await scrape_urls(urls, browser_config, run_config, direct_only=True)
 
                             # Store result in Redis
-                            manager.store_result(req_id, result)
+                            manager.store_result(req_id, {
+                                "status": "completed",
+                                "data": result,
+                                "updated_at": time.time()
+                            })
                             _logger.info(f"Successfully processed request {req_id}")
+                            success = True
                         except Exception as e:
                             _logger.error(f"Error processing request {req_id}: {str(e)}")
                             # Store error as result
-                            manager.store_result(req_id, {'error': str(e)})
+                            manager.store_result(req_id, {
+                                "status": "failed",
+                                "error": str(e),
+                                "updated_at": time.time()
+                            })
+                        finally:
+                            # Remove from processing queue regardless of outcome
+                            # Mark as success (true) if successful, failure (false) if failed
+                            try:
+                                if manager and hasattr(manager, 'complete_request'):
+                                    manager.complete_request(req_obj, success)
+                            except Exception as cleanup_error:
+                                _logger.error(f"Error completing request {req_id}: {str(cleanup_error)}")
 
-                    tasks.append(process_request(request_id, request_data))
+                    # Add the task to our batch
+                    tasks.append(process_request(request_id, request_data, request))
 
                 # Wait for all tasks in sub-batch to complete
-                await asyncio.gather(*tasks)
+                if tasks:
+                    await asyncio.gather(*tasks)
 
             # Sleep briefly to avoid spinning too fast
             await asyncio.sleep(0.1)
 
         except Exception as e:
             _logger.error(f"Error in queue worker: {str(e)}")
+            import traceback
+            _logger.error(f"Traceback: {traceback.format_exc()}")
             await asyncio.sleep(sleep_interval)
