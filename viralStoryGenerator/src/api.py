@@ -304,16 +304,10 @@ async def health_check():
     _logger.debug("Health check endpoint called.")
 
     # Fetch detailed service statuses
-    service_statuses = get_service_status()
+    service_status = await get_service_status()
 
     _logger.debug("Health check response generated.")
-    return {
-        "status": "healthy" if all(s["status"] == "up" for s in service_statuses.values()) else "degraded",
-        "services": service_statuses,
-        "version": app_config.VERSION,
-        "environment": app_config.ENVIRONMENT,
-        "uptime": time.time() - app_start_time
-    }
+    return service_status
 
 # Story Management Endpoints
 @app.post("/api/stories", dependencies=[Depends(get_api_key)], tags=["Story Management"])

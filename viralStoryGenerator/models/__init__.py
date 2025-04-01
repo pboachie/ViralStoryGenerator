@@ -4,7 +4,8 @@ from viralStoryGenerator.models.models import (
     StoryGenerationResult,
     ErrorResponse,
     HealthResponse,
-    JobStatusResponse
+    JobStatusResponse,
+    ServiceStatusDetail
 )
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     'StoryGenerationResult',
     'ErrorResponse',
     'HealthResponse',
-    'JobStatusResponse'
+    'JobStatusResponse',
+    'ServiceStatusDetail'
 ]
