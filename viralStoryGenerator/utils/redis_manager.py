@@ -248,3 +248,123 @@ class RedisManager:
         except Exception as e:
             _logger.error(f"Failed to get queue length: {str(e)}")
             return 0
+
+    def get_result(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve the result of a completed task.
+
+        Args:
+            task_id: Task identifier
+
+        Returns:
+            Dict or None: Task result information if available
+        """
+        if not self.client:
+            return None
+
+        try:
+            status_key = f"{self.result_prefix}{task_id}"
+            result = self.client.get(status_key)
+            if result:
+                return json.loads(result)
+            return None
+        except Exception as e:
+            _logger.error(f"Failed to get task result: {str(e)}")
+            return None
+
+    def check_key_exists(self, job_id: str) -> bool:
+        """
+        Check if any key exists for the given job ID.
+        Used to determine if a job exists but hasn't completed yet.
+
+        Args:
+            job_id: Job ID to check for existence
+
+        Returns:
+            bool: True if any key with this job ID exists, False otherwise
+        """
+        if not self.client:
+            return False
+
+        try:
+            # Create the specific result key pattern to check
+            key = f"{self.result_prefix}{job_id}"
+            return bool(self.client.exists(key))
+        except Exception as e:
+            _logger.error(f"Error checking key existence: {str(e)}")
+            return False
+
+    def add_request(self, request_data: Dict[str, Any]) -> bool:
+        """
+        Add a request to the queue
+
+        Args:
+            request_data: Dictionary with request data
+
+        Returns:
+            bool: Success status
+        """
+        if not self.client:
+            return False
+
+        try:
+            # Get job ID
+            job_id = request_data.get("id")
+            if not job_id:
+                job_id = str(uuid.uuid4())
+                request_data["id"] = job_id
+
+            # Add to queue
+            self.client.lpush(self.queue_name, json.dumps(request_data))
+
+            # Initialize status
+            status_key = f"{self.result_prefix}{job_id}"
+            self.client.setex(
+                status_key,
+                self.ttl,
+                json.dumps({
+                    "status": "pending",
+                    "message": "Job queued, waiting to start processing",
+                    "created_at": time.time()
+                })
+            )
+
+            return True
+        except Exception as e:
+            _logger.error(f"Failed to add request: {str(e)}")
+            return False
+
+    def store_result(self, job_id: str, result_data: Dict[str, Any]) -> bool:
+        """
+        Store result data for a job
+
+        Args:
+            job_id: Job ID
+            result_data: Result data to store
+
+        Returns:
+            bool: Success status
+        """
+        if not self.client:
+            return False
+
+        try:
+            # Create result key
+            status_key = f"{self.result_prefix}{job_id}"
+
+            # Add timestamp
+            if "created_at" not in result_data:
+                result_data["created_at"] = time.time()
+            result_data["updated_at"] = time.time()
+
+            # Store in Redis
+            self.client.setex(
+                status_key,
+                self.ttl,
+                json.dumps(result_data)
+            )
+
+            return True
+        except Exception as e:
+            _logger.error(f"Failed to store result: {str(e)}")
+            return False
