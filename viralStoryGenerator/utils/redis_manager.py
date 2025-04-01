@@ -412,3 +412,70 @@ class RedisManager:
         except Exception as e:
             _logger.error(f"Error waiting for job result: {str(e)}")
             return None
+
+    def get_next_request(self) -> Optional[Dict[str, Any]]:
+        """
+        Get the next request from the queue without removing it.
+        Returns:
+            Dict or None: The next request in the queue, or None if queue is empty
+        """
+        if not self.client:
+            return None
+
+        try:
+            # Create a processing queue if it doesn't exist
+            processing_queue = f"{self.queue_name}_processing"
+
+            # Atomically move item from main queue to processing queue
+            item = self.client.brpoplpush(self.queue_name, processing_queue, timeout=1)
+
+            if not item:
+                return None
+
+            # Parse the request data
+            request = json.loads(item)
+
+            # Store the original data with the request to make cleanup possible
+            if isinstance(request, dict):
+                request['_original_data'] = item
+
+            return request
+        except Exception as e:
+            _logger.error(f"Failed to get next request: {str(e)}")
+            return None
+
+    def complete_request(self, request: Dict[str, Any], success: bool = True) -> bool:
+        """
+        Mark a request as completed and remove it from the processing queue.
+
+        Args:
+            request: The request object returned by get_next_request
+            success: Whether the processing was successful
+
+        Returns:
+            bool: Success status of the operation
+        """
+        if not self.client or not request:
+            return False
+
+        try:
+            processing_queue = f"{self.queue_name}_processing"
+
+            # Get the original data that was stored
+            original_data = request.get('_original_data')
+            if not original_data:
+                _logger.warning("Cannot complete request: missing original data")
+                return False
+
+            # Remove the item from the processing queue
+            self.client.lrem(processing_queue, 1, original_data)
+
+            # If processing failed, optionally put it back in the main queue
+            if not success:
+                # Check retry count and re-queue if below threshold (Configurable)
+                pass
+
+            return True
+        except Exception as e:
+            _logger.error(f"Failed to complete request: {str(e)}")
+            return False
