@@ -1,9 +1,6 @@
 """
 HTTP API backend for ViralStoryGenerator.
-This module provides HTTP endpoints that replicate CLI functionality
-but accept URLs instead of file paths.
 """
-import asyncio
 import uuid
 import time
 import os
@@ -13,30 +10,39 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, AnyHttpUrl, Field, field_validator
 from prometheus_client import Counter, Histogram, Gauge, generate_latest
 from starlette.responses import Response
 import redis
-import uvicorn
+import time
 import tempfile
 
-from viralStoryGenerator.utils.health_check import get_service_status
+import uvicorn
 
-from ..utils.redis_manager import RedisManager as RedisQueueManager
-from ..utils.storage_manager import storage_manager
-from ..utils.crawl4ai_scraper import scrape_urls
-from ..utils.config import config
-from ..src.llm import process_with_llm
-from ..src.source_cleanser import chunkify_and_summarize
-from ..src.storyboard import generate_storyboard
-from ..src.elevenlabs_tts import generate_elevenlabs_audio
+from viralStoryGenerator.models import (
+    StoryGenerationRequest,
+    JobResponse,
+    HealthResponse,
+    JobStatusResponse
+)
+
+from viralStoryGenerator.utils.health_check import get_service_status
+from viralStoryGenerator.src.api_worker import process_story_generation
+from viralStoryGenerator.utils.redis_manager import RedisManager as RedisQueueManager
+from viralStoryGenerator.utils.config import config as app_config
+from viralStoryGenerator.utils.storage_manager import storage_manager
 from viralStoryGenerator.src.logger import logger as _logger
+from viralStoryGenerator.utils.security import (
+    is_safe_filename,
+    is_file_in_directory,
+    is_valid_uuid,
+    is_valid_voice_id,
+    sanitize_input
+)
 from viralStoryGenerator.src.api_handlers import (
     create_story_task,
     get_task_status
 )
 
-import time
 
 app_start_time = time.time()
 
@@ -48,17 +54,17 @@ router = APIRouter(
 
 # Initialize FastAPI app
 app = FastAPI(
-    title=config.APP_TITLE,
-    description=config.APP_DESCRIPTION,
-    version=config.VERSION
+    title=app_config.APP_TITLE,
+    description=app_config.APP_DESCRIPTION,
+    version=app_config.VERSION
 )
 
 # Include the router in the app
 app.include_router(router)
 
 # Mount static file directory for local storage
-os.makedirs(config.storage.LOCAL_STORAGE_PATH, exist_ok=True)
-app.mount("/static", StaticFiles(directory=config.storage.LOCAL_STORAGE_PATH), name="static")
+os.makedirs(app_config.storage.LOCAL_STORAGE_PATH, exist_ok=True)
+app.mount("/static", StaticFiles(directory=app_config.storage.LOCAL_STORAGE_PATH), name="static")
 
 # Prometheus metrics
 REQUEST_COUNT = Counter('api_requests_total', 'Total API requests', ['method', 'endpoint', 'status'])
@@ -70,7 +76,7 @@ RATE_LIMIT_HIT = Counter('api_rate_limit_hit_total', 'Rate limit exceeded count'
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.http.CORS_ORIGINS,
+    allow_origins=app_config.http.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -78,13 +84,13 @@ app.add_middleware(
 
 # Initialize Redis client for rate limiting
 redis_client = None
-if config.http.RATE_LIMIT_ENABLED and config.redis.ENABLED:
+if app_config.http.RATE_LIMIT_ENABLED and app_config.redis.ENABLED:
     try:
         redis_client = redis.Redis(
-            host=config.redis.HOST,
-            port=config.redis.PORT,
-            db=config.redis.DB,
-            password=config.redis.PASSWORD,
+            host=app_config.redis.HOST,
+            port=app_config.redis.PORT,
+            db=app_config.redis.DB,
+            password=app_config.redis.PASSWORD,
             decode_responses=True
         )
         redis_client.ping()  # Test connection
@@ -111,8 +117,8 @@ class RateLimiter:
         Returns:
             Tuple of (is_allowed, current_count, limit)
         """
-        window = config.http.RATE_LIMIT_WINDOW
-        limit = config.http.RATE_LIMIT_REQUESTS
+        window = app_config.http.RATE_LIMIT_WINDOW
+        limit = app_config.http.RATE_LIMIT_REQUESTS
 
         # Create a unique key for each client IP and endpoint combination
         rate_key = f"rate_limit:{client_ip}:{endpoint}"
@@ -177,7 +183,7 @@ async def metrics_middleware(request: Request, call_next):
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     _logger.debug(f"Rate limit middleware triggered for {request.method} {request.url.path}")
-    if config.http.RATE_LIMIT_ENABLED:
+    if app_config.http.RATE_LIMIT_ENABLED:
         client_ip = request.client.host
         endpoint = request.url.path
 
@@ -194,14 +200,14 @@ async def rate_limit_middleware(request: Request, call_next):
             _logger.warning(f"Rate limit exceeded for {client_ip} on {endpoint}: {current}/{limit}")
 
             # Calculate remaining window time for retry-after header
-            retry_after = config.http.RATE_LIMIT_WINDOW
+            retry_after = app_config.http.RATE_LIMIT_WINDOW
 
             # Custom rate limit exceeded response
             return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 content={
                     "error": "Rate limit exceeded",
-                    "detail": f"Too many requests. Maximum {limit} requests per {config.http.RATE_LIMIT_WINDOW} second window."
+                    "detail": f"Too many requests. Maximum {limit} requests per {app_config.http.RATE_LIMIT_WINDOW} second window."
                 },
                 headers={
                     "X-RateLimit-Limit": str(limit),
@@ -215,7 +221,7 @@ async def rate_limit_middleware(request: Request, call_next):
     response = await call_next(request)
 
     # Add rate limit headers to response if enabled
-    if config.http.RATE_LIMIT_ENABLED:
+    if app_config.http.RATE_LIMIT_ENABLED:
         # Include rate limit information in response headers
         response.headers["X-RateLimit-Limit"] = str(limit)
         response.headers["X-RateLimit-Remaining"] = str(limit - current)
@@ -235,24 +241,6 @@ async def log_requests(request: Request, call_next):
 # Redis queue for API requests
 API_QUEUE_NAME = "api_requests"
 RESULT_PREFIX = "api_result:"
-
-# Models for request and response
-class StoryGenerationRequest(BaseModel):
-    urls: List[AnyHttpUrl] = Field(..., description="List of URLs to scrape for content")
-    topic: str = Field(..., description="Topic for the story")
-    generate_audio: bool = Field(False, description="Whether to generate audio")
-    temperature: Optional[float] = Field(None, description="LLM temperature")
-    chunk_size: Optional[int] = Field(None, description="Word chunk size for splitting sources")
-
-class JobResponse(BaseModel):
-    job_id: str = Field(..., description="Job ID for tracking progress")
-    message: str = Field(..., description="Status message")
-
-class StoryGenerationResult(BaseModel):
-    story_script: str = Field(..., description="Generated story script")
-    storyboard: Dict[str, Any] = Field(..., description="Generated storyboard")
-    audio_url: Optional[str] = Field(None, description="URL to the generated audio file")
-    sources: List[str] = Field(..., description="Sources used to generate the story")
 
 # Redis queue manager dependency
 def get_queue_manager() -> RedisQueueManager:
@@ -291,10 +279,10 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 # Authentication dependency
 async def get_api_key(request: Request, api_key: str = Depends(api_key_header)):
     # Skip authentication if API key security is disabled
-    if not config.http.API_KEY_ENABLED:
+    if not app_config.http.API_KEY_ENABLED:
         return None
 
-    if api_key != config.http.API_KEY:
+    if api_key != app_config.http.API_KEY:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API Key",
@@ -310,7 +298,7 @@ async def get_metrics():
     """
     return Response(content=generate_latest(), media_type="text/plain")
 
-@app.get("/health", tags=["Health and Metrics"])
+@app.get("/health", response_model=HealthResponse, tags=["Health and Metrics"])
 async def health_check():
     """Health check endpoint for monitoring"""
     _logger.debug("Health check endpoint called.")
@@ -322,8 +310,8 @@ async def health_check():
     return {
         "status": "healthy" if all(s["status"] == "up" for s in service_statuses.values()) else "degraded",
         "services": service_statuses,
-        "version": config.VERSION,
-        "environment": config.ENVIRONMENT,
+        "version": app_config.VERSION,
+        "environment": app_config.ENVIRONMENT,
         "uptime": time.time() - app_start_time
     }
 
@@ -335,7 +323,6 @@ async def generate_story(
     sources_folder: Optional[str] = None,
     voice_id: Optional[str] = None
 ):
-    _logger.debug(f"Generate story endpoint called with topic: {topic}")
     """
     Create a new story generation task
 
@@ -348,6 +335,57 @@ async def generate_story(
     - task_id: ID to check status later
     - status: initial status of the task
     """
+    _logger.debug(f"Generate story endpoint called with topic: {topic}")
+
+    # Validate topic
+    if not topic or len(topic) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="Topic must be between 1 and 500 characters"
+        )
+
+    # Check for potential command injection characters
+    if any(char in topic for char in ['&', '|', ';', '$', '`', '\\']):
+        _logger.warning(f"Security: Potentially malicious topic detected: {topic}")
+        raise HTTPException(
+            status_code=400,
+            detail="Topic contains invalid characters"
+        )
+
+    # Validate sources_folder if provided
+    if sources_folder:
+        # Prevent path traversal
+        if '..' in sources_folder or sources_folder.startswith('/') or '\\' in sources_folder:
+            _logger.warning(f"Security: Path traversal attempt detected in sources_folder: {sources_folder}")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid sources folder path"
+            )
+
+        # Ensure the folder exists and is within the allowed directories
+        full_path = os.path.abspath(os.path.join(app_config.storage.SOURCE_MATERIALS_PATH, sources_folder))
+        if not os.path.exists(full_path) or not os.path.isdir(full_path):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Sources folder not found: {sources_folder}"
+            )
+
+        # Verify the folder is within the allowed source materials directory
+        if not is_file_in_directory(full_path, app_config.storage.SOURCE_MATERIALS_PATH):
+            _logger.warning(f"Security: Attempted access to folder outside allowed path: {full_path}")
+            raise HTTPException(
+                status_code=403,
+                detail="Access to the specified folder is not allowed"
+            )
+
+    # Validate voice_id if provided (should match ElevenLabs voice ID format)
+    if voice_id and not is_valid_voice_id(voice_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid voice ID format"
+        )
+
+    # Create the story task
     task = create_story_task(topic, sources_folder, voice_id)
     _logger.debug(f"Story generation task created for topic: {topic}")
     return task
@@ -382,6 +420,16 @@ async def download_story_file(task_id: str, file_type: str):
     Returns:
     - File download response
     """
+    if not is_valid_uuid(task_id):
+        raise HTTPException(status_code=400, detail="Invalid task ID format")
+
+    allowed_file_types = ["story", "audio", "storyboard"]
+    if file_type not in allowed_file_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Must be one of: {', '.join(allowed_file_types)}"
+        )
+
     task_info = get_task_status(task_id)
     if not task_info:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
@@ -394,30 +442,52 @@ async def download_story_file(task_id: str, file_type: str):
         raise HTTPException(status_code=404, detail=f"No {file_type} file available for task {task_id}")
 
     file_path = file_paths[file_type]
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail=f"File not found on server")
+    if not os.path.exists(file_path) or not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="File not found on server")
+
+    expected_directory = None
+    if file_type == "audio":
+        expected_directory = app_config.storage.AUDIO_STORAGE_PATH
+    elif file_type == "story":
+        expected_directory = app_config.storage.STORY_STORAGE_PATH
+    elif file_type == "storyboard":
+        expected_directory = app_config.storage.STORYBOARD_STORAGE_PATH
+
+    if not is_file_in_directory(file_path, expected_directory):
+        _logger.warning(f"Security: Attempted access to file outside storage directory: {file_path}")
+        raise HTTPException(status_code=403, detail="Access denied")
 
     # Set appropriate content type and filename
+    filename = os.path.basename(file_path)
+
+    # Validate filename is safe
+    if not is_safe_filename(filename):
+        _logger.warning(f"Security: Suspicious filename detected: {filename}")
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
     if file_type == "audio":
         media_type = "audio/mpeg"
-        filename = os.path.basename(file_path)
-        return FileResponse(path=file_path, media_type=media_type, filename=filename)
     elif file_type == "storyboard":
         media_type = "application/json"
-        filename = os.path.basename(file_path)
-        return FileResponse(path=file_path, media_type=media_type, filename=filename)
     else:  # story text
         media_type = "text/plain"
-        filename = os.path.basename(file_path)
-        return FileResponse(path=file_path, media_type=media_type, filename=filename)
+
+    return FileResponse(path=file_path, media_type=media_type, filename=filename)
 
 # File Serving Endpoints
 @app.get("/audio/{filename}", tags=["File Serving"])
 async def serve_audio_file(filename: str):
     """Serve audio files directly"""
-    file_path = os.path.join(config.storage.AUDIO_STORAGE_PATH, filename)
-    if not os.path.exists(file_path):
+    if not is_safe_filename(filename):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    file_path = os.path.join(app_config.storage.AUDIO_STORAGE_PATH, filename)
+    if not os.path.exists(file_path) or not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail="Audio file not found")
+
+    if not is_file_in_directory(file_path, app_config.storage.AUDIO_STORAGE_PATH):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     return FileResponse(
         path=file_path,
         media_type="audio/mpeg",
@@ -431,23 +501,23 @@ async def stream_audio(
 ):
     """
     Stream audio file with support for range requests (needed for seeking in audio players)
-
-    Parameters:
-    - filename: Name of the audio file to stream
-    - range: HTTP Range header for partial content requests
-
-    Returns:
-    - Streaming response with audio data and appropriate headers for HTML5 audio players
     """
+    if not is_safe_filename(filename):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
     # Get file size and check existence
     file_size = None
     file_path = None
 
-    if config.storage.PROVIDER == "local":
+    if app_config.storage.PROVIDER == "local":
         # For local files, check the file system directly
-        file_path = os.path.join(config.storage.AUDIO_STORAGE_PATH, filename)
-        if not os.path.exists(file_path):
+        file_path = os.path.join(app_config.storage.AUDIO_STORAGE_PATH, filename)
+        if not os.path.exists(file_path) or not os.path.isfile(file_path):
             raise HTTPException(status_code=404, detail="Audio file not found")
+
+        if not is_file_in_directory(file_path, app_config.storage.AUDIO_STORAGE_PATH):
+            raise HTTPException(status_code=403, detail="Access denied")
+
         file_size = os.path.getsize(file_path)
     else:
         # For cloud storage, check if file exists by getting metadata
@@ -487,6 +557,12 @@ async def stream_audio(
             if end >= file_size:
                 end = file_size - 1
 
+            # Prevent negative ranges
+            if start < 0:
+                start = 0
+            if end < 0:
+                end = 0
+
             # Use 206 Partial Content for range requests
             if start > 0 or end < file_size - 1:
                 status_code = 206
@@ -495,7 +571,7 @@ async def stream_audio(
             pass
 
     # Calculate content length
-    content_length = end - start + 1
+    content_length = max(0, end - start + 1)
 
     # Define headers
     headers = {
@@ -507,7 +583,7 @@ async def stream_audio(
 
     # Function to stream file content in chunks
     async def file_streamer():
-        if config.storage.PROVIDER == "local" or file_path:
+        if app_config.storage.PROVIDER == "local" or file_path:
             # Stream from local file
             with open(file_path, "rb") as f:
                 f.seek(start)
@@ -567,9 +643,16 @@ async def stream_audio(
 @app.get("/story/{filename}", tags=["File Serving"])
 async def serve_story_file(filename: str):
     """Serve story text files directly"""
-    file_path = os.path.join(config.storage.STORY_STORAGE_PATH, filename)
-    if not os.path.exists(file_path):
+    if not is_safe_filename(filename):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    file_path = os.path.join(app_config.storage.STORY_STORAGE_PATH, filename)
+    if not os.path.exists(file_path) or not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail="Story file not found")
+
+    if not is_file_in_directory(file_path, app_config.storage.STORY_STORAGE_PATH):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     return FileResponse(
         path=file_path,
         media_type="text/plain",
@@ -579,9 +662,16 @@ async def serve_story_file(filename: str):
 @app.get("/storyboard/{filename}", tags=["File Serving"])
 async def serve_storyboard_file(filename: str):
     """Serve storyboard JSON files directly"""
-    file_path = os.path.join(config.storage.STORYBOARD_STORAGE_PATH, filename)
-    if not os.path.exists(file_path):
+    if not is_safe_filename(filename):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    file_path = os.path.join(app_config.storage.STORYBOARD_STORAGE_PATH, filename)
+    if not os.path.exists(file_path) or not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail="Storyboard file not found")
+
+    if not is_file_in_directory(file_path, app_config.storage.STORYBOARD_STORAGE_PATH):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     return FileResponse(
         path=file_path,
         media_type="application/json",
@@ -609,8 +699,8 @@ async def generate_story_from_urls(
             "urls": [str(url) for url in request.urls],
             "topic": request.topic,
             "generate_audio": request.generate_audio,
-            "temperature": request.temperature or config.llm.TEMPERATURE,
-            "chunk_size": request.chunk_size or int(os.environ.get("LLM_CHUNK_SIZE", config.llm.CHUNK_SIZE))
+            "temperature": request.temperature or app_config.llm.TEMPERATURE,
+            "chunk_size": request.chunk_size or int(os.environ.get("LLM_CHUNK_SIZE", app_config.llm.CHUNK_SIZE))
         }
 
         queue_manager.add_request(request_data)
@@ -627,7 +717,7 @@ async def generate_story_from_urls(
         _logger.error(f"Error queueing job: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to queue job: {str(e)}")
 
-@app.get("/api/status/{job_id}", tags=["Job Management"])
+@app.get("/api/status/{job_id}", response_model=JobStatusResponse, tags=["Job Management"])
 async def get_job_status(
     job_id: str,
     queue_manager: RedisQueueManager = Depends(get_queue_manager)
@@ -661,200 +751,6 @@ async def get_job_status(
     except Exception as e:
         _logger.error(f"Error checking job status: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to check job status: {str(e)}")
-
-# Function to generate audio from text
-def generate_audio(text: str) -> Dict[str, Any]:
-    """
-    Generate audio from text using ElevenLabs TTS
-
-    Args:
-        text: Text to convert to speech
-
-    Returns:
-        Dict with file information including path and URL
-    """
-    try:
-        # Check for API key
-        api_key = config.elevenLabs.API_KEY
-        voice_id = config.elevenLabs.VOICE_ID
-
-        if not api_key:
-            _logger.error("No ElevenLabs API key configured. Cannot generate audio.")
-            raise ValueError("ElevenLabs API key not configured")
-
-        # Generate a unique filename
-        filename = f"{uuid.uuid4()}.mp3"
-        temp_path = os.path.join(tempfile.gettempdir(), filename)
-
-        # Generate the audio file
-        success = generate_elevenlabs_audio(
-            text=text,
-            api_key=api_key,
-            output_mp3_path=temp_path,
-            voice_id=voice_id,
-            model_id="eleven_multilingual_v2",
-            stability=0.5,
-            similarity_boost=0.75
-        )
-
-        if not success:
-            raise ValueError("Failed to generate audio with ElevenLabs API")
-
-        # Store the audio file using the storage manager
-        with open(temp_path, "rb") as f:
-            audio_data = f.read()
-
-        # Store the audio file in the configured storage
-        file_info = storage_manager.store_file(
-            file_data=audio_data,
-            file_type="audio",
-            filename=filename,
-            content_type="audio/mpeg"
-        )
-
-        # Clean up temp file
-        os.remove(temp_path)
-
-        return file_info
-
-    except Exception as e:
-        _logger.error(f"Error generating audio: {str(e)}")
-        raise
-
-async def process_story_generation(job_id: str, request_data: Dict[str, Any]):
-    """
-    Process a story generation request asynchronously.
-    This function is run in the background after a request is received.
-
-    Args:
-        job_id: Unique identifier for the job
-        request_data: Request data containing URLs and parameters
-    """
-    _logger.info(f"Starting job {job_id} for topic: {request_data['topic']}")
-
-    try:
-        queue_manager = RedisQueueManager(
-            queue_name=API_QUEUE_NAME,
-            result_prefix=RESULT_PREFIX
-        )
-
-        # Update status to processing
-        queue_manager.store_result(job_id, {
-            "status": "processing",
-            "message": "Scraping content from URLs"
-        })
-
-        # Scrape content from URLs
-        urls = request_data["urls"]
-        scraped_content = await scrape_urls(urls)
-
-        # Filter out failed scrapes
-        valid_content = [(url, content) for url, content in scraped_content if content]
-
-        if not valid_content:
-            queue_manager.store_result(job_id, {
-                "status": "failed",
-                "message": "Failed to scrape any content from the provided URLs"
-            })
-            return
-
-        # Update status
-        queue_manager.store_result(job_id, {
-            "status": "processing",
-            "message": "Chunking and summarizing content"
-        })
-
-        # Prepare content for processing by combining all scraped content into one text
-        combined_content = ""
-        for _, content in valid_content:
-            combined_content += content + "\n\n"
-
-        # Process through chunking
-        temperature = request_data.get("temperature", config.llm.TEMPERATURE)
-        endpoint = config.llm.ENDPOINT
-        model = config.llm.MODEL
-        chunk_size = request_data.get("chunk_size", int(os.environ.get("LLM_CHUNK_SIZE", config.llm.CHUNK_SIZE)))
-
-        # Apply chunking and summarization
-        cleansed_content = chunkify_and_summarize(
-            raw_sources=combined_content,
-            endpoint=endpoint,
-            model=model,
-            temperature=temperature,
-            chunk_size=chunk_size
-        )
-
-        # Process with LLM
-        queue_manager.store_result(job_id, {
-            "status": "processing",
-            "message": "Generating story script"
-        })
-        story_script = process_with_llm(request_data["topic"], cleansed_content, temperature)
-
-        # Generate storyboard
-        queue_manager.store_result(job_id, {
-            "status": "processing",
-            "message": "Creating storyboard"
-        })
-        storyboard = generate_storyboard(story_script)
-
-        result = {
-            "status": "completed",
-            "story_script": story_script,
-            "storyboard": storyboard,
-            "sources": [url for url, _ in valid_content]
-        }
-
-        # Generate audio if requested
-        if request_data.get("generate_audio", False):
-            queue_manager.store_result(job_id, {
-                "status": "processing",
-                "message": "Generating audio"
-            })
-
-            try:
-                # Generate audio and store it in the configured storage
-                file_info = generate_audio(story_script)
-
-                # Add audio URL to result
-                if config.storage.PROVIDER == "local":
-                    # For local storage, construct URL using server's base URL
-                    result["audio_url"] = f"{config.http.BASE_URL}/audio/{os.path.basename(file_info.get('file_path', ''))}"
-                else:
-                    # For cloud storage providers, use the URL directly
-                    result["audio_url"] = file_info.get("url", None)
-
-                # For tracking, add file path details
-                result["audio_file"] = {
-                    "path": file_info.get("file_path", ""),
-                    "filename": file_info.get("filename", ""),
-                    "provider": file_info.get("provider", "local"),
-                    "storage_id": file_info.get("id", "")
-                }
-
-            except Exception as e:
-                _logger.error(f"Error generating audio: {str(e)}")
-                result["audio_url"] = None
-                result["audio_error"] = str(e)
-
-        # Store the final result
-        queue_manager.store_result(job_id, result)
-        _logger.info(f"Completed job {job_id}")
-
-    except Exception as e:
-        _logger.error(f"Error processing job {job_id}: {str(e)}")
-        try:
-            # Store the error
-            queue_manager = RedisQueueManager(
-                queue_name=API_QUEUE_NAME,
-                result_prefix=RESULT_PREFIX
-            )
-            queue_manager.store_result(job_id, {
-                "status": "failed",
-                "message": f"Job failed: {str(e)}"
-            })
-        except Exception:
-            _logger.exception("Failed to store job failure")
 
 def start_api_server(host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
     """Start the FastAPI server with uvicorn"""
