@@ -43,9 +43,8 @@ def is_file_in_directory(file_path: str, directory: str) -> bool:
     file_path = os.path.realpath(os.path.abspath(file_path))
     directory = os.path.realpath(os.path.abspath(directory))
 
-    # Check if the file's path starts with the directory path
-    return os.path.commonpath([file_path]) == os.path.commonpath([file_path, directory])
-
+    # Check if the file's path is within the directory path
+    return os.path.commonpath([file_path, directory]) == directory
 def is_valid_uuid(uuid_string: str) -> bool:
     """
     Validate that a string is a valid UUID format.
