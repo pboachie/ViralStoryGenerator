@@ -20,6 +20,8 @@ import redis
 import uvicorn
 import tempfile
 
+from viralStoryGenerator.utils.health_check import get_service_status
+
 from ..utils.redis_manager import RedisManager as RedisQueueManager
 from ..utils.storage_manager import storage_manager
 from ..utils.crawl4ai_scraper import scrape_urls
@@ -31,10 +33,12 @@ from ..src.elevenlabs_tts import generate_elevenlabs_audio
 from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.src.api_handlers import (
     create_story_task,
-    get_task_status,
-    process_story_task,
-    process_audio_queue
+    get_task_status
 )
+
+import time
+
+app_start_time = time.time()
 
 router = APIRouter(
     prefix="/api",
@@ -279,37 +283,6 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"error": "An unexpected error occurred", "detail": str(exc)},
     )
 
-# Periodic task scheduler
-@app.on_event("startup")
-async def startup_event():
-    _logger.info("API server starting up...")
-    # Process any queued audio files at startup
-    process_audio_queue()
-
-    # Start the cleanup background task if enabled
-    if config.storage.FILE_RETENTION_DAYS > 0:
-        asyncio.create_task(scheduled_cleanup())
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    _logger.info("API server shutting down...")
-
-async def scheduled_cleanup():
-    """Run periodic cleanup of old files based on retention policy"""
-    while True:
-        try:
-            # Sleep first to avoid cleanup right at startup
-            await asyncio.sleep(24 * 60 * 60)  # Run once per day
-
-            # Get the retention period from config
-            retention_days = config.storage.FILE_RETENTION_DAYS
-
-            if retention_days > 0:
-                _logger.info(f"Running scheduled cleanup of files older than {retention_days} days")
-                deleted_count = storage_manager.cleanup_old_files(retention_days)
-                _logger.info(f"Cleanup complete: {deleted_count} files removed")
-        except Exception as e:
-            _logger.error(f"Error in scheduled cleanup: {e}")
 
 # Setup API security if enabled in config
 API_KEY_NAME = "X-API-Key"
@@ -328,7 +301,8 @@ async def get_api_key(request: Request, api_key: str = Depends(api_key_header)):
         )
     return api_key
 
-@app.get("/metrics")
+# Health and Metrics Endpoints
+@app.get("/metrics", tags=["Health and Metrics"])
 async def get_metrics():
     """
     Endpoint to expose Prometheus metrics.
@@ -336,15 +310,25 @@ async def get_metrics():
     """
     return Response(content=generate_latest(), media_type="text/plain")
 
-@app.get("/health")
+@app.get("/health", tags=["Health and Metrics"])
 async def health_check():
-    """
-    Health check endpoint.
-    Returns 200 OK if the API server is running.
-    """
-    return JSONResponse(content={"status": "ok"})
+    """Health check endpoint for monitoring"""
+    _logger.debug("Health check endpoint called.")
 
-@app.post("/api/stories", dependencies=[Depends(get_api_key)])
+    # Fetch detailed service statuses
+    service_statuses = get_service_status()
+
+    _logger.debug("Health check response generated.")
+    return {
+        "status": "healthy" if all(s["status"] == "up" for s in service_statuses.values()) else "degraded",
+        "services": service_statuses,
+        "version": config.VERSION,
+        "environment": config.ENVIRONMENT,
+        "uptime": time.time() - app_start_time
+    }
+
+# Story Management Endpoints
+@app.post("/api/stories", dependencies=[Depends(get_api_key)], tags=["Story Management"])
 async def generate_story(
     topic: str,
     background_tasks: BackgroundTasks,
@@ -368,7 +352,7 @@ async def generate_story(
     _logger.debug(f"Story generation task created for topic: {topic}")
     return task
 
-@app.get("/api/stories/{task_id}", dependencies=[Depends(get_api_key)])
+@app.get("/api/stories/{task_id}", dependencies=[Depends(get_api_key)], tags=["Story Management"])
 async def check_story_status(task_id: str):
     _logger.debug(f"Check story status endpoint called for task_id: {task_id}")
     """
@@ -386,7 +370,49 @@ async def check_story_status(task_id: str):
     _logger.debug(f"Story status retrieved for task_id: {task_id}")
     return task_info
 
-@app.get("/audio/{filename}")
+@app.get("/api/stories/{task_id}/download/{file_type}", dependencies=[Depends(get_api_key)], tags=["Story Management"])
+async def download_story_file(task_id: str, file_type: str):
+    """
+    Download a generated file from a completed story task
+
+    Parameters:
+    - task_id: ID of the task
+    - file_type: Type of file to download (story, audio, storyboard)
+
+    Returns:
+    - File download response
+    """
+    task_info = get_task_status(task_id)
+    if not task_info:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+    if task_info.get("status") != "completed":
+        raise HTTPException(status_code=400, detail=f"Task {task_id} is not completed")
+
+    file_paths = task_info.get("file_paths", {})
+    if file_type not in file_paths or not file_paths[file_type]:
+        raise HTTPException(status_code=404, detail=f"No {file_type} file available for task {task_id}")
+
+    file_path = file_paths[file_type]
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail=f"File not found on server")
+
+    # Set appropriate content type and filename
+    if file_type == "audio":
+        media_type = "audio/mpeg"
+        filename = os.path.basename(file_path)
+        return FileResponse(path=file_path, media_type=media_type, filename=filename)
+    elif file_type == "storyboard":
+        media_type = "application/json"
+        filename = os.path.basename(file_path)
+        return FileResponse(path=file_path, media_type=media_type, filename=filename)
+    else:  # story text
+        media_type = "text/plain"
+        filename = os.path.basename(file_path)
+        return FileResponse(path=file_path, media_type=media_type, filename=filename)
+
+# File Serving Endpoints
+@app.get("/audio/{filename}", tags=["File Serving"])
 async def serve_audio_file(filename: str):
     """Serve audio files directly"""
     file_path = os.path.join(config.storage.AUDIO_STORAGE_PATH, filename)
@@ -538,7 +564,7 @@ async def stream_audio(
         status_code=status_code
     )
 
-@app.get("/story/{filename}")
+@app.get("/story/{filename}", tags=["File Serving"])
 async def serve_story_file(filename: str):
     """Serve story text files directly"""
     file_path = os.path.join(config.storage.STORY_STORAGE_PATH, filename)
@@ -550,7 +576,7 @@ async def serve_story_file(filename: str):
         filename=filename
     )
 
-@app.get("/storyboard/{filename}")
+@app.get("/storyboard/{filename}", tags=["File Serving"])
 async def serve_storyboard_file(filename: str):
     """Serve storyboard JSON files directly"""
     file_path = os.path.join(config.storage.STORYBOARD_STORAGE_PATH, filename)
@@ -562,48 +588,8 @@ async def serve_storyboard_file(filename: str):
         filename=filename
     )
 
-@app.get("/api/stories/{task_id}/download/{file_type}", dependencies=[Depends(get_api_key)])
-async def download_story_file(task_id: str, file_type: str):
-    """
-    Download a generated file from a completed story task
-
-    Parameters:
-    - task_id: ID of the task
-    - file_type: Type of file to download (story, audio, storyboard)
-
-    Returns:
-    - File download response
-    """
-    task_info = get_task_status(task_id)
-    if not task_info:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-
-    if task_info.get("status") != "completed":
-        raise HTTPException(status_code=400, detail=f"Task {task_id} is not completed")
-
-    file_paths = task_info.get("file_paths", {})
-    if file_type not in file_paths or not file_paths[file_type]:
-        raise HTTPException(status_code=404, detail=f"No {file_type} file available for task {task_id}")
-
-    file_path = file_paths[file_type]
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail=f"File not found on server")
-
-    # Set appropriate content type and filename
-    if file_type == "audio":
-        media_type = "audio/mpeg"
-        filename = os.path.basename(file_path)
-        return FileResponse(path=file_path, media_type=media_type, filename=filename)
-    elif file_type == "storyboard":
-        media_type = "application/json"
-        filename = os.path.basename(file_path)
-        return FileResponse(path=file_path, media_type=media_type, filename=filename)
-    else:  # story text
-        media_type = "text/plain"
-        filename = os.path.basename(file_path)
-        return FileResponse(path=file_path, media_type=media_type, filename=filename)
-
-@app.post("/api/generate", response_model=JobResponse)
+# Job Management Endpoints
+@app.post("/api/generate", response_model=JobResponse, tags=["Job Management"])
 async def generate_story_from_urls(
     request: StoryGenerationRequest,
     background_tasks: BackgroundTasks,
@@ -641,7 +627,7 @@ async def generate_story_from_urls(
         _logger.error(f"Error queueing job: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to queue job: {str(e)}")
 
-@app.get("/api/status/{job_id}")
+@app.get("/api/status/{job_id}", tags=["Job Management"])
 async def get_job_status(
     job_id: str,
     queue_manager: RedisQueueManager = Depends(get_queue_manager)
@@ -651,12 +637,27 @@ async def get_job_status(
     Returns the result if the job has completed.
     """
     try:
+        if not queue_manager.is_available():
+            raise HTTPException(status_code=503, detail="Redis service unavailable")
+
+        # Try to get the result for the job
         result = queue_manager.get_result(job_id)
+
         if not result:
+            # Check if the job exists by checking for any record with this ID
+            key_exists = queue_manager.check_key_exists(job_id)
+
+            if not key_exists:
+                # The job doesn't exist at all
+                raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+            # Job exists but is still processing
             return {"status": "pending", "message": "Job is still processing"}
 
         return result
 
+    except HTTPException:
+        raise
     except Exception as e:
         _logger.error(f"Error checking job status: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to check job status: {str(e)}")

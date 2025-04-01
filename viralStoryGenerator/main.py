@@ -1,20 +1,17 @@
 # viralStoryGenerator/main.py
 import argparse
-import sys
+import asyncio
 import os
 import multiprocessing
 from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.utils.config import config as app_config
 from fastapi.staticfiles import StaticFiles
-from fastapi import FastAPI, HTTPException, Depends, Header, Request
-from fastapi.middleware.cors import CORSMiddleware
-from viralStoryGenerator.src.api import router as api_router
+from viralStoryGenerator.src.api import app as api_router
 from viralStoryGenerator.utils.scheduled_cleanup import cleanup_task
-from viralStoryGenerator.utils.health_check import get_service_status
-import time
-
-app_start_time = time.time()
-
+from viralStoryGenerator.utils.storage_manager import storage_manager
+from viralStoryGenerator.src.api_handlers import (
+    process_audio_queue
+)
 def main():
     """
     Main entry point for ViralStoryGenerator API.
@@ -55,24 +52,23 @@ def main():
     start_api_server(host=args.host, port=args.port, reload=args.reload or is_development)
     _logger.debug("API server started successfully.")
 
-# Set up the FastAPI application
-app = FastAPI(
-    title=app_config.APP_TITLE,
-    description=app_config.APP_DESCRIPTION,
-    version=app_config.VERSION
-)
+async def scheduled_cleanup():
+    """Run periodic cleanup of old files based on retention policy"""
+    while True:
+        try:
+            # Sleep first to avoid cleanup right at startup
+            await asyncio.sleep(24 * 60 * 60)  # Run once per day
 
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=app_config.http.CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+            # Get the retention period from config
+            retention_days = app_config.storage.FILE_RETENTION_DAYS
 
-# Include the API router
-app.include_router(api_router)
+            if retention_days > 0:
+                _logger.info(f"Running scheduled cleanup of files older than {retention_days} days")
+                deleted_count = storage_manager.cleanup_old_files(retention_days)
+                _logger.info(f"Cleanup complete: {deleted_count} files removed")
+        except Exception as e:
+            _logger.error(f"Error in scheduled cleanup: {e}")
+
 
 # Create necessary directories
 os.makedirs(app_config.storage.AUDIO_STORAGE_PATH, exist_ok=True)
@@ -80,18 +76,24 @@ os.makedirs(app_config.storage.STORY_STORAGE_PATH, exist_ok=True)
 os.makedirs(app_config.storage.STORYBOARD_STORAGE_PATH, exist_ok=True)
 
 # Mount static directories for serving files directly
-app.mount("/static/audio", StaticFiles(directory=app_config.storage.AUDIO_STORAGE_PATH), name="audio")
-app.mount("/static/stories", StaticFiles(directory=app_config.storage.STORY_STORAGE_PATH), name="stories")
-app.mount("/static/storyboards", StaticFiles(directory=app_config.storage.STORYBOARD_STORAGE_PATH), name="storyboards")
+api_router.mount("/static/audio", StaticFiles(directory=app_config.storage.AUDIO_STORAGE_PATH), name="audio")
+api_router.mount("/static/stories", StaticFiles(directory=app_config.storage.STORY_STORAGE_PATH), name="stories")
+api_router.mount("/static/storyboards", StaticFiles(directory=app_config.storage.STORYBOARD_STORAGE_PATH), name="storyboards")
 
 # Startup event handler
-@app.on_event("startup")
+@api_router.on_event("startup")
 async def startup_event():
     """Perform tasks when the application starts"""
     _logger.debug("Startup event triggered.")
     _logger.info(f"Starting {app_config.APP_TITLE} v{app_config.VERSION}")
     _logger.info(f"Environment: {app_config.ENVIRONMENT}")
     _logger.info(f"Storage provider: {app_config.storage.PROVIDER}")
+        # Process any queued audio files at startup
+    process_audio_queue()
+
+        # Start the cleanup background task if enabled
+    if app_config.storage.FILE_RETENTION_DAYS > 0:
+        asyncio.create_task(scheduled_cleanup())
 
     # Start the scheduled cleanup task
     if app_config.storage.FILE_RETENTION_DAYS > 0:
@@ -103,7 +105,7 @@ async def startup_event():
     _logger.debug("Startup event completed.")
 
 # Shutdown event handler
-@app.on_event("shutdown")
+@api_router.on_event("shutdown")
 async def shutdown_event():
     """Perform tasks when the application shuts down"""
     _logger.debug("Shutdown event triggered.")
@@ -113,26 +115,9 @@ async def shutdown_event():
     cleanup_task.stop()
     _logger.debug("Shutdown event completed.")
 
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for monitoring"""
-    _logger.debug("Health check endpoint called.")
-
-    # Fetch detailed service statuses
-    service_statuses = get_service_status()
-
-    _logger.debug("Health check response generated.")
-    return {
-        "status": "healthy" if all(s["status"] == "up" for s in service_statuses.values()) else "degraded",
-        "services": service_statuses,
-        "version": app_config.VERSION,
-        "environment": app_config.ENVIRONMENT,
-        "uptime": time.time() - app_start_time
-    }
 
 # Root endpoint
-@app.get("/")
+@api_router.get("/")
 async def root():
     """Root endpoint"""
     return {
