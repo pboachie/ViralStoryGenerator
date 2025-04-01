@@ -129,23 +129,6 @@ async def scrape_urls(
         - If Redis queue manager is available, the request will be queued to prevent system overload.
         - The function will attempt to use the queue first, then fall back to direct scraping if needed.
 
-    Example:
-        ```python
-        import asyncio
-        from crawl4ai_scraper import scrape_urls
-
-        async def main():
-            urls = ["https://example.com", "https://another.com"]
-            results = await scrape_urls(urls)
-            for url, markdown in results:
-                if markdown:
-                    print(f"Markdown for {url}:\n{markdown[:100]}...")
-                else:
-                    print(f"Failed to crawl {url}")
-
-        if __name__ == "__main__":
-            asyncio.run(main())
-        ```
     """
     _logger.debug(f"Scraping URLs: {urls}")
     # Try to use the Redis queue first
