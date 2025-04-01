@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # viralStoryGenerator/models/models.py
 
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from pydantic import BaseModel, AnyHttpUrl, Field, field_validator
 from viralStoryGenerator.utils.config import config as app_config
 
@@ -59,10 +59,18 @@ class ErrorResponse(BaseModel):
     detail: str = Field(..., description="Error details")
 
 
+class ServiceStatusDetail(BaseModel):
+    """Model for individual service status details"""
+    status: str = Field(..., description="Service status: healthy, degraded, or unhealthy")
+    uptime: Union[float, str] = Field(..., description="Service uptime in seconds or uptime text")
+    response_time: Union[float, str] = Field(..., description="Service response time in ms or response time text")
+    message: Optional[str] = Field(None, description="Additional service status information")
+
+
 class HealthResponse(BaseModel):
     """Response model for health check endpoint"""
     status: str = Field(..., description="Overall system status: healthy, degraded, or unhealthy")
-    services: Dict[str, Dict[str, str]] = Field(..., description="Status of individual services")
+    services: Dict[str, ServiceStatusDetail] = Field(..., description="Status of individual services")
     version: str = Field(..., description="API version")
     environment: str = Field(..., description="Environment name")
     uptime: float = Field(..., description="Server uptime in seconds")
@@ -79,4 +87,3 @@ class JobStatusResponse(BaseModel):
     error: Optional[str] = Field(None, description="Error message if failed")
     created_at: Optional[float] = Field(None, description="Timestamp when job was created")
     updated_at: Optional[float] = Field(None, description="Timestamp when job was last updated")
-    
