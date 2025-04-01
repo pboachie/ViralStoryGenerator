@@ -368,3 +368,47 @@ class RedisManager:
         except Exception as e:
             _logger.error(f"Failed to store result: {str(e)}")
             return False
+
+    def wait_for_result(self, job_id: str, timeout: int = 300, check_interval: float = 0.5) -> Optional[Dict[str, Any]]:
+        """
+        Wait for a job result with timeout.
+
+        Args:
+            job_id: The job ID to wait for
+            timeout: Maximum time to wait in seconds (default 300 seconds/5 minutes)
+            check_interval: How often to check for results in seconds (default 0.5 seconds)
+
+        Returns:
+            Dict or None: Result data if job completed successfully within timeout, None otherwise
+        """
+        if not self.client:
+            return None
+
+        try:
+            start_time = time.time()
+            status_key = f"{self.result_prefix}{job_id}"
+
+            while (time.time() - start_time) < timeout:
+                # Check if result exists
+                result_data = self.client.get(status_key)
+                if result_data:
+                    result = json.loads(result_data)
+                    status = result.get("status")
+
+                    # If job completed or failed, return the result
+                    if status in ["completed", "failed"]:
+                        return result
+
+                # Wait before checking again
+                time.sleep(check_interval)
+
+            # Timeout reached
+            _logger.warning(f"Timeout reached while waiting for job {job_id}")
+            return {
+                "status": "failed",
+                "error": f"Timeout reached waiting for job result after {timeout} seconds",
+                "job_id": job_id
+            }
+        except Exception as e:
+            _logger.error(f"Error waiting for job result: {str(e)}")
+            return None
