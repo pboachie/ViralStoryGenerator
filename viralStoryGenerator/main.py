@@ -81,7 +81,7 @@ async def scheduled_cleanup():
             _logger.info("Running scheduled file cleanup")
 
             # Run the cleanup task
-            await cleanup_task()
+            cleanup_task._run_cleanup()
 
             # Process any queued audio generation
             process_audio_queue()

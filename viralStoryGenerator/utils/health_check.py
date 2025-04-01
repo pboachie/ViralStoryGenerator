@@ -123,8 +123,16 @@ async def check_llm_status() -> Dict[str, Any]:
 
         # If it's an OpenAI-compatible endpoint, just ping it with a GET request
         # to avoid unnecessary token usage
+        # Extract base URL and create models endpoint
+        v1_index = endpoint.find("/v1/")
+        if v1_index != -1:
+            models_endpoint = endpoint[:v1_index + 4] + "models"  # +4 to include "/v1/"
+        else:
+            # Fallback for unexpected endpoint format
+            models_endpoint = endpoint.rsplit("/", 2)[0] + "/models"
+
         response = requests.get(
-            endpoint.split("/v1")[0] + "/models",  # Try standard models endpoint
+            models_endpoint,
             headers=headers,
             timeout=5
         )
