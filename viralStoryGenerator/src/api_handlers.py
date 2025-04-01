@@ -6,6 +6,10 @@ import json
 import uuid
 from typing import Dict, Any, Optional, List
 
+from viralStoryGenerator.models import (
+    StoryGenerationResult,
+    JobStatusResponse
+)
 from viralStoryGenerator.src.llm import generate_story_script
 from viralStoryGenerator.src.source_cleanser import chunkify_and_summarize
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
@@ -297,12 +301,12 @@ def process_story_task(task_id: str, topic: str, sources_folder: Optional[str] =
         process_audio_queue()
 
         raw_sources = None
-        # 1) Read all the files from the sources folder into one combined text
+        # Read all the files from the sources folder into one combined text
         if sources_folder and len(sources_folder) >= 1:
             _logger.debug(f"Reading all files in folder '{sources_folder}' for sources...")
             raw_sources = _read_sources_from_folder(sources_folder)
 
-        # 2) Chunkify & Summarize them into a single cohesive summary
+        # Chunkify & Summarize them into a single cohesive summary
         if raw_sources and raw_sources.strip():
             _logger.debug("Splitting & summarizing sources via LLM (multi-chunk)...")
             cleansed_sources = chunkify_and_summarize(
@@ -317,7 +321,7 @@ def process_story_task(task_id: str, topic: str, sources_folder: Optional[str] =
             _logger.debug("No sources found. Skipping cleansing step.")
             cleansed_sources = ""
 
-        # 3) Generate the story script from these cleansed/merged sources
+        # Generate the story script from these cleansed/merged sources
         result = generate_story_script(
             topic=topic,
             sources=cleansed_sources,
@@ -327,10 +331,10 @@ def process_story_task(task_id: str, topic: str, sources_folder: Optional[str] =
             show_thinking=appconfig.llm.SHOW_THINKING
         )
 
-        # 4) Save the final outputs including audio generation
+        # Save the final outputs including audio generation
         file_paths = _save_story_output(result, topic, voice_id=voice_id)
 
-        # 5) Prepare the final result
+        # Prepare the final result
         task_result = {
             "task_id": task_id,
             "topic": topic,
@@ -343,6 +347,17 @@ def process_story_task(task_id: str, topic: str, sources_folder: Optional[str] =
             "file_paths": file_paths,
             "processing_time": time.time() - start_exec
         }
+
+        # Convert to StoryGenerationResult model if needed
+        story_result = {
+            "story_script": result.get("story", ""),
+            "storyboard": result.get("storyboard", {}),
+            "sources": [sources_folder] if sources_folder else []
+        }
+
+        # Add audio URL if available
+        if file_paths.get("audio"):
+            story_result["audio_url"] = f"/audio/{os.path.basename(file_paths['audio'])}"
 
         # Update Redis if enabled
         if redis_manager:
@@ -374,9 +389,30 @@ def get_task_status(task_id: str) -> Dict[str, Any]:
         task_id: The ID of the task to check
 
     Returns:
-        Dict with task status information
+        Dict with task status information that can be converted to JobStatusResponse
     """
     if not redis_manager:
-        return {"error": "Task tracking unavailable without Redis"}
+        return {"error": "Task tracking unavailable without Redis", "status": "failed"}
 
-    return redis_manager.get_task_status(task_id)
+    result = redis_manager.get_task_status(task_id)
+
+    # Ensure the result matches the JobStatusResponse model structure
+    if result and "status" in result:
+        # Make sure all required fields from JobStatusResponse are present
+        if "message" not in result:
+            result["message"] = None
+        if result["status"] == "completed" and "result" in result:
+            # Extract story data from the result
+            result["story_script"] = result.get("result", {}).get("story")
+            result["storyboard"] = result.get("result", {}).get("storyboard")
+
+            # Add audio URL if available
+            if "file_paths" in result and result["file_paths"].get("audio"):
+                result["audio_url"] = f"/audio/{os.path.basename(result['file_paths']['audio'])}"
+            else:
+                result["audio_url"] = None
+
+            # Add sources data
+            result["sources"] = [result.get("sources_folder")] if result.get("sources_folder") else []
+
+    return result
