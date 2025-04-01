@@ -127,3 +127,11 @@ class config:
         # Tracing configuration (for distributed tracing)
         TRACING_ENABLED = os.environ.get("TRACING_ENABLED", "False").lower() in ["true", "1", "yes"]
         TRACING_EXPORTER = os.environ.get("TRACING_EXPORTER", "jaeger")
+
+    class security:
+        # Security settings
+        VOICE_ID_PATTERN = os.environ.get("VOICE_ID_PATTERN", "")  # Regex pattern for voice ID validation
+        SANITIZE_MAX_LENGTH = int(os.environ.get("SANITIZE_MAX_LENGTH", 1000))
+        DANGEROUS_CHARS = list(os.environ.get("DANGEROUS_CHARS", "&|;$`\\"))  # Characters to remove in sanitization
+        ALLOWED_FILE_TYPES = os.environ.get("ALLOWED_FILE_TYPES", "mp3,wav,txt,json").split(",")  # Allowed file extensions
+        SOURCE_MATERIALS_PATH = os.environ.get("SOURCE_MATERIALS_PATH", "./data/sources")  # Path to source materials
