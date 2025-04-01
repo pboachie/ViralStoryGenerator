@@ -36,8 +36,7 @@ setup(
         "pytest>=7.3.1",
         "httpx>=0.24.0",
         "boto3>=1.26.114",
-        "azure-storage-blob>=12.16.0",
-        "prometheus_client>=0.16.0"
+        "azure-storage-blob>=12.16.0"
     ],
     python_requires=">=3.7",
     entry_points={
