@@ -50,7 +50,7 @@ def main():
     )
 
     # Start scheduled cleanup in separate thread
-    cleanup_thread = threading.Thread(target=scheduled_cleanup)
+    cleanup_thread = threading.Thread(target=run_scheduled_cleanup)
     cleanup_thread.daemon = True
     cleanup_thread.start()
     _logger.info("Cleanup scheduler thread started")
