@@ -1,414 +1,257 @@
-#!/usr/bin/env python
 # viralStoryGenerator/utils/redis_manager.py
+"""Redis manager for task queuing and state management."""
 
 import json
 import time
-import redis
-from typing import Dict, Any, Optional, List
+import redis # Using redis-py
+from redis.exceptions import ConnectionError, TimeoutError, RedisError
+from typing import Dict, Any, Optional, List, Union
 import uuid
 
 from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.utils.config import config as app_config
 
 class RedisManager:
-    """Redis manager for handling task queuing and state management"""
+    """Manages Redis connection, task queuing, and result storage."""
 
-    def __init__(self, host=None, port=None, db=None, password=None, queue_name=None, result_prefix=None, ttl=None):
-        """Initialize Redis connection"""
-        # Default to values from config if parameters aren't provided
-        self.host = host or app_config.redis.HOST
-        self.port = port or app_config.redis.PORT
-        self.db = db or app_config.redis.DB
-        self.password = password or app_config.redis.PASSWORD
-        self.queue_name = queue_name or app_config.redis.QUEUE_NAME
-        self.result_prefix = result_prefix or app_config.redis.RESULT_PREFIX
-        self.ttl = ttl or app_config.redis.TTL
-
-        if not app_config.redis.ENABLED:
-            _logger.warning("Redis is disabled in config. Task queuing will not work properly.")
+    def __init__(self, host: Optional[str] = None, port: Optional[int] = None, db: Optional[int] = None,
+                 password: Optional[str] = None, queue_name: Optional[str] = None,
+                 result_prefix: Optional[str] = None, ttl: Optional[int] = None):
+        """Initializes Redis connection using config or provided parameters."""
+        self.is_redis_enabled = app_config.redis.ENABLED
+        if not self.is_redis_enabled:
+            _logger.warning("Redis is disabled in config. RedisManager operations will be no-ops.")
             self.client = None
             return
 
-        try:
-            self.client = redis.Redis(
-                host=self.host,
-                port=self.port,
-                db=self.db,
-                password=self.password,
-                decode_responses=True
-            )
-            self.client.ping()  # Test connection
-            _logger.info(f"Connected to Redis at {self.host}:{self.port}")
+        # Use provided args or fall back to config
+        self.host = host or app_config.redis.HOST
+        self.port = port or app_config.redis.PORT
+        self.db = db if db is not None else app_config.redis.DB # Allow db=0
+        self.password = password or app_config.redis.PASSWORD # Handles None password correctly
+        self.queue_name = queue_name or app_config.redis.QUEUE_NAME
+        self.result_prefix = result_prefix or app_config.redis.RESULT_PREFIX
+        self.ttl = ttl if ttl is not None else app_config.redis.TTL # Time-to-live for result keys
 
-        except redis.exceptions.ConnectionError as e:
-            _logger.error(f"Failed to connect to Redis: {str(e)}")
+        self.processing_queue_name = f"{self.queue_name}_processing" # Standard name for processing items
+
+        self.client: Optional[redis.Redis] = None
+        self._connect()
+
+    def _connect(self):
+        """Establishes connection to Redis."""
+        if not self.is_redis_enabled: return
+        try:
+            # TODO: Consider using ConnectionPool for better performance if used heavily/concurrently
+            self.client = redis.Redis(
+                host=self.host, port=self.port, db=self.db, password=self.password,
+                decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=5
+            )
+            self.client.ping() # Verify connection
+            _logger.info(f"Connected to Redis at {self.host}:{self.port}/{self.db}")
+        except (ConnectionError, TimeoutError) as e:
+            _logger.error(f"Failed to connect to Redis: {e}")
             self.client = None
+        except Exception as e:
+             _logger.exception(f"Unexpected error connecting to Redis: {e}")
+             self.client = None
 
     def is_available(self) -> bool:
-        """Check if Redis is available"""
-        if not self.client:
-            return False
+        """Checks if Redis connection is active."""
+        if not self.client: return False
         try:
-            self.client.ping()
-            return True
-        except:
+            return self.client.ping()
+        except (ConnectionError, TimeoutError):
+            _logger.warning("Redis connection check failed (ping).")
             return False
-
-    def enqueue_task(self, task_data: Dict[str, Any]) -> bool:
-        """
-        Enqueue a task for processing
-
-        Args:
-            task_data: Dictionary with task data
-
-        Returns:
-            bool: Success status
-        """
-        if not self.client:
-            return False
-
-        try:
-            task_id = task_data.get("task_id")
-            if not task_id:
-                task_id = str(uuid.uuid4())
-                task_data["task_id"] = task_id
-
-            # Store initial task status
-            self.update_task_status(task_id, "pending")
-
-            # Add to processing queue
-            self.client.lpush(self.queue_name, json.dumps(task_data))
-            _logger.debug(f"Task {task_id} added to queue")
-            return True
         except Exception as e:
-            _logger.error(f"Failed to enqueue task: {str(e)}")
-            return False
+             _logger.exception(f"Unexpected error during Redis ping: {e}")
+             return False
 
-    def dequeue_task(self) -> Optional[Dict[str, Any]]:
-        """
-        Dequeue a task for processing
-
-        Returns:
-            Dict or None: Task data if available
-        """
-        if not self.client:
+    def _execute_command(self, command, *args, **kwargs) -> Any:
+        """Helper to execute Redis commands with error handling."""
+        if not self.is_available():
+            _logger.error("Cannot execute Redis command: Redis is unavailable.")
             return None
 
         try:
-            # Pop task with blocking wait for specified timeout
-            result = self.client.brpop(self.queue_name, timeout=1)
-            if not result:
-                return None
-
-            _, task_data_str = result
-            task_data = json.loads(task_data_str)
-            return task_data
-        except Exception as e:
-            _logger.error(f"Failed to dequeue task: {str(e)}")
+            return command(*args, **kwargs)
+        except (ConnectionError, TimeoutError) as e:
+            _logger.error(f"Redis command failed (connection/timeout): {e}")
+            self.client = None
             return None
-
-    def update_task_status(self, task_id: str, status: str) -> bool:
-        """
-        Update the status of a task
-
-        Args:
-            task_id: Task identifier
-            status: New status value
-
-        Returns:
-            bool: Success status
-        """
-        if not self.client:
-            return False
-
-        try:
-            status_key = f"{self.result_prefix}{task_id}"
-            # Get existing data if any
-            existing_data = self.client.get(status_key)
-            if existing_data:
-                data = json.loads(existing_data)
-                data["status"] = status
-                data["updated_at"] = time.time()
-            else:
-                data = {
-                    "task_id": task_id,
-                    "status": status,
-                    "created_at": time.time(),
-                    "updated_at": time.time()
-                }
-
-            # Save back to Redis
-            self.client.setex(status_key, self.ttl, json.dumps(data))
-            return True
-        except Exception as e:
-            _logger.error(f"Failed to update task status: {str(e)}")
-            return False
-
-    def update_task_result(self, task_id: str, result_data: Dict[str, Any]) -> bool:
-        """
-        Update task with result data
-
-        Args:
-            task_id: Task identifier
-            result_data: Result data to store
-
-        Returns:
-            bool: Success status
-        """
-        if not self.client:
-            return False
-
-        try:
-            status_key = f"{self.result_prefix}{task_id}"
-            # Ensure status is completed
-            result_data["status"] = "completed"
-            result_data["updated_at"] = time.time()
-
-            # Save to Redis
-            self.client.setex(status_key, self.ttl, json.dumps(result_data))
-            return True
-        except Exception as e:
-            _logger.error(f"Failed to update task result: {str(e)}")
-            return False
-
-    def update_task_error(self, task_id: str, error_message: str) -> bool:
-        """
-        Update task with error information
-
-        Args:
-            task_id: Task identifier
-            error_message: Error message
-
-        Returns:
-            bool: Success status
-        """
-        if not self.client:
-            return False
-
-        try:
-            status_key = f"{self.result_prefix}{task_id}"
-            # Get existing data if any
-            existing_data = self.client.get(status_key)
-            if existing_data:
-                data = json.loads(existing_data)
-                data["status"] = "failed"
-                data["error"] = error_message
-                data["updated_at"] = time.time()
-            else:
-                data = {
-                    "task_id": task_id,
-                    "status": "failed",
-                    "error": error_message,
-                    "created_at": time.time(),
-                    "updated_at": time.time()
-                }
-
-            # Save back to Redis
-            self.client.setex(status_key, self.ttl, json.dumps(data))
-            return True
-        except Exception as e:
-            _logger.error(f"Failed to update task error: {str(e)}")
-            return False
-
-    def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get the current status of a task
-
-        Args:
-            task_id: Task identifier
-
-        Returns:
-            Dict or None: Task status information
-        """
-        if not self.client:
-            return None
-
-        try:
-            status_key = f"{self.result_prefix}{task_id}"
-            result = self.client.get(status_key)
-            if result:
-                return json.loads(result)
+        except RedisError as e:
+            _logger.error(f"Redis command failed (RedisError): {e}")
             return None
         except Exception as e:
-            _logger.error(f"Failed to get task status: {str(e)}")
-            return None
-
-    def get_queue_length(self) -> int:
-        """
-        Get the current length of the task queue
-
-        Returns:
-            int: Number of tasks in queue
-        """
-        if not self.client:
-            return 0
-
-        try:
-            return self.client.llen(self.queue_name)
-        except Exception as e:
-            _logger.error(f"Failed to get queue length: {str(e)}")
-            return 0
-
-    def get_result(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve the result of a completed task.
-
-        Args:
-            task_id: Task identifier
-
-        Returns:
-            Dict or None: Task result information if available
-        """
-        if not self.client:
-            return None
-
-        try:
-            status_key = f"{self.result_prefix}{task_id}"
-            result = self.client.get(status_key)
-            if result:
-                return json.loads(result)
-            return None
-        except Exception as e:
-            _logger.error(f"Failed to get task result: {str(e)}")
-            return None
-
-    def check_key_exists(self, job_id: str) -> bool:
-        """
-        Check if any key exists for the given job ID.
-        Used to determine if a job exists but hasn't completed yet.
-
-        Args:
-            job_id: Job ID to check for existence
-
-        Returns:
-            bool: True if any key with this job ID exists, False otherwise
-        """
-        if not self.client:
-            return False
-
-        try:
-            # Create the specific result key pattern to check
-            key = f"{self.result_prefix}{job_id}"
-            return bool(self.client.exists(key))
-        except Exception as e:
-            _logger.error(f"Error checking key existence: {str(e)}")
-            return False
+             _logger.exception(f"Unexpected error executing Redis command: {e}")
+             return None
 
     def add_request(self, request_data: Dict[str, Any]) -> bool:
-        """
-        Add a request to the queue
-
-        Args:
-            request_data: Dictionary with request data
-
-        Returns:
-            bool: Success status
-        """
-        if not self.client:
-            return False
+        """Adds a job request to the main queue."""
+        if not self.client: return False
+        job_id = request_data.get("id")
+        if not job_id:
+            _logger.warning("Request data missing 'id'. Assigning a UUID.")
+            job_id = str(uuid.uuid4())
+            request_data["id"] = job_id
 
         try:
-            # Get job ID
-            job_id = request_data.get("id")
-            if not job_id:
-                job_id = str(uuid.uuid4())
-                request_data["id"] = job_id
-
-            # Add to queue
-            self.client.lpush(self.queue_name, json.dumps(request_data))
-
-            # Initialize status
-            status_key = f"{self.result_prefix}{job_id}"
-            self.client.setex(
-                status_key,
-                self.ttl,
-                json.dumps({
-                    "status": "pending",
-                    "message": "Job queued, waiting to start processing",
-                    "created_at": time.time()
-                })
-            )
-
-            return True
-        except Exception as e:
-            _logger.error(f"Failed to add request: {str(e)}")
+            # Serialize data to JSON string
+            request_json = json.dumps(request_data)
+        except TypeError as e:
+            _logger.error(f"Failed to serialize request data to JSON: {e}. Data: {request_data}")
             return False
 
-    def store_result(self, job_id: str, result_data: Dict[str, Any]) -> bool:
-        """
-        Store result data for a job
+        # TODO: Use pipeline for atomic operations if needed, though LPUSH is atomic itself
+        success = self._execute_command(self.client.lpush, self.queue_name, request_json)
 
-        Args:
-            job_id: Job ID
-            result_data: Result data to store
+        if success is not None: # LPUSH returns queue length on success
+             _logger.debug(f"Job {job_id} added to queue '{self.queue_name}'.")
+             self.store_result(job_id, {"status": "queued", "created_at": time.time()})
+             return True
+        else:
+             _logger.error(f"Failed to add job {job_id} to queue '{self.queue_name}'.")
+             return False
 
-        Returns:
-            bool: Success status
-        """
-        if not self.client:
-            return False
+    def get_next_request(self) -> Optional[Dict[str, Any]]:
+        """Atomically gets the next request from main queue and moves it to processing queue."""
+        if not self.client: return None
+
+        # BRPOPLPUSH blocks until item available or timeout (timeout=1 second)
+        item_json = self._execute_command(
+            self.client.brpoplpush, self.queue_name, self.processing_queue_name, timeout=1
+        )
+
+        if not item_json:
+            return None
 
         try:
-            # Create result key
-            status_key = f"{self.result_prefix}{job_id}"
+            request = json.loads(item_json)
+            request['_processing_start_time'] = time.time()
+            request['_original_data'] = item_json
+            _logger.debug(f"Moved job {request.get('id')} to processing queue '{self.processing_queue_name}'.")
+            return request
+        except json.JSONDecodeError as e:
+            _logger.error(f"Failed to decode JSON from queue item: {e}. Item: {item_json[:100]}...")
+            removed = self._execute_command(self.client.lrem, self.processing_queue_name, 0, item_json)
+            _logger.warning(f"Removed invalid JSON item from processing queue (removed: {removed}).")
+            return None
 
-            # Add timestamp
-            if "created_at" not in result_data:
-                result_data["created_at"] = time.time()
-            result_data["updated_at"] = time.time()
 
-            # Store in Redis
-            self.client.setex(
-                status_key,
-                self.ttl,
-                json.dumps(result_data)
-            )
+    def complete_request(self, request: Dict[str, Any], success: bool):
+        """Removes a completed/failed request from the processing queue."""
+        if not self.client or not isinstance(request, dict): return False
 
-            return True
-        except Exception as e:
-            _logger.error(f"Failed to store result: {str(e)}")
+        original_data = request.get('_original_data')
+        job_id = request.get('id', 'unknown')
+        if not original_data:
+            _logger.error(f"Cannot complete job {job_id}: missing '_original_data' for removal.")
             return False
+
+        # Remove the specific item from the processing queue
+        removed_count = self._execute_command(self.client.lrem, self.processing_queue_name, 0, original_data)
+
+        if removed_count is not None and removed_count > 0:
+             _logger.debug(f"Completed job {job_id} (success={success}). Removed from processing queue.")
+             return True
+        elif removed_count == 0:
+             _logger.warning(f"Job {job_id} (success={success}) not found in processing queue for completion (already removed?).")
+             return False # Indicate item wasn't found/removed
+        else:
+             _logger.error(f"Failed to remove job {job_id} (success={success}) from processing queue.")
+             return False
+
+
+    def store_result(self, job_id: str, result_data: Dict[str, Any], merge: bool = False, ttl: Optional[int] = None) -> bool:
+        """Stores job result/status data in Redis with TTL."""
+        if not self.client: return False
+
+        result_key = f"{self.result_prefix}{job_id}"
+        effective_ttl = ttl if ttl is not None else self.ttl
+
+        current_data = {}
+        if merge:
+             existing_json = self._execute_command(self.client.get, result_key)
+             if existing_json:
+                  try: current_data = json.loads(existing_json)
+                  except json.JSONDecodeError: _logger.warning(f"Could not decode existing data for merge on key {result_key}")
+
+        # Update data, ensuring timestamps are present
+        current_data.update(result_data)
+        current_data.setdefault("created_at", time.time())
+        current_data["updated_at"] = time.time()
+
+        try:
+            # Serialize final data, handling potential non-serializable types
+            result_json = json.dumps(current_data, default=str)
+        except TypeError as e:
+            _logger.error(f"Failed to serialize result data for job {job_id} to JSON: {e}")
+            return False
+
+        # Set with expiration
+        success = self._execute_command(self.client.setex, result_key, effective_ttl, result_json)
+
+        if success:
+             _logger.debug(f"Stored result/status for job {job_id} with TTL {effective_ttl}s.")
+             return True
+        else:
+             _logger.error(f"Failed to store result/status for job {job_id}.")
+             return False
+
+    def update_task_status(self, task_id: str, status: str):
+        """Updates only the status field for a task."""
+        return self.store_result(task_id, {"status": status}, merge=True)
+
+    def update_task_error(self, task_id: str, error_message: str):
+        """Updates task status to 'failed' and adds error message."""
+        return self.store_result(task_id, {"status": "failed", "error": error_message}, merge=True)
+
+    def get_result(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves the result/status data for a job."""
+        if not self.client: return None
+        result_key = f"{self.result_prefix}{job_id}"
+        result_json = self._execute_command(self.client.get, result_key)
+        if result_json:
+            try:
+                return json.loads(result_json)
+            except json.JSONDecodeError as e:
+                 _logger.error(f"Failed to decode result JSON for job {job_id}: {e}")
+                 return {"status": "error", "error": "Failed to decode stored result data."}
+        return None
+
+    get_task_status = get_result
+
+    def check_key_exists(self, job_id: str) -> bool:
+         """Checks if the result key exists for a job."""
+         if not self.client: return False
+         result_key = f"{self.result_prefix}{job_id}"
+         exists = self._execute_command(self.client.exists, result_key)
+         return bool(exists)
+
+    def get_queue_length(self, queue_name: Optional[str] = None) -> int:
+        """Gets the length of the specified queue (defaults to main queue)."""
+        if not self.client: return 0
+        q_name = queue_name or self.queue_name
+        length = self._execute_command(self.client.llen, q_name)
+        return length if isinstance(length, int) else 0
+
+    def get_processing_queue_length(self) -> int:
+         """Gets the length of the processing queue."""
+         return self.get_queue_length(self.processing_queue_name)
+
 
     def wait_for_result(self, job_id: str, timeout: int = 300, check_interval: float = 0.5) -> Optional[Dict[str, Any]]:
-        """
-        Wait for a job result with timeout.
+        """Waits for a job result with polling (use with caution, consider websockets/SSE)."""
+        if not self.client: return None
+        start_time = time.time()
+        while (time.time() - start_time) < timeout:
+            result = self.get_result(job_id)
+            if result and result.get("status") in ["completed", "failed"]:
+                return result
+            time.sleep(check_interval)
 
-        Args:
-            job_id: The job ID to wait for
-            timeout: Maximum time to wait in seconds (default 300 seconds/5 minutes)
-            check_interval: How often to check for results in seconds (default 0.5 seconds)
-
-        Returns:
-            Dict or None: Result data if job completed successfully within timeout, None otherwise
-        """
-        if not self.client:
-            return None
-
-        try:
-            start_time = time.time()
-            status_key = f"{self.result_prefix}{job_id}"
-
-            while (time.time() - start_time) < timeout:
-                # Check if result exists
-                result_data = self.client.get(status_key)
-                if result_data:
-                    result = json.loads(result_data)
-                    status = result.get("status")
-
-                    # If job completed or failed, return the result
-                    if status in ["completed", "failed"]:
-                        return result
-
-                # Wait before checking again
-                time.sleep(check_interval)
-
-            # Timeout reached
-            _logger.warning(f"Timeout reached while waiting for job {job_id}")
-            return {
-                "status": "failed",
-                "error": f"Timeout reached waiting for job result after {timeout} seconds",
-                "job_id": job_id
-            }
-        except Exception as e:
-            _logger.error(f"Error waiting for job result: {str(e)}")
-            return None
+        _logger.warning(f"Timeout ({timeout}s) reached waiting for job {job_id}")
+        return {"status": "timeout", "error": f"Timeout waiting for result after {timeout}s."}

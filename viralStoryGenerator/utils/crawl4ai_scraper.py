@@ -1,251 +1,280 @@
-#/viralStoryGenerator/utils/crawl4ai_scraper.py
+# viralStoryGenerator/utils/crawl4ai_scraper.py
+"""Web scraping utilities using Crawl4AI with optional Redis queuing."""
 import asyncio
 import os
 from typing import List, Union, Optional, Tuple, Dict, Any
 import time
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+import json
+import uuid
+
+# Use Crawl4AI library
+try:
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+    _CRAWL4AI_AVAILABLE = True
+except ImportError:
+    _logger.error("Crawl4AI library not found. pip install crawl4ai")
+    _CRAWL4AI_AVAILABLE = False
+    class AsyncWebCrawler: pass
+    class BrowserConfig: pass
+    class CrawlerRunConfig: pass
+
+
+# TODO: Use shared RedisManager instance or create one specifically? Shared seems okay.
 from .redis_manager import RedisManager as RedisQueueManager
+from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.src.logger import logger as _logger
 
-# Initialize Redis queue manager with environment variables if available
-def get_redis_manager() -> RedisQueueManager:
-    """
-    Get or create a Redis queue manager instance using environment variables.
-
-    Returns:
-        RedisQueueManager: An instance of the Redis queue manager
-    """
-    _logger.debug("Initializing Redis queue manager...")
-    host = os.environ.get('REDIS_HOST', 'localhost')
-    port = int(os.environ.get('REDIS_PORT', 6379))
-    db = int(os.environ.get('REDIS_DB', 0))
-    password = os.environ.get('REDIS_PASSWORD', None)
-
+# Initialize Redis queue manager only if Redis is enabled
+redis_manager: Optional[RedisQueueManager] = None
+if app_config.redis.ENABLED:
     try:
-        return RedisQueueManager(host=host, port=port, db=db, password=password)
+        scrape_queue_name = app_config.redis.QUEUE_NAME + "_scrape"
+        scrape_result_prefix = app_config.redis.RESULT_PREFIX + "scrape:"
+        scrape_ttl = app_config.redis.TTL
+
+        redis_manager = RedisQueueManager(
+            queue_name=scrape_queue_name,
+            result_prefix=scrape_result_prefix,
+            ttl=scrape_ttl
+        )
+        if not redis_manager.is_available():
+             _logger.warning("Scraper RedisManager initialized but Redis is unavailable.")
+             redis_manager = None
     except Exception as e:
-        _logger.error(f"Failed to initialize Redis queue manager: {str(e)}")
-        _logger.warning("Continuing without Redis queue management")
-        return None
-    finally:
-        _logger.debug("Redis queue manager initialized.")
+         _logger.exception(f"Failed to initialize RedisManager for scraper: {e}")
+         redis_manager = None
 
-# Queue-based version that uses Redis if available
-async def queue_scrape_request(
-    urls: Union[str, List[str]],
-    browser_config: Optional[Dict[str, Any]] = None,
-    run_config: Optional[Dict[str, Any]] = None,
-    wait_for_result: bool = True,
-    timeout: int = 300
-) -> Union[str, None]:
-    """
-    Queue a scraping request using the Redis queue manager.
 
-    Args:
-        urls: A single URL or a list of URLs to scrape
-        browser_config: Configuration for the browser
-        run_config: Configuration for the crawler run
-        wait_for_result: Whether to wait for the result or return immediately
-        timeout: Maximum time to wait for a result in seconds
-
-    Returns:
-        request_id: The ID of the queued request, or None if queuing failed
-    """
-    manager = get_redis_manager()
-    if not manager:
-        _logger.warning("Redis queue manager not available, falling back to direct scraping")
-        return None
-
-    # Prepare request data
-    request_data = {
-        'urls': urls if isinstance(urls, list) else [urls],
-        'browser_config': browser_config,
-        'run_config': run_config
-    }
-
-    try:
-        # Add request to queue
-        request_id = manager.add_request(request_data)
-
-        # Wait for result if specified
-        if wait_for_result:
-            result = manager.wait_for_result(request_id, timeout=timeout)
-            if result:
-                return result
-            else:
-                _logger.warning(f"Timed out waiting for result of request {request_id}")
-                return request_id
-
-        return request_id
-    except Exception as e:
-        _logger.error(f"Failed to queue scraping request: {str(e)}")
-        return None
-
-async def get_scrape_result(request_id: str) -> Union[List[Tuple[str, Optional[str]]], None]:
-    """
-    Get the result of a previously queued scraping request.
-
-    Args:
-        request_id: The ID of the queued request
-
-    Returns:
-        result: A list of (url, markdown) tuples, or None if not available
-    """
-    manager = get_redis_manager()
-    if not manager:
-        _logger.error("Redis queue manager not available, cannot retrieve result")
-        return None
-
-    try:
-        result = manager.get_result(request_id)
-        if result and 'data' in result:
-            return result['data']
-        return None
-    except Exception as e:
-        _logger.error(f"Failed to get scrape result: {str(e)}")
-        return None
-
+# --- Main Scraping Function ---
 async def scrape_urls(
     urls: Union[str, List[str]],
     browser_config: Optional[BrowserConfig] = None,
     run_config: Optional[CrawlerRunConfig] = None
 ) -> List[Tuple[str, Optional[str]]]:
     """
-    Scrape the given URLs using Crawl4AI and return the content as Markdown.
-    If Redis queue manager is available, the request will be queued.
-
-    Args:
-        urls (Union[str, List[str]]): A single URL or a list of URLs to scrape.
-        browser_config (Optional[BrowserConfig]): Configuration for the browser, e.g., headless mode.
-        run_config (Optional[CrawlerRunConfig]): Configuration for the crawl run, e.g., extraction strategies.
-
-    Returns:
-        List[Tuple[str, Optional[str]]]: A list of tuples, each containing the URL and its corresponding
-        Markdown content. If a URL fails to crawl, its Markdown will be None.
-
-    Notes:
-        - This function is asynchronous and must be run within an asyncio event loop, e.g., using `asyncio.run()`.
-        - Errors during crawling are logged using the `logging` module and do not halt the process.
-        - If Redis queue manager is available, the request will be queued to prevent system overload.
-        - The function will attempt to use the queue first, then fall back to direct scraping if needed.
-
+    Scrapes URLs using Crawl4AI, returning Markdown content.
+    Does NOT use Redis queue; called directly by worker or API if Redis disabled.
     """
-    _logger.debug(f"Scraping URLs: {urls}")
-    # Try to use the Redis queue first
-    queued_request_id = await queue_scrape_request(urls, browser_config, run_config)
-    if queued_request_id:
-        result = await get_scrape_result(queued_request_id)
-        if result:
-            return result
-        _logger.info("Falling back to direct scraping after queue attempt")
+    if not _CRAWL4AI_AVAILABLE:
+        _logger.error("Cannot scrape URLs: Crawl4AI library is not available.")
+        url_list = [urls] if isinstance(urls, str) else urls
+        return [(url, None) for url in url_list]
 
-    # Convert single URL string to a list for uniform processing
-    if isinstance(urls, str):
-        urls = [urls]
+    url_list = [urls] if isinstance(urls, str) else urls
+    if not url_list: return []
 
-    # Initialize the AsyncWebCrawler with optional browser configuration
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        # Create a list of crawl tasks for each URL with optional run configuration
-        tasks = [crawler.arun(url, config=run_config) for url in urls]
-        # Execute all tasks concurrently, capturing exceptions without stopping
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+    _logger.info(f"Starting direct Crawl4AI scraping for {len(url_list)} URL(s)...")
+    # Add default browser config if none provided (e.g., headless)
+    effective_browser_config = browser_config or BrowserConfig(headless=True)
+    results_data: List[Tuple[str, Optional[str]]] = []
 
-    # Process results into a list of (url, markdown) tuples
-    output = []
-    for url, result in zip(urls, results):
-        if isinstance(result, Exception):
-            # Log errors and append None for failed crawls
-            _logger.error(f"Error crawling {url}: {result}")
-            output.append((url, None))
+    try:
+        # Initialize crawler within async context manager
+        async with AsyncWebCrawler(config=effective_browser_config) as crawler:
+            tasks = [crawler.arun(url, config=run_config) for url in url_list]
+            crawl_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        for url, result in zip(url_list, crawl_results):
+            if isinstance(result, Exception):
+                error_msg = str(result)
+                if "Executable doesn't exist" in error_msg and "playwright" in error_msg.lower():
+                     _logger.error(f"Playwright browser not installed for {url}. Run 'playwright install'. Error: {result}")
+                else:
+                     _logger.error(f"Error crawling {url}: {result}")
+                results_data.append((url, None))
+            elif hasattr(result, 'markdown'):
+                results_data.append((url, result.markdown))
+            else:
+                 _logger.warning(f"Unexpected result type from crawl4ai for {url}: {type(result)}")
+                 results_data.append((url, None))
+
+    except ImportError:
+         # Should be caught by _CRAWL4AI_AVAILABLE, but as safeguard
+         _logger.critical("Crawl4AI library import failed unexpectedly during execution.")
+         return [(url, None) for url in url_list]
+    except Exception as e:
+        error_msg = str(e)
+        if "Executable doesn't exist" in error_msg and "playwright" in error_msg.lower():
+             _logger.critical("Playwright browser executable not found. Please install browsers by running: playwright install")
+             return [(url, None) for url in url_list]
         else:
-            # Append successful crawl results as Markdown
-            output.append((url, result.markdown))
+            _logger.exception(f"Unexpected error during Crawl4AI execution: {e}")
+            return [(url, None) for url in url_list]
 
-    _logger.debug(f"Scraping completed for URLs: {urls}")
-    return output
 
-# Worker function to process queued requests in a background process
-async def process_queue_worker(
-    batch_size: int = 5,
-    sleep_interval: int = 1,
-    max_concurrent: int = 3
+    _logger.info(f"Direct Crawl4AI scraping finished for {len(url_list)} URL(s).")
+    return results_data
+
+async def queue_scrape_request(
+    urls: Union[str, List[str]],
+    browser_config_dict: Optional[Dict[str, Any]] = None,
+    run_config_dict: Optional[Dict[str, Any]] = None,
+    wait_for_result: bool = False,
+    timeout: int = 300
+) -> Optional[str]:
+    """Queues a scraping request via Redis if manager is available."""
+    if not redis_manager:
+        _logger.warning("Redis manager for scraper not available, cannot queue scrape request.")
+        return None
+
+    job_id = str(uuid.uuid4())
+    request_payload = {
+        'id': job_id,
+        'data': {
+            'urls': [urls] if isinstance(urls, str) else urls,
+            'browser_config': browser_config_dict,
+            'run_config': run_config_dict
+        },
+        'request_time': time.time()
+    }
+
+    success = redis_manager.add_request(request_payload)
+    if not success:
+        _logger.error("Failed to add scrape request to Redis queue.")
+        return None
+
+    _logger.info(f"Scrape request {job_id} queued successfully.")
+
+    if wait_for_result:
+         _logger.warning(f"Waiting for scrape result {job_id} (timeout: {timeout}s) - Blocking operation.")
+         result = redis_manager.wait_for_result(job_id, timeout=timeout)
+         if result and result.get("status") == "completed":
+             _logger.info(f"Received result for scrape request {job_id}.")
+             return job_id
+         else:
+             _logger.warning(f"Timed out or error waiting for scrape result {job_id}. Status: {result.get('status') if result else 'N/A'}")
+             return None
+
+    return job_id
+
+
+async def get_scrape_result(request_id: str) -> Optional[List[Tuple[str, Optional[str]]]]:
+    """Gets the result of a previously queued scraping request."""
+    if not redis_manager:
+        _logger.error("Redis manager for scraper not available, cannot get scrape result.")
+        return None
+
+    result_data = redis_manager.get_result(request_id)
+    if not result_data:
+        if redis_manager.check_key_exists(request_id):
+            _logger.debug(f"Scrape job {request_id} is pending/processing.")
+        else:
+            _logger.warning(f"Scrape job {request_id} not found.")
+        return None
+
+    status = result_data.get("status")
+    if status == "completed":
+        scrape_output = result_data.get("data")
+        if isinstance(scrape_output, list):
+             return scrape_output
+        else:
+             _logger.error(f"Unexpected data format in completed scrape job {request_id}: {type(scrape_output)}")
+             return None
+    elif status == "failed":
+         _logger.error(f"Scrape job {request_id} failed: {result_data.get('error')}")
+         return None
+    else:
+         _logger.debug(f"Scrape job {request_id} status: {status}. Result not ready.")
+         return None
+
+
+# --- Dedicated Scrape Worker (If using separate worker) ---
+async def process_scrape_queue_worker(
+    batch_size: int = 5, sleep_interval: int = 1, max_concurrent: int = 3
 ) -> None:
-    """
-    A worker function to process queued scraping requests.
-
-    Args:
-        batch_size: Maximum number of requests to process in one batch
-        sleep_interval: Time to sleep between polling the queue in seconds
-        max_concurrent: Maximum number of concurrent scraping tasks
-
-    Notes:
-        This function is meant to be run in a background process or task.
-        It will continuously poll the queue and process requests.
-    """
-    manager = get_redis_manager()
-    if not manager:
-        _logger.error("Redis queue manager not available, cannot start worker")
+    """Worker function to process queued scraping requests (if Redis queuing is used)."""
+    if not redis_manager:
+        _logger.error("Scraper Redis manager not available. Scrape worker cannot start.")
         return
+    if not _CRAWL4AI_AVAILABLE:
+         _logger.error("Crawl4AI library not available. Scrape worker cannot start.")
+         return
 
-    _logger.info(f"Starting queue worker process with batch_size={batch_size}, max_concurrent={max_concurrent}")
+    _logger.info(f"Starting dedicated Scrape Queue Worker (Queue: '{redis_manager.queue_name}')...")
 
+    active_tasks = set()
     while True:
         try:
-            # Check queue length
-            queue_length = manager.get_queue_length()
-            if queue_length == 0:
-                # If queue is empty, sleep and check again
-                await asyncio.sleep(sleep_interval)
+            if not redis_manager.is_available():
+                 _logger.error("Scraper worker lost Redis connection. Sleeping...")
+                 await asyncio.sleep(10)
+                 continue
+
+            num_to_fetch = min(batch_size, max_concurrent - len(active_tasks))
+            if num_to_fetch <= 0:
+                if active_tasks:
+                     done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                     active_tasks = pending
+                else: await asyncio.sleep(0.1)
                 continue
 
-            # Process up to batch_size requests
             batch = []
-            for _ in range(min(batch_size, queue_length)):
-                request = manager.get_next_request()
+            for _ in range(num_to_fetch):
+                request = redis_manager.get_next_request()
                 if request:
-                    batch.append(request)
+                     if isinstance(request, dict) and 'id' in request and 'data' in request:
+                         batch.append(request)
+                     else:
+                         _logger.error(f"Invalid item received from scrape queue: {str(request)[:100]}...")
+                         if hasattr(redis_manager, 'complete_request') and isinstance(request, dict) and '_original_data' in request:
+                             redis_manager.complete_request(request, success=False)
+                else: break # Queue empty
 
             if not batch:
                 await asyncio.sleep(sleep_interval)
                 continue
 
-            _logger.info(f"Processing batch of {len(batch)} requests")
+            _logger.info(f"Scrape worker processing batch of {len(batch)} requests.")
 
-            # Process requests in batches with max_concurrent limit
-            for i in range(0, len(batch), max_concurrent):
-                sub_batch = batch[i:i + max_concurrent]
-                tasks = []
-
-                for request in sub_batch:
-                    request_id = request['id']
-                    request_data = request['data']
-
-                    # Create task to scrape URLs and store result
-                    async def process_request(req_id, req_data):
-                        try:
-                            urls = req_data.get('urls', [])
-                            browser_config = req_data.get('browser_config')
-                            run_config = req_data.get('run_config')
-
-                            # Perform the actual scraping
-                            result = await scrape_urls(urls, browser_config, run_config)
-
-                            # Store result in Redis
-                            manager.store_result(req_id, result)
-                            _logger.info(f"Successfully processed request {req_id}")
-                        except Exception as e:
-                            _logger.error(f"Error processing request {req_id}: {str(e)}")
-                            # Store error as result
-                            manager.store_result(req_id, {'error': str(e)})
-
-                    tasks.append(process_request(request_id, request_data))
-
-                # Wait for all tasks in sub-batch to complete
-                await asyncio.gather(*tasks)
-
-            # Sleep briefly to avoid spinning too fast
-            await asyncio.sleep(0.1)
+            for request in batch:
+                task = asyncio.create_task(_process_single_scrape_job(request, redis_manager))
+                active_tasks.add(task)
+                task.add_done_callback(active_tasks.discard)
 
         except Exception as e:
-            _logger.error(f"Error in queue worker: {str(e)}")
-            await asyncio.sleep(sleep_interval)
+             _logger.exception(f"Error in scrape worker main loop: {e}")
+             await asyncio.sleep(sleep_interval * 2)
+
+async def _process_single_scrape_job(request: Dict[str, Any], manager: RedisQueueManager):
+    """Helper coroutine to process one scrape job."""
+    job_id = request['id']
+    job_data = request.get('data', {})
+    urls = job_data.get('urls')
+    browser_config_dict = job_data.get('browser_config')
+    run_config_dict = job_data.get('run_config')
+    start_time = request.get('request_time', time.time())
+
+    result_payload = {}
+    try:
+        if not urls: raise ValueError("No URLs found in scrape job data.")
+
+        # Convert dicts back to Pydantic models if needed by scrape_urls
+        browser_config = BrowserConfig(**browser_config_dict) if browser_config_dict else None
+        run_config = CrawlerRunConfig(**run_config_dict) if run_config_dict else None
+
+        # Perform the actual scraping
+        manager.store_result(job_id, {"status": "processing", "message": f"Scraping {len(urls)} URLs...", "updated_at": time.time()}, merge=True)
+        scrape_result = await scrape_urls(urls, browser_config, run_config)
+
+        # Store result
+        result_payload = {
+            "status": "completed",
+            "data": scrape_result,
+            "created_at": start_time,
+            "updated_at": time.time()
+        }
+        manager.store_result(job_id, result_payload)
+        _logger.info(f"Scrape job {job_id} completed successfully.")
+        manager.complete_request(request, success=True)
+
+    except Exception as e:
+        _logger.exception(f"Error processing scrape job {job_id}: {e}")
+        result_payload = {
+            "status": "failed",
+            "error": str(e),
+            "created_at": start_time,
+            "updated_at": time.time()
+        }
+        manager.store_result(job_id, result_payload)
+        manager.complete_request(request, success=False)

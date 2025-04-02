@@ -1,692 +1,724 @@
-#!/usr/bin/env python
 # viralStoryGenerator/utils/storage_manager.py
 
+import datetime
 import os
 import shutil
 import uuid
 import time
 import tempfile
-from pathlib import Path
-from typing import Optional, Dict, Any, Union, BinaryIO, List
 import mimetypes
-from urllib.parse import urljoin
+import hmac
+from pathlib import Path
+from typing import Optional, Dict, Any, Union, BinaryIO, List, Tuple
+from urllib.parse import urljoin, urlparse
 
+# Import config first
+from viralStoryGenerator.utils.config import config as appconfig
 from viralStoryGenerator.src.logger import logger as _logger
-from viralStoryGenerator.utils.config import config
+from viralStoryGenerator.utils.security import is_safe_filename, is_file_in_directory
+
+# Cloud SDKs are optional dependencies
+try:
+    import boto3
+    from botocore.exceptions import NoCredentialsError, ClientError, BotoCoreError
+    _BOTO3_AVAILABLE = True
+except ImportError:
+    _BOTO3_AVAILABLE = False
+    boto3 = None
+    ClientError = Exception
+    NoCredentialsError = Exception
+    BotoCoreError = Exception
+
+try:
+    from azure.storage.blob import BlobServiceClient, ContentSettings
+    from azure.core.exceptions import ResourceNotFoundError, AzureError
+    _AZURE_SDK_AVAILABLE = True
+except ImportError:
+    _AZURE_SDK_AVAILABLE = False
+    BlobServiceClient = None
+    ContentSettings = None
+    ResourceNotFoundError = Exception
+    AzureError = Exception
+
 
 class StorageManager:
-    """Storage manager for handling file storage across different providers"""
+    """Handles file storage across local, S3, and Azure providers."""
 
     def __init__(self):
-        """Initialize the storage manager based on configured provider"""
-        self.provider = config.storage.PROVIDER.lower()
-        self.base_url = config.http.BASE_URL
+        """Initialize the storage manager based on configured provider."""
+        self.provider = appconfig.storage.PROVIDER.lower()
+        self.base_url = appconfig.http.BASE_URL
+        self.s3_client = None
+        self.azure_blob_service_client = None
+
+        _logger.info(f"Initializing StorageManager with provider: {self.provider}")
 
         # Initialize the appropriate storage provider
         if self.provider == "local":
             self._init_local_storage()
         elif self.provider == "s3":
+            if not _BOTO3_AVAILABLE:
+                 _logger.error("S3 storage configured, but 'boto3' library is not installed. pip install boto3")
+                 raise ImportError("boto3 library is required for S3 storage.")
             self._init_s3_storage()
         elif self.provider == "azure":
+            if not _AZURE_SDK_AVAILABLE:
+                 _logger.error("Azure storage configured, but 'azure-storage-blob' library is not installed. pip install azure-storage-blob")
+                 raise ImportError("azure-storage-blob library is required for Azure storage.")
             self._init_azure_storage()
         else:
-            _logger.warning(f"Unsupported storage provider: {self.provider}. Falling back to local storage.")
+            _logger.warning(f"Unsupported storage provider: {self.provider}. Falling back to 'local'.")
             self.provider = "local"
             self._init_local_storage()
+
+    def _get_storage_dir(self, file_type: str) -> str:
+        """Gets the absolute local storage directory for a file type."""
+        path_map = {
+            "audio": appconfig.storage.AUDIO_STORAGE_PATH,
+            "story": appconfig.storage.STORY_STORAGE_PATH,
+            "storyboard": appconfig.storage.STORYBOARD_STORAGE_PATH,
+        }
+        storage_dir = path_map.get(file_type)
+        if not storage_dir:
+            _logger.warning(f"Unknown file_type '{file_type}', using default local storage path.")
+            storage_dir = appconfig.storage.LOCAL_STORAGE_PATH
+
+        # Ensure the directory exists (already done in _init_local_storage, but safe to repeat)
+        # try:
+        #     os.makedirs(storage_dir, exist_ok=True)
+        # except OSError as e:
+        #      _logger.error(f"Failed to create local storage directory '{storage_dir}': {e}")
+        #      # Raise an error as we cannot store files
+        #      raise IOError(f"Cannot create storage directory: {storage_dir}") from e
+        return storage_dir
+
+    def _get_cloud_key(self, file_type: str, filename: str) -> str:
+        """Constructs the object key/blob path for cloud storage."""
+        safe_filename = filename.lstrip('/')
+        # Basic structure: type/filename
+        return f"{file_type}/{safe_filename}"
 
     def _init_local_storage(self):
-        """Initialize local file storage"""
-        # Create base storage directories if they don't exist
-        os.makedirs(config.storage.LOCAL_STORAGE_PATH, exist_ok=True)
-        os.makedirs(config.storage.AUDIO_STORAGE_PATH, exist_ok=True)
-        os.makedirs(config.storage.STORY_STORAGE_PATH, exist_ok=True)
-        os.makedirs(config.storage.STORYBOARD_STORAGE_PATH, exist_ok=True)
-        _logger.info(f"Initialized local storage at {config.storage.LOCAL_STORAGE_PATH}")
+        """Initialize local file storage directories."""
+        try:
+            paths_to_create = [
+                appconfig.storage.LOCAL_STORAGE_PATH,
+                appconfig.storage.AUDIO_STORAGE_PATH,
+                appconfig.storage.STORY_STORAGE_PATH,
+                appconfig.storage.STORYBOARD_STORAGE_PATH,
+            ]
+            for path in paths_to_create:
+                 os.makedirs(path, exist_ok=True)
+                 _logger.debug(f"Ensured local storage directory exists: {path}")
+            _logger.info(f"Initialized local storage provider. Base path: {appconfig.storage.LOCAL_STORAGE_PATH}")
+        except OSError as e:
+            _logger.critical(f"CRITICAL: Failed to create essential local storage directories: {e}")
+            raise IOError("Failed to initialize local storage directories.") from e
 
     def _init_s3_storage(self):
-        """Initialize S3 storage"""
+        """Initialize S3 client and check bucket access."""
+        if not all([appconfig.storage.S3_BUCKET_NAME, appconfig.storage.S3_REGION]):
+            _logger.error("S3 provider enabled, but S3_BUCKET_NAME or S3_REGION is not configured.")
+            raise ValueError("Missing required S3 configuration (bucket, region).")
+        _logger.info(f"Initializing S3 storage provider. Bucket: {appconfig.storage.S3_BUCKET_NAME}, Region: {appconfig.storage.S3_REGION}")
+
+        using_config_creds = bool(appconfig.storage.S3_ACCESS_KEY and appconfig.storage.S3_SECRET_KEY)
+        if using_config_creds:
+             _logger.info("Using S3 credentials provided in configuration.")
+
         try:
-            import boto3
-            from botocore.exceptions import NoCredentialsError, ClientError
-
-            # Initialize S3 client
             session = boto3.session.Session()
-            self.s3_client = session.client(
-                's3',
-                region_name=config.storage.S3_REGION,
-                aws_access_key_id=config.storage.S3_ACCESS_KEY,
-                aws_secret_access_key=config.storage.S3_SECRET_KEY,
-                endpoint_url=config.storage.S3_ENDPOINT_URL or None
-            )
+            s3_client_args = {
+                'region_name': appconfig.storage.S3_REGION,
+                'endpoint_url': appconfig.storage.S3_ENDPOINT_URL or None
+            }
+            if using_config_creds:
+                 s3_client_args['aws_access_key_id'] = appconfig.storage.S3_ACCESS_KEY
+                 s3_client_args['aws_secret_access_key'] = appconfig.storage.S3_SECRET_KEY
 
-            # Check if bucket exists
-            try:
-                self.s3_client.head_bucket(Bucket=config.storage.S3_BUCKET_NAME)
-                _logger.info(f"Connected to S3 bucket: {config.storage.S3_BUCKET_NAME}")
-            except (ClientError, NoCredentialsError) as e:
-                _logger.error(f"S3 bucket not accessible: {e}. Falling back to local storage.")
-                self.provider = "local"
-                self._init_local_storage()
+            self.s3_client = session.client('s3', **s3_client_args)
 
-        except ImportError:
-            _logger.error("boto3 library not found. Please install with 'pip install boto3'. Falling back to local storage.")
-            self.provider = "local"
-            self._init_local_storage()
+            # Check bucket existence and accessibility
+            self.s3_client.head_bucket(Bucket=appconfig.storage.S3_BUCKET_NAME)
+            _logger.info(f"Successfully connected to S3 bucket: {appconfig.storage.S3_BUCKET_NAME}")
+
+        except (ClientError, NoCredentialsError, BotoCoreError) as e:
+            _logger.critical(f"S3 Initialization Failed: Could not access bucket '{appconfig.storage.S3_BUCKET_NAME}'. Error: {e}")
+            # Optionally fallback to local, but better to fail if S3 is configured but inaccessible
+            # self.provider = "local"; self._init_local_storage()
+            raise ConnectionError(f"Failed to initialize S3 storage: {e}") from e
+        except Exception as e:
+             _logger.critical(f"Unexpected error initializing S3: {e}")
+             raise ConnectionError("Unexpected error during S3 initialization.") from e
+
 
     def _init_azure_storage(self):
-        """Initialize Azure Blob Storage"""
+        """Initialize Azure Blob Storage client and check container."""
+        if not all([appconfig.storage.AZURE_ACCOUNT_NAME, appconfig.storage.AZURE_ACCOUNT_KEY, appconfig.storage.AZURE_CONTAINER_NAME]):
+            _logger.error("Azure provider enabled, but AZURE_ACCOUNT_NAME, AZURE_ACCOUNT_KEY, or AZURE_CONTAINER_NAME is not configured.")
+            raise ValueError("Missing required Azure configuration.")
+        _logger.info(f"Initializing Azure storage provider. Account: {appconfig.storage.AZURE_ACCOUNT_NAME}, Container: {appconfig.storage.AZURE_CONTAINER_NAME}")
+
         try:
-            from azure.storage.blob import BlobServiceClient
-
-            # Initialize Azure blob client
-            connection_string = f"DefaultEndpointsProtocol=https;AccountName={config.storage.AZURE_ACCOUNT_NAME};AccountKey={config.storage.AZURE_ACCOUNT_KEY};EndpointSuffix=core.windows.net"
+            # Construct connection string securely
+            connection_string = (
+                f"DefaultEndpointsProtocol=https;"
+                f"AccountName={appconfig.storage.AZURE_ACCOUNT_NAME};"
+                f"AccountKey={appconfig.storage.AZURE_ACCOUNT_KEY};"
+                f"EndpointSuffix=core.windows.net"
+            )
             self.azure_blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-
-            # Check if container exists, create if it doesn't
-            container_name = config.storage.AZURE_CONTAINER_NAME
+            container_name = appconfig.storage.AZURE_CONTAINER_NAME
             container_client = self.azure_blob_service_client.get_container_client(container_name)
-            try:
-                container_properties = container_client.get_container_properties()
-                _logger.info(f"Connected to Azure Blob container: {container_name}")
-            except Exception as e:
-                _logger.info(f"Container {container_name} not found, creating...")
-                container_client.create_container()
-                _logger.info(f"Created Azure Blob container: {container_name}")
 
-        except ImportError:
-            _logger.error("Azure Storage SDK not found. Please install with 'pip install azure-storage-blob'. Falling back to local storage.")
-            self.provider = "local"
-            self._init_local_storage()
+            # Check if container exists, create if needed
+            try:
+                container_client.get_container_properties()
+                _logger.info(f"Successfully connected to Azure Blob container: {container_name}")
+            except ResourceNotFoundError:
+                _logger.info(f"Azure container '{container_name}' not found, attempting to create...")
+                container_client.create_container()
+                _logger.info(f"Successfully created Azure Blob container: {container_name}")
+            except AzureError as e:
+                 # Catch specific Azure errors during property check/creation
+                 _logger.critical(f"Azure Initialization Failed: Could not access or create container '{container_name}'. Error: {e}")
+                 raise ConnectionError(f"Failed to initialize Azure storage: {e}") from e
+
+        except AzureError as e:
+             # Catch errors during client creation itself
+             _logger.critical(f"Azure Initialization Failed: Error creating BlobServiceClient. Error: {e}")
+             raise ConnectionError(f"Failed to initialize Azure storage: {e}") from e
         except Exception as e:
-            _logger.error(f"Failed to initialize Azure Blob Storage: {e}. Falling back to local storage.")
-            self.provider = "local"
-            self._init_local_storage()
+            _logger.critical(f"Unexpected error initializing Azure: {e}")
+            raise ConnectionError("Unexpected error during Azure initialization.") from e
+
+    def _guess_content_type(self, filename: str) -> str:
+        """Guess MIME type from filename, default to octet-stream."""
+        content_type, _ = mimetypes.guess_type(filename)
+        return content_type or "application/octet-stream"
+
+    def _get_validated_local_path(self, file_type: str, filename: str) -> str:
+         """Gets and validates the full local path for a file."""
+         if not is_safe_filename(filename):
+             _logger.error(f"Attempt to use unsafe filename for local storage: {filename}")
+             raise ValueError(f"Invalid or unsafe filename: {filename}")
+
+         storage_dir = self._get_storage_dir(file_type)
+         file_path = os.path.abspath(os.path.join(storage_dir, filename))
+
+         if not is_file_in_directory(file_path, storage_dir):
+             _logger.critical(f"SECURITY BREACH ATTEMPT: Calculated file path '{file_path}' is outside designated storage directory '{storage_dir}'.")
+             raise PermissionError("Calculated file path is outside allowed directory.")
+
+         return file_path
 
     def store_file(self, file_data: Union[str, bytes, BinaryIO],
                   file_type: str,
                   filename: Optional[str] = None,
-                  content_type: Optional[str] = None) -> Dict[str, str]:
+                  content_type: Optional[str] = None) -> Dict[str, Any]:
         """
-        Store a file in the configured storage provider
-
-        Args:
-            file_data: File content as string, bytes or file-like object
-            file_type: Type of file ('audio', 'story', 'storyboard')
-            filename: Optional filename (will be generated if not provided)
-            content_type: Optional MIME type
-
-        Returns:
-            Dict with file info including URL
+        Stores file data using the configured provider. Returns dict with info or error.
+        Generates a unique filename if none is provided.
         """
         if filename is None:
-            # Generate a unique filename with uuid
-            ext = self._get_extension_for_type(file_type, content_type)
-            filename = f"{str(uuid.uuid4())}{ext}"
+            ext = mimetypes.guess_extension(content_type or '') or self._get_extension_for_type(file_type)
+            filename = f"{uuid.uuid4()}{ext}"
+            _logger.debug(f"Generated unique filename: {filename}")
+        elif not is_safe_filename(filename):
+             _logger.error(f"Provided filename '{filename}' is unsafe.")
+             return {"error": "Invalid or unsafe filename provided.", "provider": self.provider}
 
-        # Store based on provider
-        if self.provider == "local":
-            return self._store_file_local(file_data, file_type, filename, content_type)
-        elif self.provider == "s3":
-            return self._store_file_s3(file_data, file_type, filename, content_type)
-        elif self.provider == "azure":
-            return self._store_file_azure(file_data, file_type, filename, content_type)
-        else:
-            # Should never reach here due to initialization checks
-            return self._store_file_local(file_data, file_type, filename, content_type)
+        start_time = time.time()
+        result = {"error": "Provider not implemented or failed", "provider": self.provider}
 
-    def get_file_url(self, file_path: str, file_type: str) -> str:
-        """
-        Get URL for a stored file
-
-        Args:
-            file_path: Storage path of the file
-            file_type: Type of file ('audio', 'story', 'storyboard')
-
-        Returns:
-            URL to access the file
-        """
-        if self.provider == "local":
-            # For local storage, form a URL using the base URL
-            relative_path = self._get_relative_path(file_path, file_type)
-            return urljoin(self.base_url, f"/static/{relative_path}")
-        elif self.provider == "s3":
-            # For S3, either return a pre-signed URL or direct S3 URL
-            if config.storage.S3_ENDPOINT_URL:
-                return f"{config.storage.S3_ENDPOINT_URL}/{config.storage.S3_BUCKET_NAME}/{file_path}"
+        try:
+            # --- Store based on provider ---
+            if self.provider == "local":
+                result = self._store_file_local(file_data, file_type, filename, content_type)
+            elif self.provider == "s3":
+                result = self._store_file_s3(file_data, file_type, filename, content_type)
+            elif self.provider == "azure":
+                result = self._store_file_azure(file_data, file_type, filename, content_type)
             else:
-                return f"https://{config.storage.S3_BUCKET_NAME}.s3.{config.storage.S3_REGION}.amazonaws.com/{file_path}"
-        elif self.provider == "azure":
-            # For Azure, form the blob URL
-            container_name = config.storage.AZURE_CONTAINER_NAME
-            return f"https://{config.storage.AZURE_ACCOUNT_NAME}.blob.core.windows.net/{container_name}/{file_path}"
-        return ""
+                 _logger.error(f"store_file called with unsupported provider '{self.provider}'")
+                 result = self._store_file_local(file_data, file_type, filename, content_type)
 
-    def serve_file(self, file_path: str, file_type: str) -> Union[str, Dict[str, Any]]:
-        """
-        Get file data for serving directly through the API
-
-        Args:
-            file_path: Storage path of the file
-            file_type: Type of file ('audio', 'story', 'storyboard')
-
-        Returns:
-            File path for local files, or file data for cloud storage
-        """
-        if self.provider == "local":
-            # For local files, return the file path for direct serving
-            return self._get_local_path(file_type, os.path.basename(file_path))
-        elif self.provider == "s3":
-            # Download from S3 to a temp file and return the path
-            try:
-                # Create the file path key for S3 based on file_type
-                s3_key = f"{file_type}/{os.path.basename(file_path)}"
-
-                # Create a temporary file to download to
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_path)[1])
-                temp_path = temp_file.name
-                temp_file.close()  # Close but don't delete
-
-                # Download the file from S3
-                self.s3_client.download_file(
-                    Bucket=config.storage.S3_BUCKET_NAME,
-                    Key=s3_key,
-                    Filename=temp_path
-                )
-
-                _logger.debug(f"Downloaded S3 file {s3_key} to temporary location {temp_path}")
-                return temp_path
-
-            except Exception as e:
-                _logger.error(f"Failed to serve file from S3: {e}")
-                return {"error": str(e)}
-        elif self.provider == "azure":
-            # Download from Azure to a temp file and return the path
-            try:
-                # Create the blob path based on file_type
-                blob_path = f"{file_type}/{os.path.basename(file_path)}"
-                container_name = config.storage.AZURE_CONTAINER_NAME
-
-                # Create a temporary file to download to
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_path)[1])
-                temp_path = temp_file.name
-                temp_file.close()  # Close but don't delete
-
-                # Get a blob client and download
-                blob_client = self.azure_blob_service_client.get_blob_client(
-                    container=container_name,
-                    blob=blob_path
-                )
-
-                with open(temp_path, "wb") as download_file:
-                    download_file.write(blob_client.download_blob().readall())
-
-                _logger.debug(f"Downloaded Azure blob {blob_path} to temporary location {temp_path}")
-                return temp_path
-
-            except Exception as e:
-                _logger.error(f"Failed to serve file from Azure: {e}")
-                return {"error": str(e)}
-        return ""
-
-    def delete_file(self, file_path: str, file_type: str) -> bool:
-        """
-        Delete a file from storage
-
-        Args:
-            file_path: Storage path of the file
-            file_type: Type of file ('audio', 'story', 'storyboard')
-
-        Returns:
-            True if deletion was successful
-        """
-        try:
-            if self.provider == "local":
-                os.remove(file_path)
-            elif self.provider == "s3":
-                self.s3_client.delete_object(
-                    Bucket=config.storage.S3_BUCKET_NAME,
-                    Key=file_path
-                )
-            elif self.provider == "azure":
-                container_name = config.storage.AZURE_CONTAINER_NAME
-                blob_client = self.azure_blob_service_client.get_blob_client(
-                    container=container_name,
-                    blob=file_path
-                )
-                blob_client.delete_blob()
-            return True
-        except Exception as e:
-            _logger.error(f"Failed to delete file {file_path}: {e}")
-            return False
-
-    def cleanup_old_files(self, max_age_days: int = None) -> int:
-        """
-        Delete files older than specified age from all storage providers
-
-        Args:
-            max_age_days: Maximum file age in days (default from config)
-
-        Returns:
-            Number of files deleted
-        """
-        if max_age_days is None:
-            max_age_days = config.storage.FILE_RETENTION_DAYS
-
-        # Skip if retention is set to 0 (keep forever)
-        if max_age_days <= 0:
-            return 0
-
-        deleted_count = 0
-        current_time = time.time()
-        max_age_seconds = max_age_days * 24 * 60 * 60
-        cutoff_time = current_time - max_age_seconds
-
-        # Log start of cleanup
-        _logger.info(f"Starting file cleanup for files older than {max_age_days} days")
-
-        try:
-            # Local storage cleanup
-            if self.provider == "local":
-                for file_type in ["audio", "story", "storyboard"]:
-                    storage_dir = self._get_storage_dir(file_type)
-                    if not os.path.exists(storage_dir):
-                        continue
-
-                    for filename in os.listdir(storage_dir):
-                        file_path = os.path.join(storage_dir, filename)
-                        if os.path.isfile(file_path):
-                            # Check file modification time
-                            file_mtime = os.path.getmtime(file_path)
-                            if file_mtime < cutoff_time:
-                                try:
-                                    os.remove(file_path)
-                                    deleted_count += 1
-                                    _logger.debug(f"Deleted old file {file_path}")
-                                except Exception as e:
-                                    _logger.error(f"Failed to delete old file {file_path}: {e}")
-
-            # S3 storage cleanup
-            elif self.provider == "s3":
-                for prefix in ["audio/", "story/", "storyboard/"]:
-                    try:
-                        # List objects in the bucket with the given prefix
-                        paginator = self.s3_client.get_paginator('list_objects_v2')
-                        pages = paginator.paginate(
-                            Bucket=config.storage.S3_BUCKET_NAME,
-                            Prefix=prefix
-                        )
-
-                        for page in pages:
-                            if 'Contents' not in page:
-                                continue
-
-                            for obj in page['Contents']:
-                                # Check object's last modified time
-                                if obj['LastModified'].timestamp() < cutoff_time:
-                                    try:
-                                        self.s3_client.delete_object(
-                                            Bucket=config.storage.S3_BUCKET_NAME,
-                                            Key=obj['Key']
-                                        )
-                                        deleted_count += 1
-                                        _logger.debug(f"Deleted old S3 object: {obj['Key']}")
-                                    except Exception as e:
-                                        _logger.error(f"Failed to delete old S3 object {obj['Key']}: {e}")
-                    except Exception as e:
-                        _logger.error(f"Error listing S3 objects for cleanup with prefix {prefix}: {e}")
-
-            # Azure Blob storage cleanup
-            elif self.provider == "azure":
-                container_name = config.storage.AZURE_CONTAINER_NAME
-                container_client = self.azure_blob_service_client.get_container_client(container_name)
-
-                for prefix in ["audio/", "story/", "storyboard/"]:
-                    try:
-                        # List all blobs with the given prefix
-                        blob_list = container_client.list_blobs(name_starts_with=prefix)
-
-                        for blob in blob_list:
-                            # Check blob's last modified time
-                            if blob.last_modified.timestamp() < cutoff_time:
-                                try:
-                                    blob_client = container_client.get_blob_client(blob.name)
-                                    blob_client.delete_blob()
-                                    deleted_count += 1
-                                    _logger.debug(f"Deleted old Azure blob: {blob.name}")
-                                except Exception as e:
-                                    _logger.error(f"Failed to delete old Azure blob {blob.name}: {e}")
-                    except Exception as e:
-                        _logger.error(f"Error listing Azure blobs for cleanup with prefix {prefix}: {e}")
-
-            _logger.info(f"File cleanup complete: {deleted_count} files removed")
-            return deleted_count
+            duration = time.time() - start_time
+            if "error" not in result:
+                _logger.info(f"Stored '{filename}' ({file_type}) via {self.provider}. Time: {duration:.3f}s. Path/Key: {result.get('file_path')}")
+            else:
+                _logger.error(f"Failed to store '{filename}' ({file_type}) via {self.provider}. Time: {duration:.3f}s. Error: {result.get('error')}")
 
         except Exception as e:
-            _logger.error(f"Error during file cleanup: {e}")
-            return 0
+             duration = time.time() - start_time
+             _logger.exception(f"Unexpected error storing file '{filename}' via {self.provider}. Time: {duration:.3f}s. Error: {e}")
+             result = {"error": f"Unexpected error during storage: {e}", "provider": self.provider}
 
-    def retrieve_file(self, filename: str, file_type: str,
-                    start_byte: int = None, end_byte: int = None) -> Optional[Union[bytes, BinaryIO]]:
-        """
-        Retrieve file data from storage with optional range support for streaming
+        return result
 
-        Args:
-            filename: Name of the file to retrieve
-            file_type: Type of file ('audio', 'story', 'storyboard')
-            start_byte: Optional starting byte for range requests
-            end_byte: Optional ending byte for range requests
-
-        Returns:
-            File content as bytes, or None if file not found
-            For range requests: file-like object that can be iterated for streaming
-        """
+    def _store_file_local(self, file_data: Union[str, bytes, BinaryIO], file_type: str, filename: str, content_type: Optional[str]) -> Dict[str, Any]:
+        """Stores a file in the local filesystem."""
         try:
-            if self.provider == "local":
-                # For local storage, read directly from file system
-                file_path = self._get_local_path(file_type, filename)
-                if not os.path.exists(file_path):
-                    return None
+            file_path = self._get_validated_local_path(file_type, filename)
+            _logger.debug(f"Writing local file to: {file_path}")
 
-                # If range is specified, return a file object for streaming
-                if start_byte is not None:
-                    file_obj = open(file_path, "rb")
-                    file_obj.seek(start_byte)
-                    return file_obj
+            # Write the file (handle different data types)
+            mode = "wb" if isinstance(file_data, bytes) else "w"
+            encoding = None if mode == "wb" else "utf-8" # Use UTF-8 for text
 
-                # Otherwise return the entire file as bytes
-                with open(file_path, "rb") as f:
-                    return f.read()
-
-            elif self.provider == "s3":
-                # Download from S3 with optional range
-                s3_key = f"{file_type}/{filename}"
-                try:
-                    # Prepare range string if needed
-                    range_header = None
-                    if start_byte is not None:
-                        if end_byte is not None:
-                            range_header = f"bytes={start_byte}-{end_byte}"
-                        else:
-                            range_header = f"bytes={start_byte}-"
-
-                    # Get object with optional range
-                    params = {'Bucket': config.storage.S3_BUCKET_NAME, 'Key': s3_key}
-                    if range_header:
-                        params['Range'] = range_header
-
-                    response = self.s3_client.get_object(**params)
-
-                    # For range requests, return the streaming body for efficient handling
-                    if start_byte is not None:
-                        return response['Body']
-
-                    # For full requests, read all data
-                    return response['Body'].read()
-
-                except Exception as e:
-                    _logger.error(f"Error downloading from S3: {e}")
-                    return None
-
-            elif self.provider == "azure":
-                # Download from Azure Blob with optional range
-                blob_path = f"{file_type}/{filename}"
-                container_name = config.storage.AZURE_CONTAINER_NAME
-
-                try:
-                    blob_client = self.azure_blob_service_client.get_blob_client(
-                        container=container_name,
-                        blob=blob_path
-                    )
-
-                    # For range requests
-                    if start_byte is not None:
-                        if end_byte is not None:
-                            download_stream = blob_client.download_blob(
-                                offset=start_byte,
-                                length=end_byte-start_byte+1
-                            )
-                        else:
-                            download_stream = blob_client.download_blob(
-                                offset=start_byte
-                            )
-                        return download_stream
-
-                    # For full downloads
-                    download_stream = blob_client.download_blob()
-                    return download_stream.readall()
-
-                except Exception as e:
-                    _logger.error(f"Error downloading from Azure: {e}")
-                    return None
-
-            return None
-
-        except Exception as e:
-            _logger.error(f"Failed to retrieve file {filename}: {e}")
-            return None
-
-    def _store_file_local(self, file_data: Union[str, bytes, BinaryIO],
-                        file_type: str,
-                        filename: str,
-                        content_type: Optional[str] = None) -> Dict[str, str]:
-        """Store a file in local file system"""
-        # Get the appropriate storage directory
-        storage_dir = self._get_storage_dir(file_type)
-        file_path = os.path.join(storage_dir, filename)
-
-        # Write the file based on the type of data
-        try:
-            if isinstance(file_data, (str, bytes)):
-                # It's string or bytes content
-                mode = "wb" if isinstance(file_data, bytes) else "w"
-                with open(file_path, mode) as f:
+            with open(file_path, mode, encoding=encoding) as f:
+                if isinstance(file_data, (str, bytes)):
                     f.write(file_data)
-            else:
-                # It's a file-like object
-                with open(file_path, "wb") as f:
+                else:
+                    # Ensure reading starts from the beginning if it's a file object
+                    if hasattr(file_data, 'seek'): file_data.seek(0)
                     shutil.copyfileobj(file_data, f)
 
-            _logger.debug(f"Stored file at {file_path}")
+            # Construct relative path for URL generation (relative to storage type base)
+            relative_path = f"{file_type}/{filename}"
+            file_url = urljoin(self.base_url, f"/static/{relative_path}") # Assumes /static mount point
 
-            # Return file info including URL
-            relative_path = self._get_relative_path(file_path, file_type)
             return {
-                "file_path": file_path,
+                "file_path": relative_path,
+                "absolute_path": file_path,
                 "filename": filename,
-                "url": urljoin(self.base_url, f"/static/{relative_path}"),
+                "url": file_url,
                 "content_type": content_type or self._guess_content_type(filename),
                 "provider": "local"
             }
-        except Exception as e:
-            _logger.error(f"Failed to store file locally: {e}")
-            return {
-                "error": f"Failed to store file: {str(e)}",
-                "provider": "local"
-            }
+        except (IOError, OSError, ValueError, PermissionError) as e:
+            _logger.error(f"Failed to store file locally at '{filename}': {e}")
+            return {"error": f"Local storage failed: {e}", "provider": "local"}
 
-    def _store_file_s3(self, file_data: Union[str, bytes, BinaryIO],
-                     file_type: str,
-                     filename: str,
-                     content_type: Optional[str] = None) -> Dict[str, str]:
-        """Store a file in S3"""
-        # Determine S3 key (path)
-        s3_key = f"{file_type}/{filename}"
+
+    def _store_file_s3(self, file_data: Union[str, bytes, BinaryIO], file_type: str, filename: str, content_type: Optional[str]) -> Dict[str, Any]:
+        """Stores a file in S3."""
+        if not self.s3_client: return {"error": "S3 client not initialized.", "provider": "s3"}
+
+        s3_key = self._get_cloud_key(file_type, filename)
+        guessed_content_type = content_type or self._guess_content_type(filename)
+        _logger.debug(f"Uploading to S3. Bucket: {appconfig.storage.S3_BUCKET_NAME}, Key: {s3_key}, ContentType: {guessed_content_type}")
 
         try:
-            # Prepare data for upload
-            if isinstance(file_data, str):
-                file_data = file_data.encode('utf-8')
+            extra_args = {"ContentType": guessed_content_type}
+            put_args = {
+                "Bucket": appconfig.storage.S3_BUCKET_NAME,
+                "Key": s3_key,
+                "ExtraArgs": extra_args
+            }
 
-            # Determine content type if not provided
-            if content_type is None:
-                content_type = self._guess_content_type(filename)
-
-            # Upload to S3
             if isinstance(file_data, bytes):
-                self.s3_client.put_object(
-                    Bucket=config.storage.S3_BUCKET_NAME,
-                    Key=s3_key,
-                    Body=file_data,
-                    ContentType=content_type
-                )
+                self.s3_client.put_object(Body=file_data, ContentType=guessed_content_type, **put_args)
+            elif isinstance(file_data, str):
+                 self.s3_client.put_object(Body=file_data.encode('utf-8'), ContentType=guessed_content_type, **put_args)
             else:
-                # File-like object
-                self.s3_client.upload_fileobj(
-                    file_data,
-                    config.storage.S3_BUCKET_NAME,
-                    s3_key,
-                    ExtraArgs={"ContentType": content_type}
-                )
+                 if hasattr(file_data, 'seek'): file_data.seek(0)
+                 # upload_fileobj is generally preferred for streams
+                 self.s3_client.upload_fileobj(file_data, appconfig.storage.S3_BUCKET_NAME, s3_key, ExtraArgs=extra_args)
 
-            _logger.debug(f"Stored file in S3 at {s3_key}")
-
-            # Generate a URL for the S3 object
-            if config.storage.S3_ENDPOINT_URL:
-                url = f"{config.storage.S3_ENDPOINT_URL}/{config.storage.S3_BUCKET_NAME}/{s3_key}"
-            else:
-                url = f"https://{config.storage.S3_BUCKET_NAME}.s3.{config.storage.S3_REGION}.amazonaws.com/{s3_key}"
+            file_url = self.get_file_url(s3_key, file_type)
 
             return {
                 "file_path": s3_key,
                 "filename": filename,
-                "url": url,
-                "content_type": content_type,
+                "url": file_url,
+                "content_type": guessed_content_type,
                 "provider": "s3"
             }
-        except Exception as e:
-            _logger.error(f"Failed to store file in S3: {e}")
-            return {
-                "error": f"Failed to store file in S3: {str(e)}",
-                "provider": "s3"
-            }
+        except (ClientError, BotoCoreError) as e:
+            _logger.error(f"Failed to store file in S3 (Key: {s3_key}): {e}")
+            return {"error": f"S3 storage failed: {e}", "provider": "s3"}
 
-    def _store_file_azure(self, file_data: Union[str, bytes, BinaryIO],
-                        file_type: str,
-                        filename: str,
-                        content_type: Optional[str] = None) -> Dict[str, str]:
-        """Store a file in Azure Blob Storage"""
-        # Determine blob path
-        blob_path = f"{file_type}/{filename}"
-        container_name = config.storage.AZURE_CONTAINER_NAME
+    def _store_file_azure(self, file_data: Union[str, bytes, BinaryIO], file_type: str, filename: str, content_type: Optional[str]) -> Dict[str, Any]:
+        """Stores a file in Azure Blob Storage."""
+        if not self.azure_blob_service_client: return {"error": "Azure client not initialized.", "provider": "azure"}
+
+        blob_path = self._get_cloud_key(file_type, filename)
+        guessed_content_type = content_type or self._guess_content_type(filename)
+        container_name = appconfig.storage.AZURE_CONTAINER_NAME
+        _logger.debug(f"Uploading to Azure Blob. Container: {container_name}, Blob: {blob_path}, ContentType: {guessed_content_type}")
 
         try:
-            # Get a blob client
-            blob_client = self.azure_blob_service_client.get_blob_client(
-                container=container_name,
-                blob=blob_path
+            blob_client = self.azure_blob_service_client.get_blob_client(container=container_name, blob=blob_path)
+            azure_content_settings = ContentSettings(content_type=guessed_content_type)
+
+            data_to_upload: Union[bytes, BinaryIO]
+            if isinstance(file_data, str):
+                 data_to_upload = file_data.encode('utf-8')
+            elif isinstance(file_data, bytes):
+                 data_to_upload = file_data
+            else:
+                 if hasattr(file_data, 'seek'): file_data.seek(0)
+                 data_to_upload = file_data
+
+            # Upload blob
+            blob_client.upload_blob(
+                 data_to_upload,
+                 overwrite=True,
+                 content_settings=azure_content_settings
             )
 
-            # Determine content type if not provided
-            if content_type is None:
-                content_type = self._guess_content_type(filename)
-
-            # Upload data
-            if isinstance(file_data, str):
-                file_data = file_data.encode('utf-8')
-
-            if isinstance(file_data, bytes):
-                blob_client.upload_blob(file_data, overwrite=True, content_settings={"content_type": content_type})
-            else:
-                # File-like object
-                blob_client.upload_blob(file_data.read(), overwrite=True, content_settings={"content_type": content_type})
-
-            _logger.debug(f"Stored file in Azure Blob at {blob_path}")
-
             # Generate URL
-            url = f"https://{config.storage.AZURE_ACCOUNT_NAME}.blob.core.windows.net/{container_name}/{blob_path}"
+            file_url = self.get_file_url(blob_path, file_type)
 
             return {
                 "file_path": blob_path,
                 "filename": filename,
-                "url": url,
-                "content_type": content_type,
+                "url": file_url,
+                "content_type": guessed_content_type,
                 "provider": "azure"
             }
+        except (AzureError, IOError) as e:
+            _logger.error(f"Failed to store file in Azure Blob (Blob: {blob_path}): {e}")
+            return {"error": f"Azure storage failed: {e}", "provider": "azure"}
+
+
+    def get_file_url(self, file_path_or_key: str, file_type: str) -> Optional[str]:
+        """Gets the publicly accessible URL for a stored file."""
+        filename = os.path.basename(file_path_or_key)
+
+        try:
+            if self.provider == "local":
+                # Use the relative path directly with the static mount and base URL
+                # Assumes file_path_or_key is like "audio/somefile.mp3"
+                relative_path = file_path_or_key.lstrip('/')
+                return urljoin(self.base_url, f"/static/{relative_path}")
+
+            elif self.provider == "s3":
+                 # Construct standard S3 URL or use endpoint URL if provided
+                 bucket = appconfig.storage.S3_BUCKET_NAME
+                 key = file_path_or_key
+                 if appconfig.storage.S3_ENDPOINT_URL:
+                     # Handle potential trailing slash in endpoint URL
+                     endpoint = appconfig.storage.S3_ENDPOINT_URL.rstrip('/')
+                     return f"{endpoint}/{bucket}/{key}"
+                 else:
+                     region = appconfig.storage.S3_REGION
+                     return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
+                 # TODO: Consider pre-signed URLs for private content:
+                 # return self.s3_client.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': key}, ExpiresIn=3600)
+
+            elif self.provider == "azure":
+                 account = appconfig.storage.AZURE_ACCOUNT_NAME
+                 container = appconfig.storage.AZURE_CONTAINER_NAME
+                 blob_path = file_path_or_key
+                 return f"https://{account}.blob.core.windows.net/{container}/{blob_path}"
+                 # TODO: Consider SAS tokens for private content
+
+            else:
+                _logger.error(f"Cannot get URL for unsupported provider: {self.provider}")
+                return None
         except Exception as e:
-            _logger.error(f"Failed to store file in Azure Blob: {e}")
-            return {
-                "error": f"Failed to store file in Azure Blob: {str(e)}",
-                "provider": "azure"
-            }
+             _logger.exception(f"Error generating file URL for {file_path_or_key}: {e}")
+             return None
 
-    def _get_storage_dir(self, file_type: str) -> str:
-        """Get the appropriate storage directory for the file type"""
-        if file_type == "audio":
-            return config.storage.AUDIO_STORAGE_PATH
-        elif file_type == "story":
-            return config.storage.STORY_STORAGE_PATH
-        elif file_type == "storyboard":
-            return config.storage.STORYBOARD_STORAGE_PATH
+
+    def retrieve_file(self, filename: str, file_type: str,
+                    start_byte: Optional[int] = None, end_byte: Optional[int] = None) -> Optional[Union[bytes, BinaryIO]]:
+        """Retrieves file content, supporting byte ranges for streaming."""
+        _logger.debug(f"Retrieving file '{filename}' ({file_type}), range: {start_byte}-{end_byte}")
+        if not is_safe_filename(filename):
+             _logger.error(f"Attempt to retrieve file with unsafe filename: {filename}")
+             return None
+
+        try:
+            if self.provider == "local":
+                # Get validated absolute path
+                file_path = self._get_validated_local_path(file_type, filename)
+                if not os.path.exists(file_path):
+                    _logger.warning(f"Local file not found: {file_path}")
+                    return None
+
+                file_size = os.path.getsize(file_path)
+                # Validate range if provided
+                range_header, length = self._validate_and_get_range(file_size, start_byte, end_byte)
+                if length == 0 and start_byte is not None: return b''
+
+                # Open file and seek for range requests
+                file_obj = open(file_path, "rb")
+                if start_byte is not None:
+                    file_obj.seek(start_byte)
+                return file_obj
+
+            elif self.provider == "s3":
+                if not self.s3_client: return None
+                s3_key = self._get_cloud_key(file_type, filename)
+                params = {'Bucket': appconfig.storage.S3_BUCKET_NAME, 'Key': s3_key}
+
+                # Add Range header if needed (S3 uses HTTP Range spec)
+                if start_byte is not None:
+                    range_str = f"bytes={start_byte}-"
+                    if end_byte is not None:
+                         range_str = f"bytes={start_byte}-{end_byte}"
+                    params['Range'] = range_str
+                    _logger.debug(f"S3 GetObject Range: {range_str}")
+
+                response = self.s3_client.get_object(**params)
+                return response['Body'] # This is a streamable object (botocore.response.StreamingBody)
+
+            elif self.provider == "azure":
+                if not self.azure_blob_service_client: return None
+                blob_path = self._get_cloud_key(file_type, filename)
+                container_name = appconfig.storage.AZURE_CONTAINER_NAME
+                blob_client = self.azure_blob_service_client.get_blob_client(container=container_name, blob=blob_path)
+
+                offset = start_byte if start_byte is not None else 0
+                length = None
+                if start_byte is not None and end_byte is not None:
+                     length = end_byte - start_byte + 1
+                elif start_byte is not None:
+                     # Read from start_byte to end if end_byte is None
+                     length = None
+                else: # Full download
+                    offset = 0
+                    length = None
+
+                _logger.debug(f"Azure Download Blob Range: offset={offset}, length={length}")
+                download_stream = blob_client.download_blob(offset=offset, length=length)
+                # Return the download stream object (azure.storage.blob.StorageStreamDownloader)
+                return download_stream
+
+            else:
+                return None # Should not happen
+
+        except (ClientError, AzureError, FileNotFoundError, ValueError, PermissionError) as e:
+            _logger.error(f"Failed to retrieve file '{filename}' ({file_type}) from {self.provider}: {e}")
+            return None
+        except Exception as e:
+            _logger.exception(f"Unexpected error retrieving file '{filename}': {e}")
+            return None
+
+    def _validate_and_get_range(self, file_size: int, start_byte: Optional[int], end_byte: Optional[int]) -> Tuple[Optional[str], int]:
+        """Helper to validate byte range and calculate length."""
+        if start_byte is None:
+            return None, file_size
+
+        start = start_byte
+        end = end_byte if end_byte is not None else file_size - 1
+
+        if start < 0 or start >= file_size:
+            raise ValueError(f"Invalid start byte {start} for file size {file_size}")
+        if end < start or end >= file_size:
+             raise ValueError(f"Invalid end byte {end} for start {start} and file size {file_size}")
+
+        range_header = f"bytes {start}-{end}/{file_size}"
+        length = end - start + 1
+        return range_header, length
+
+
+    def serve_file(self, filename: str, file_type: str) -> Union[str, Dict[str, Any]]:
+        """
+        Gets information needed to serve a file (e.g., local path or cloud error).
+        DEPRECATED? retrieve_file is likely more useful for API endpoints.
+        Kept for potential direct use, but needs careful handling.
+        """
+        _logger.warning("serve_file method called - consider using retrieve_file for API streaming.")
+        if not is_safe_filename(filename):
+             _logger.error(f"Serve file rejected unsafe filename: {filename}")
+             return {"error": "Invalid or unsafe filename"}
+
+        if self.provider == "local":
+             try:
+                 # Return validated absolute path for direct serving (e.g., by FileResponse)
+                 return self._get_validated_local_path(file_type, filename)
+             except (ValueError, PermissionError, FileNotFoundError) as e:
+                  _logger.error(f"Cannot serve local file '{filename}': {e}")
+                  return {"error": str(e)}
+
+        elif self.provider == "s3" or self.provider == "azure":
+             _logger.warning(f"Serving cloud file '{filename}' via 'serve_file' is inefficient. Use 'retrieve_file'.")
+             # If absolutely needed
+             try:
+                  # Create a secure temp file (consider cleanup strategy)
+                  temp_suffix = os.path.splitext(filename)[1]
+                  with tempfile.NamedTemporaryFile(delete=False, suffix=temp_suffix, prefix=f"{file_type}_") as temp_f:
+                     temp_path = temp_f.name
+
+                  # Retrieve full file content (inefficient for large files)
+                  file_stream = self.retrieve_file(filename, file_type)
+                  if file_stream is None:
+                      os.remove(temp_path) # Clean up empty temp file
+                      return {"error": "File not found in cloud storage"}
+
+                  # Write stream to temp file
+                  with open(temp_path, "wb") as f_out:
+                     if hasattr(file_stream, 'read'): # S3 stream
+                         shutil.copyfileobj(file_stream, f_out)
+                     elif hasattr(file_stream, 'readall'): # Azure stream
+                          f_out.write(file_stream.readall())
+                     elif isinstance(file_stream, bytes): # Should not happen without range
+                          f_out.write(file_stream)
+                     else:
+                          raise TypeError("Unsupported stream type from retrieve_file")
+
+                  _logger.debug(f"Downloaded cloud file {filename} to temporary location {temp_path} for serving.")
+                  return temp_path
+             except Exception as e:
+                  _logger.exception(f"Failed to download cloud file {filename} to temp location: {e}")
+                  if 'temp_path' in locals() and os.path.exists(temp_path):
+                       try: os.remove(temp_path)
+                       except OSError: pass
+                  return {"error": f"Failed to serve file from {self.provider}: {e}"}
         else:
-            # Default to base storage path
-            return config.storage.LOCAL_STORAGE_PATH
+             return {"error": f"Unsupported provider {self.provider}"}
 
-    def _get_local_path(self, file_type: str, filename: str) -> str:
-        """Get the full local path for a file"""
-        storage_dir = self._get_storage_dir(file_type)
-        return os.path.join(storage_dir, filename)
 
-    def _get_relative_path(self, file_path: str, file_type: str) -> str:
-        """Get the relative path for a file for URL construction"""
-        if file_type == "audio":
-            return f"audio/{os.path.basename(file_path)}"
-        elif file_type == "story":
-            return f"stories/{os.path.basename(file_path)}"
-        elif file_type == "storyboard":
-            return f"storyboards/{os.path.basename(file_path)}"
-        else:
-            return os.path.basename(file_path)
+    def delete_file(self, file_path_or_key: str, file_type: str) -> bool:
+        """Deletes a file from the configured storage provider."""
+        _logger.warning(f"Attempting to delete file/key '{file_path_or_key}' ({file_type}) from {self.provider} storage.")
+        filename = os.path.basename(file_path_or_key)
 
-    def _get_extension_for_type(self, file_type: str, content_type: Optional[str] = None) -> str:
-        """Get the appropriate file extension based on file type"""
-        if file_type == "audio":
-            return ".mp3"
-        elif file_type == "story":
-            return ".txt"
-        elif file_type == "storyboard":
-            return ".json"
+        try:
+            if self.provider == "local":
+                # Use validated local path for deletion
+                abs_path_to_delete = self._get_validated_local_path(file_type, filename)
+                os.remove(abs_path_to_delete)
+                _logger.info(f"Deleted local file: {abs_path_to_delete}")
 
-        # Try to determine from content type
-        if content_type:
-            ext = mimetypes.guess_extension(content_type)
-            if ext:
-                return ext
+            elif self.provider == "s3":
+                 if not self.s3_client: return False
+                 s3_key = file_path_or_key
+                 self.s3_client.delete_object(Bucket=appconfig.storage.S3_BUCKET_NAME, Key=s3_key)
+                 _logger.info(f"Deleted S3 object: Bucket={appconfig.storage.S3_BUCKET_NAME}, Key={s3_key}")
 
-        # Default
-        return ""
+            elif self.provider == "azure":
+                 if not self.azure_blob_service_client: return False
+                 blob_path = file_path_or_key
+                 container_name = appconfig.storage.AZURE_CONTAINER_NAME
+                 blob_client = self.azure_blob_service_client.get_blob_client(container=container_name, blob=blob_path)
+                 blob_client.delete_blob()
+                 _logger.info(f"Deleted Azure blob: Container={container_name}, Blob={blob_path}")
 
-    def _guess_content_type(self, filename: str) -> str:
-        """Guess the content type based on filename"""
-        content_type, _ = mimetypes.guess_type(filename)
-        if content_type:
-            return content_type
+            else:
+                 _logger.error(f"Delete failed: Unsupported provider {self.provider}")
+                 return False
 
-        # Some common mappings
-        extension = os.path.splitext(filename)[1].lower()
-        if extension == ".mp3":
-            return "audio/mpeg"
-        elif extension == ".txt":
-            return "text/plain"
-        elif extension == ".json":
-            return "application/json"
+            return True
 
-        # Default to octet-stream
-        return "application/octet-stream"
+        except (FileNotFoundError, ResourceNotFoundError) as e:
+             _logger.warning(f"File/object not found during deletion attempt: {file_path_or_key}. Error: {e}")
+             return False
+        except (ClientError, AzureError, ValueError, PermissionError, OSError) as e:
+             _logger.error(f"Failed to delete file/object '{file_path_or_key}' from {self.provider}: {e}")
+             return False
+        except Exception as e:
+             _logger.exception(f"Unexpected error deleting file/object '{file_path_or_key}': {e}")
+             return False
+
+
+    def cleanup_old_files(self, max_age_days: Optional[int] = None) -> int:
+        """Deletes files older than max_age_days based on modification time."""
+        retention_days = max_age_days if max_age_days is not None else appconfig.storage.FILE_RETENTION_DAYS
+        if not isinstance(retention_days, int) or retention_days <= 0:
+            _logger.info("File retention cleanup skipped (retention_days <= 0).")
+            return 0
+
+        deleted_count = 0
+        cutoff_timestamp = time.time() - (retention_days * 24 * 60 * 60)
+        cutoff_dt = datetime.datetime.fromtimestamp(cutoff_timestamp, tz=datetime.timezone.utc)
+        _logger.info(f"Starting storage cleanup. Provider: {self.provider}. Deleting files older than {retention_days} days (before {cutoff_dt.isoformat()}).")
+
+        try:
+            if self.provider == "local":
+                # Iterate through configured storage directories
+                for file_type in ["audio", "story", "storyboard"]:
+                    storage_dir = self._get_storage_dir(file_type)
+                    _logger.debug(f"Checking local directory for cleanup: {storage_dir}")
+                    if not os.path.isdir(storage_dir): continue
+
+                    for filename in os.listdir(storage_dir):
+                         file_path = os.path.join(storage_dir, filename)
+                         # Check if it's a file and not a symlink before getting mtime
+                         if os.path.isfile(file_path) and not os.path.islink(file_path):
+                             try:
+                                 file_mtime = os.path.getmtime(file_path)
+                                 if file_mtime < cutoff_timestamp:
+                                     # Validate path again before deleting
+                                     if is_file_in_directory(file_path, storage_dir):
+                                         os.remove(file_path)
+                                         deleted_count += 1
+                                         _logger.debug(f"Deleted old local file: {file_path}")
+                                     else:
+                                          _logger.warning(f"Skipping deletion of suspicious file outside expected directory: {file_path}")
+                             except FileNotFoundError:
+                                  continue
+                             except OSError as e:
+                                  _logger.error(f"Failed to delete old local file {file_path}: {e}")
+
+            elif self.provider == "s3":
+                 if not self.s3_client: return 0
+                 bucket = appconfig.storage.S3_BUCKET_NAME
+                 for prefix in ["audio/", "story/", "storyboard/"]:
+                     _logger.debug(f"Checking S3 prefix for cleanup: {prefix}")
+                     paginator = self.s3_client.get_paginator('list_objects_v2')
+                     pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
+                     keys_to_delete = []
+                     for page in pages:
+                         if 'Contents' not in page: continue
+                         for obj in page['Contents']:
+                             # S3 LastModified is timezone-aware (UTC)
+                             if obj['LastModified'] < cutoff_dt:
+                                 keys_to_delete.append({'Key': obj['Key']})
+                                 _logger.debug(f"Marked old S3 object for deletion: {obj['Key']} (Modified: {obj['LastModified']})")
+
+                     # Batch delete (up to 1000 keys per request)
+                     for i in range(0, len(keys_to_delete), 1000):
+                         batch = keys_to_delete[i:i+1000]
+                         if batch:
+                             delete_payload = {'Objects': batch, 'Quiet': True}
+                             response = self.s3_client.delete_objects(Bucket=bucket, Delete=delete_payload)
+                             if 'Errors' in response and response['Errors']:
+                                  for error in response['Errors']:
+                                       _logger.error(f"Failed to delete S3 object {error['Key']}: {error['Code']} - {error['Message']}")
+                             deleted_count += len(batch) - len(response.get('Errors', []))
+                             _logger.info(f"Batch deleted {len(batch)} S3 objects (encountered {len(response.get('Errors', []))} errors).")
+
+
+            elif self.provider == "azure":
+                 if not self.azure_blob_service_client: return 0
+                 container_name = appconfig.storage.AZURE_CONTAINER_NAME
+                 container_client = self.azure_blob_service_client.get_container_client(container_name)
+                 for prefix in ["audio/", "story/", "storyboard/"]:
+                     _logger.debug(f"Checking Azure prefix for cleanup: {prefix}")
+                     blob_list = container_client.list_blobs(name_starts_with=prefix)
+                     blobs_to_delete = []
+                     for blob in blob_list:
+                         # Azure last_modified is timezone-aware (UTC)
+                         if blob.last_modified < cutoff_dt:
+                             blobs_to_delete.append(blob.name)
+                             _logger.debug(f"Marked old Azure blob for deletion: {blob.name} (Modified: {blob.last_modified})")
+
+                     # Delete blobs one by one (Azure SDK doesn't have batch delete like S3)
+                     for blob_name in blobs_to_delete:
+                         try:
+                             blob_client = container_client.get_blob_client(blob_name)
+                             blob_client.delete_blob()
+                             deleted_count += 1
+                         except AzureError as e:
+                             _logger.error(f"Failed to delete old Azure blob {blob_name}: {e}")
+
+
+            _logger.info(f"Storage cleanup complete for provider {self.provider}. Deleted {deleted_count} old files/objects.")
+            return deleted_count
+
+        except (ClientError, AzureError, BotoCoreError, OSError) as e:
+            _logger.error(f"Error during storage cleanup: {e}")
+            return 0
+        except Exception as e:
+             _logger.exception(f"Unexpected error during storage cleanup: {e}")
+             return 0
+
 
     async def close(self):
-        """Close any open connections or resources"""
-        _logger.debug("Closing storage manager resources")
-        if self.provider == "s3":
-            # Close any S3 connections if needed
-            pass
-        elif self.provider == "azure":
-            # Close any Azure connections if needed
-            pass
-        # For local storage, nothing special needs to be done
+        """Placeholder for closing connections (if needed)."""
+        _logger.debug("Closing storage manager (no-op for current implementation).")
+        # Add cleanup for SDK clients if necessary (usually not required for boto3/azure)
         return True
 
-# Initialize the mimetypes module
+
+# Initialize mimetypes module
 mimetypes.init()
 
-# Single shared instance
+# Single shared instance (ensure thread-safety if used across threads without care)
+# TODO: Consider using dependency injection (FastAPI Depends) instead of global instance if needed.
 storage_manager = StorageManager()

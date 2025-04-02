@@ -7,7 +7,7 @@ import signal
 import sys
 import os
 from .config import config
-from .crawl4ai_scraper import process_queue_worker
+from .crawl4ai_scraper import process_scrape_queue_worker as process_queue_worker
 from viralStoryGenerator.src.logger import logger as _logger
 
 # Graceful shutdown handler
