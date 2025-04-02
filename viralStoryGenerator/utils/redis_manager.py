@@ -479,3 +479,4 @@ class RedisManager:
         except Exception as e:
             _logger.error(f"Failed to complete request: {str(e)}")
             return False
+        
