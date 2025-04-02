@@ -7,6 +7,9 @@ import time
 import json
 import uuid
 
+import playwright
+from playwright.sync_api import sync_playwright
+
 # Use Crawl4AI library
 try:
     from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
@@ -28,7 +31,7 @@ from viralStoryGenerator.src.logger import logger as _logger
 redis_manager: Optional[RedisQueueManager] = None
 if app_config.redis.ENABLED:
     try:
-        scrape_queue_name = app_config.redis.QUEUE_NAME + "_scrape"
+        scrape_queue_name = app_config.redis.QUEUE_NAME
         scrape_result_prefix = app_config.redis.RESULT_PREFIX + "scrape:"
         scrape_ttl = app_config.redis.TTL
 
@@ -68,39 +71,49 @@ async def scrape_urls(
     effective_browser_config = browser_config or BrowserConfig(headless=True)
     results_data: List[Tuple[str, Optional[str]]] = []
 
-    try:
-        # Initialize crawler within async context manager
-        async with AsyncWebCrawler(config=effective_browser_config) as crawler:
-            tasks = [crawler.arun(url, config=run_config) for url in url_list]
-            crawl_results = await asyncio.gather(*tasks, return_exceptions=True)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # Initialize crawler within async context manager
+            async with AsyncWebCrawler(config=effective_browser_config) as crawler:
+                tasks = [crawler.arun(url, config=run_config) for url in url_list]
+                crawl_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Process results
-        for url, result in zip(url_list, crawl_results):
-            if isinstance(result, Exception):
-                error_msg = str(result)
-                if "Executable doesn't exist" in error_msg and "playwright" in error_msg.lower():
-                     _logger.error(f"Playwright browser not installed for {url}. Run 'playwright install'. Error: {result}")
+            # Process results
+            for url, result in zip(url_list, crawl_results):
+                if isinstance(result, Exception):
+                    error_msg = str(result)
+                    if "Executable doesn't exist" in error_msg and "playwright" in error_msg.lower():
+                         _logger.error(f"Playwright browser not installed for {url}. Run 'playwright install'. Error: {result}")
+                    else:
+                         _logger.error(f"Error crawling {url}: {result}")
+                    results_data.append((url, None))
+                elif hasattr(result, 'markdown'):
+                    results_data.append((url, result.markdown))
                 else:
-                     _logger.error(f"Error crawling {url}: {result}")
-                results_data.append((url, None))
-            elif hasattr(result, 'markdown'):
-                results_data.append((url, result.markdown))
-            else:
-                 _logger.warning(f"Unexpected result type from crawl4ai for {url}: {type(result)}")
-                 results_data.append((url, None))
+                     _logger.warning(f"Unexpected result type from crawl4ai for {url}: {type(result)}")
+                     results_data.append((url, None))
 
-    except ImportError:
-         # Should be caught by _CRAWL4AI_AVAILABLE, but as safeguard
-         _logger.critical("Crawl4AI library import failed unexpectedly during execution.")
-         return [(url, None) for url in url_list]
-    except Exception as e:
-        error_msg = str(e)
-        if "Executable doesn't exist" in error_msg and "playwright" in error_msg.lower():
-             _logger.critical("Playwright browser executable not found. Please install browsers by running: playwright install")
-             return [(url, None) for url in url_list]
-        else:
-            _logger.exception(f"Unexpected error during Crawl4AI execution: {e}")
-            return [(url, None) for url in url_list]
+            break  # Exit retry loop on success
+
+        except playwright._impl._errors.TargetClosedError as e:
+            _logger.warning(f"Attempt {attempt + 1}/{max_retries} failed due to TargetClosedError: {e}")
+            if attempt + 1 == max_retries:
+                _logger.error("Max retries reached. Failing the scraping process.")
+                return [(url, None) for url in url_list]
+            await asyncio.sleep(2)  # Wait before retrying
+
+        except Exception as e:
+            error_msg = str(e)
+            if "Host system is missing dependencies" in error_msg:
+                _logger.critical("Playwright browser dependencies are missing. Please run 'playwright install-deps' to install them.")
+                return [(url, None) for url in url_list]
+            elif "Executable doesn't exist" in error_msg and "playwright" in error_msg.lower():
+                _logger.critical("Playwright browser executable not found. Please run 'playwright install' to install the browsers.")
+                return [(url, None) for url in url_list]
+            else:
+                _logger.exception(f"Unexpected error during Crawl4AI execution: {e}")
+                return [(url, None) for url in url_list]
 
 
     _logger.info(f"Direct Crawl4AI scraping finished for {len(url_list)} URL(s).")
@@ -265,6 +278,7 @@ async def _process_single_scrape_job(request: Dict[str, Any], manager: RedisQueu
             "updated_at": time.time()
         }
         manager.store_result(job_id, result_payload)
+        _logger.debug(f"Updated job {job_id} status to 'completed' in Redis.")
         _logger.info(f"Scrape job {job_id} completed successfully.")
         manager.complete_request(request, success=True)
 

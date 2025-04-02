@@ -250,13 +250,15 @@ def create_story_task(topic: str, sources_folder: Optional[str] = None,
             _logger.error("Redis is enabled but currently unavailable. Cannot queue task.")
             raise ConnectionError("Redis service unavailable, cannot queue task.")
 
-        # Data payload for the worker
         task_data_payload = {
-            "task_id": task_id,
-            "topic": topic,
-            "sources_folder": sources_folder,
-            "voice_id": voice_id,
-            "request_time": time.time()
+            "id": task_id,
+            "data": {
+                "task_id": task_id,
+                "topic": topic,
+                "sources_folder": sources_folder,
+                "voice_id": voice_id,
+                "request_time": time.time()
+            }
         }
         # Queue using RedisManager's method
         success = redis_manager.add_request(task_data_payload)
