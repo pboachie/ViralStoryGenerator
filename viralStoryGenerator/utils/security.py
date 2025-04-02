@@ -73,8 +73,7 @@ def is_file_in_directory(file_path: str, directory: str) -> bool:
         abs_file_path = os.path.realpath(os.path.abspath(file_path))
 
         # Check if the file's path starts with the directory's path
-        return os.path.commonprefix([abs_file_path, abs_directory]) == abs_directory
-        # return os.path.commonpath([abs_file_path, abs_directory]) == abs_directory
+        return os.path.commonpath([abs_file_path, abs_directory]) == abs_directory
     except Exception as e:
          _logger.error(f"Error checking file path {file_path} in directory {directory}: {e}")
          return False
