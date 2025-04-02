@@ -260,7 +260,8 @@ async def _process_single_scrape_job(request: Dict[str, Any], manager: RedisQueu
 
     result_payload = {}
     try:
-        if not urls: raise ValueError("No URLs found in scrape job data.")
+        if not urls:
+            raise ValueError("No URLs found in scrape job data.")
 
         # Convert dicts back to Pydantic models if needed by scrape_urls
         browser_config = BrowserConfig(**browser_config_dict) if browser_config_dict else None
@@ -291,4 +292,5 @@ async def _process_single_scrape_job(request: Dict[str, Any], manager: RedisQueu
             "updated_at": time.time()
         }
         manager.store_result(job_id, result_payload)
+        _logger.debug(f"Updated job {job_id} status to 'failed' in Redis.")
         manager.complete_request(request, success=False)
