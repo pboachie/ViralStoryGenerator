@@ -31,6 +31,8 @@ class RedisManager:
         self.password = password or app_config.redis.PASSWORD # Handles None password correctly
         self.queue_name = queue_name or app_config.redis.QUEUE_NAME
         self.result_prefix = result_prefix or app_config.redis.RESULT_PREFIX
+        if not self.result_prefix.endswith(":"):
+            self.result_prefix += ":"
         self.ttl = ttl if ttl is not None else app_config.redis.TTL # Time-to-live for result keys
 
         self.processing_queue_name = f"{self.queue_name}_processing" # Standard name for processing items
@@ -212,14 +214,18 @@ class RedisManager:
     def get_result(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Retrieves the result/status data for a job."""
         if not self.client: return None
+
         result_key = f"{self.result_prefix}{job_id}"
         result_json = self._execute_command(self.client.get, result_key)
         if result_json:
             try:
                 return json.loads(result_json)
             except json.JSONDecodeError as e:
-                 _logger.error(f"Failed to decode result JSON for job {job_id}: {e}")
-                 return {"status": "error", "error": "Failed to decode stored result data."}
+                _logger.error(f"Failed to decode result JSON for job {job_id}: {e}")
+                return {"status": "error", "error": "Failed to decode stored result data."}
+        elif self.check_key_exists(job_id):
+            _logger.warning(f"Job {job_id} exists but has no result data yet.")
+            return {"status": "pending", "message": "Job exists but no result data available."}
         return None
 
     get_task_status = get_result
@@ -227,6 +233,7 @@ class RedisManager:
     def check_key_exists(self, job_id: str) -> bool:
          """Checks if the result key exists for a job."""
          if not self.client: return False
+
          result_key = f"{self.result_prefix}{job_id}"
          exists = self._execute_command(self.client.exists, result_key)
          return bool(exists)
