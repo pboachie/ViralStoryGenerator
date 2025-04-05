@@ -135,7 +135,7 @@ def _summarize_chunk(chunk: str, endpoint: str, model: str, temperature: float) 
         "model": model,
         "messages": [{"role": "user", "content": f"Summarize this text concisely:\n\n{chunk}"}],
         "temperature": temperature,
-        "max_tokens": 1024
+        "max_tokens": appconfig.llm.MAX_TOKENS
     }
     _logger.debug(f"Sending chunk (length: {len(chunk)}) to LLM for summarization. Payload: {payload}")
     try:
