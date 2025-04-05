@@ -5,9 +5,10 @@ import json
 import re
 import hashlib
 import shelve
-from viralStoryGenerator.src.logger import logger as _logger
 
-# Define cache database filename
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Define a persistent cache database filename.
 CACHE_DB = "chunk_summary_cache.db"
 APP_USER_AGENT = f"{appconfig.APP_TITLE}/{appconfig.VERSION}"
 
