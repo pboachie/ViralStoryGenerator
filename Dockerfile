@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
@@ -31,6 +32,8 @@ ENV PYTHONUNBUFFERED=1
 ENV REDIS_HOST=redis
 ENV REDIS_PORT=6379
 ENV REDIS_ENABLED=True
+
+# RUN mkdir -p /app/vector_db && chown -R <user>:<group> /app/vector_db # Might be needed depending on base image user
 
 # Expose the port the app runs on
 EXPOSE 8000
