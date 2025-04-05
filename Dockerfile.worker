@@ -10,17 +10,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gnupg \
     wget \
+    && curl -fsSL https://deb.nodesource.com/setup_16.x | bash - \
+    && apt-get update \
+    && apt-get install -y nodejs \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Install Node.js (required for Playwright)
-RUN curl -fsSL https://deb.nodesource.com/setup_16.x | bash - && \
-    apt-get update && \
-    apt-get install -y nodejs && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies and Playwright
 RUN pip install --no-cache-dir -r requirements.txt && \
-    playwright install-deps && \
+    playwright install --with-deps && \
     python -m playwright install
 
 # Copy application code
@@ -34,6 +31,10 @@ ENV PYTHONUNBUFFERED=1
 ENV REDIS_HOST=redis
 ENV REDIS_PORT=6379
 ENV REDIS_ENABLED=True
+# Add scrape-specific env vars if reading from environment in config.py
+# ENV REDIS_SCRAPE_QUEUE_NAME=viralstory_scrape_queue
+# ENV REDIS_SCRAPE_RESULT_PREFIX=viralstory_scrape_results:
 
 # Command to run the worker
-CMD ["python", "-m", "viralStoryGenerator.bin.start_queue_worker"]
+# CMD ["python", "-m", "viralStoryGenerator.bin.start_queue_worker"]
+CMD ["python", "-m", "viralStoryGenerator.src.scrape_worker"]
