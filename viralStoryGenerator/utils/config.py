@@ -35,7 +35,7 @@ class config:
     class elevenLabs:
         API_KEY: Optional[str] = os.environ.get("ELEVENLABS_API_KEY")
         VOICE_ID: Optional[str] = os.environ.get("ELEVENLABS_VOICE_ID")
-
+        ENABLED: bool = os.environ.get("ENABLE_AUDIO_GENERATION", "True").lower() in ["true", "1", "yes"]
     class llm:
         CHUNK_SIZE: int = int(os.environ.get("LLM_CHUNK_SIZE", 1000))
         ENDPOINT: Optional[str] = os.environ.get("LLM_ENDPOINT")
@@ -46,6 +46,7 @@ class config:
 
     class openAI:
         API_KEY: Optional[str] = os.environ.get("OPENAI_API_KEY") # Used for DALL-E
+        ENABLED: bool = os.environ.get("ENABLE_IMAGE_GENERATION", "True").lower() in ["true", "1", "yes"]
 
     class httpOptions:
         TIMEOUT: int = int(os.environ.get("HTTP_TIMEOUT", 90))
@@ -167,6 +168,14 @@ class config:
         # Base path for allowed source material folders. Crucial for preventing traversal.
         SOURCE_MATERIALS_PATH: str = os.path.abspath(os.environ.get("SOURCE_MATERIALS_PATH", "./data/sources"))
 
+    class rag:
+        ENABLED: bool = os.environ.get("RAG_ENABLED", "True").lower() in ["true", "1", "yes"]
+        EMBEDDING_MODEL: str = os.environ.get("RAG_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        VECTOR_DB_PATH: str = os.path.abspath(os.environ.get("RAG_VECTOR_DB_PATH", "./vector_db"))
+        RELEVANT_CHUNKS_COUNT: int = int(os.environ.get("RAG_RELEVANT_CHUNKS_COUNT", 5))
+        CHUNK_SIZE: int = int(os.environ.get("RAG_CHUNK_SIZE", 500)) # Chunks for RAG can often be smaller
+        CHUNK_OVERLAP: int = int(os.environ.get("RAG_CHUNK_OVERLAP", 50))
+
 
 # --- Configuration Validation ---
 def validate_config_on_startup(cfg: config):
@@ -200,8 +209,17 @@ def validate_config_on_startup(cfg: config):
              _config_logger.warning("SSL_ENABLED is true, but SSL_CERT_FILE or SSL_KEY_FILE is missing. SSL might not function correctly (unless handled by proxy).")
 
     # --- Service Dependency Checks ---
-    if cfg.elevenLabs.VOICE_ID and not cfg.elevenLabs.API_KEY:
-         _config_logger.warning("ELEVENLABS_VOICE_ID is set, but ELEVENLABS_API_KEY is missing. Audio generation will likely fail.")
+    if cfg.elevenLabs.ENABLED and not cfg.elevenLabs.API_KEY: # Check if enabled AND key missing
+         _config_logger.warning("Audio generation (ENABLE_AUDIO_GENERATION) is TRUE, but ELEVENLABS_API_KEY is missing. Audio generation will fail.")
+    elif not cfg.elevenLabs.ENABLED:
+         _config_logger.info("Audio generation via ElevenLabs is globally disabled (ENABLE_AUDIO_GENERATION=False).")
+
+
+    if cfg.openAI.ENABLED and not cfg.openAI.API_KEY: # Check if enabled AND key missing
+        _config_logger.warning("Image generation (ENABLE_IMAGE_GENERATION) is TRUE, but OPENAI_API_KEY is missing. DALL-E image generation for storyboards will fail.")
+    elif not cfg.openAI.ENABLED:
+         _config_logger.info("Image generation via DALL-E is globally disabled (ENABLE_IMAGE_GENERATION=False).")
+
 
     if not cfg.llm.ENDPOINT or not cfg.llm.MODEL:
         _config_logger.warning("LLM_ENDPOINT or LLM_MODEL is not configured. Story generation will likely fail.")
@@ -238,7 +256,17 @@ def validate_config_on_startup(cfg: config):
                 _config_logger.error(f"Configuration Error: {name} ({path}) is not inside LOCAL_STORAGE_PATH ({local_base}). This might indicate misconfiguration or a security risk.")
                 # raise ConfigError(f"{name} path is outside the configured local storage base path.")
 
+    # --- RAG Checks ---
+    if cfg.rag.ENABLED:
+        if not os.path.exists(cfg.rag.VECTOR_DB_PATH):
+            _config_logger.warning(f"RAG Vector DB path does not exist: {cfg.rag.VECTOR_DB_PATH}. Attempting to create.")
+            try:
+                os.makedirs(cfg.rag.VECTOR_DB_PATH, exist_ok=True)
+            except OSError as e:
+                _config_logger.error(f"Failed to create RAG Vector DB directory: {e}")
+
     _config_logger.info("Configuration validation complete.")
 
 
 app_config = config()
+validate_config_on_startup(app_config)
