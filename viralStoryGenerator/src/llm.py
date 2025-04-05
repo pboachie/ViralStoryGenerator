@@ -227,7 +227,6 @@ def generate_story_script(topic: str,
         "raw_output": ""
     }
 
-    start_time = time.time()
     try:
         response = _make_llm_request(endpoint, model, messages, temperature, appconfig.llm.MAX_TOKENS)
         result["generation_time"] = time.time() - start_time
