@@ -5,10 +5,9 @@ import json
 import re
 import hashlib
 import shelve
+from viralStoryGenerator.src.logger import logger as _logger
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-# Define a persistent cache database filename.
+# Define cache database filename
 CACHE_DB = "chunk_summary_cache.db"
 APP_USER_AGENT = f"{appconfig.APP_TITLE}/{appconfig.VERSION}"
 
@@ -72,6 +71,7 @@ def cleanse_sources(raw_sources: str, endpoint: str, model: str, temperature: fl
         return None
     except requests.exceptions.RequestException as e:
         _logger.error(f"Error calling the LLM for source cleansing: {e}")
+        _logger.error(f"Error calling the LLM for source cleansing: {e}")
         # Fallback: just return raw sources if something went wrong
         return raw_sources
 
@@ -87,8 +87,10 @@ def cleanse_sources_cached(raw_sources: str, endpoint: str, model: str, temperat
     with shelve.open(CACHE_DB) as cache:
         if cache_key in cache:
             _logger.info("Cache hit for the current source text. Using cached summary.")
+            _logger.info("Cache hit for the current source text. Using cached summary.")
             return cache[cache_key]
         else:
+            _logger.info("Cache miss. Calling LLM for source cleansing.")
             _logger.info("Cache miss. Calling LLM for source cleansing.")
             summary = cleanse_sources(raw_sources, endpoint, model, temperature)
             cache[cache_key] = summary
@@ -139,8 +141,10 @@ def chunkify_and_summarize(raw_sources: str, endpoint: str, model: str,
 
     # Summarize each chunk individually
     _logger.info(f"Splitting sources into {len(chunks)} chunks (chunk_size={chunk_size} words).")
+    _logger.info(f"Splitting sources into {len(chunks)} chunks (chunk_size={chunk_size} words).")
     partial_summaries = []
     for i, chunk in enumerate(chunks, start=1):
+        _logger.info(f"Summarizing chunk {i} of {len(chunks)}...")
         _logger.info(f"Summarizing chunk {i} of {len(chunks)}...")
         chunk_summary = cleanse_sources_cached(chunk, endpoint, model, temperature)
         if chunk_summary is None:
@@ -149,6 +153,7 @@ def chunkify_and_summarize(raw_sources: str, endpoint: str, model: str,
         partial_summaries.append(chunk_summary)
 
     # Now unify all chunk-level summaries into one final text
+    _logger.info("Merging chunk summaries into one final summary...")
     _logger.info("Merging chunk summaries into one final summary...")
     all_partial_text = "\n\n".join(partial_summaries)
     final_summary = cleanse_sources_cached(all_partial_text, endpoint, model, temperature)
