@@ -5,11 +5,8 @@ import json
 import re
 import hashlib
 import shelve
-import time
-from typing import List, Optional
 
-from viralStoryGenerator.src.logger import logger as _logger
-from viralStoryGenerator.utils.config import config as appconfig
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Define cache database filename
 CACHE_DB = "chunk_summary_cache.db"
@@ -74,37 +71,28 @@ def cleanse_sources(raw_sources: str, endpoint: str, model: str, temperature: fl
         _logger.error(f"LLM request timed out during source cleansing to {endpoint}.")
         return None
     except requests.exceptions.RequestException as e:
-        _logger.error(f"Error calling LLM for source cleansing: {e}")
-        return None
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-         _logger.error(f"Failed to parse LLM response during source cleansing: {e}")
-         return None
+        logging.error(f"Error calling the LLM for source cleansing: {e}")
+        # Fallback: just return raw sources if something went wrong
+        return raw_sources
+
+    response_json = response.json()
+    summary = response_json["choices"][0]["message"]["content"].strip()
+
+    return summary
 
 
 def cleanse_sources_cached(raw_sources: str, endpoint: str, model: str, temperature: float = 0.7) -> Optional[str]:
     """Wraps cleanse_sources() with a persistent cache. Returns None on failure."""
     cache_key = get_cache_key(raw_sources, model, temperature)
-    summary = None
-    try:
-        # Use context manager for shelve
-        with shelve.open(CACHE_DB) as cache:
-            if cache_key in cache:
-                _logger.info(f"Cache hit for source cleansing (key: {cache_key[:8]}...).")
-                summary = cache[cache_key]
-            else:
-                _logger.info("Cache miss for source cleansing. Calling LLM.")
-                summary = cleanse_sources(raw_sources, endpoint, model, temperature)
-                if summary is not None:
-                    cache[cache_key] = summary
-                    _logger.debug(f"Cached cleansing result for key {cache_key[:8]}...")
-                else:
-                    _logger.error("LLM cleansing failed, not caching result.")
-    except Exception as e:
-        _logger.error(f"Failed to open or access cache file '{CACHE_DB}': {e}")
-        _logger.warning("Falling back to non-cached source cleansing due to cache error.")
-        summary = cleanse_sources(raw_sources, endpoint, model, temperature)
-
-    return summary
+    with shelve.open(CACHE_DB) as cache:
+        if cache_key in cache:
+            logging.info("Cache hit for the current source text. Using cached summary.")
+            return cache[cache_key]
+        else:
+            logging.info("Cache miss. Calling LLM for source cleansing.")
+            summary = cleanse_sources(raw_sources, endpoint, model, temperature)
+            cache[cache_key] = summary
+            return summary
 
 
 def _chunk_text_by_words(text: str, chunk_size: int = 1500) -> List[str]:
@@ -150,22 +138,18 @@ def chunkify_and_summarize(raw_sources: str, endpoint: str, model: str,
         return cleanse_sources_cached(chunks[0], endpoint, model, temperature)
 
     # Summarize each chunk individually
-    _logger.info(f"Splitting sources into {len(chunks)} chunks (size ~{chunk_size} words). Summarizing chunks...")
+    logging.info(f"Splitting sources into {len(chunks)} chunks (chunk_size={chunk_size} words).")
     partial_summaries = []
     for i, chunk in enumerate(chunks, start=1):
-        _logger.info(f"Summarizing chunk {i}/{len(chunks)}...")
+        logging.info(f"Summarizing chunk {i} of {len(chunks)}...")
         chunk_summary = cleanse_sources_cached(chunk, endpoint, model, temperature)
         if chunk_summary is None:
             _logger.error(f"Failed to summarize chunk {i}. Aborting multi-chunk summarization.")
             return None
         partial_summaries.append(chunk_summary)
 
-    # Unify chunk summaries
-    _logger.info("Merging chunk summaries into final summary...")
-    if not partial_summaries:
-        _logger.error("No partial summaries generated, cannot merge.")
-        return None
-
+    # Now unify all chunk-level summaries into one final text
+    logging.info("Merging chunk summaries into one final summary...")
     all_partial_text = "\n\n".join(partial_summaries)
     final_summary = cleanse_sources_cached(all_partial_text, endpoint, model, temperature)
 

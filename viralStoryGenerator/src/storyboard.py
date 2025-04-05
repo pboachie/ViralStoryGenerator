@@ -11,23 +11,11 @@ from typing import Dict, Any, Optional
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
 from viralStoryGenerator.prompts.prompts import get_storyboard_prompt
 from viralStoryGenerator.src.logger import logger as _logger
-from viralStoryGenerator.utils.config import config as appconfig
-from viralStoryGenerator.utils.security import is_safe_filename
+from viralStoryGenerator.utils import config
 
-APP_USER_AGENT = f"{appconfig.APP_TITLE}/{appconfig.VERSION}"
+appconfig = config.config
 
-# Helper function to sanitize topic for use in filenames
-def sanitize_for_filename(text: str, max_length: int = 100) -> str:
-    """Removes unsafe characters and shortens text for use in filenames."""
-    if not text:
-        return "untitled"
-    sanitized = re.sub(r'[\\/*?:"<>|\0]', '_', text)
-    sanitized = re.sub(r'[\s_]+', '_', sanitized)
-    sanitized = sanitized.strip('._ ')
-    sanitized = sanitized[:max_length]
-    return sanitized if sanitized else "sanitized_topic"
-
-def generate_storyboard_structure(story: str, llm_endpoint: str, model: str, temperature: float) -> Optional[Dict[str, Any]]:
+def generate_storyboard_structure(story, llm_endpoint, model, temperature):
     """
     Uses the LLM to produce a storyboard breakdown in JSON format.
     Includes basic error handling and parsing.
