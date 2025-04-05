@@ -27,15 +27,16 @@ class RedisManager:
         # Use provided args or fall back to config
         self.host = host or app_config.redis.HOST
         self.port = port or app_config.redis.PORT
-        self.db = db if db is not None else app_config.redis.DB # Allow db=0
-        self.password = password or app_config.redis.PASSWORD # Handles None password correctly
+        self.db = db if db is not None else app_config.redis.DB
+        self.password = password or app_config.redis.PASSWORD
         self.queue_name = queue_name or app_config.redis.QUEUE_NAME
         self.result_prefix = result_prefix or app_config.redis.RESULT_PREFIX
         if not self.result_prefix.endswith(":"):
             self.result_prefix += ":"
-        self.ttl = ttl if ttl is not None else app_config.redis.TTL # Time-to-live for result keys
+        self.ttl = ttl if ttl is not None else app_config.redis.TTL
 
         self.processing_queue_name = f"{self.queue_name}_processing" # Standard name for processing items
+        self.lock_prefix = f"{self.queue_name}_lock:" # Prefix for job locks
 
         self.client: Optional[redis.Redis] = None
         self._connect()
@@ -122,50 +123,121 @@ class RedisManager:
         """Atomically gets the next request from main queue and moves it to processing queue."""
         if not self.client: return None
 
-        # BRPOPLPUSH blocks until item available or timeout (timeout=1 second)
-        item_json = self._execute_command(
-            self.client.brpoplpush, self.queue_name, self.processing_queue_name, timeout=1
-        )
+        # Use a Lua script for atomic operations
+        # This script pops an item from the queue, checks if it's being processed,
+        # and if not, adds a lock and moves it to the processing queue
+        lua_script = """
+        local item = redis.call('RPOP', KEYS[1])
+        if not item then
+            return nil
+        end
 
-        if not item_json:
-            return None
+        -- Try to parse JSON to get the job ID
+        local success, job = pcall(function() return cjson.decode(item) end)
+        if not success then
+            -- If can't parse, still process with a generated ID
+            local lock_key = KEYS[3] .. "unknown_" .. math.random(100000)
+            redis.call('LPUSH', KEYS[2], item)
+            redis.call('SET', lock_key, 1, 'EX', 300)
+            return item
+        end
+
+        -- Check if there's already a lock for this job
+        local job_id = job["id"] or "unknown"
+        local lock_key = KEYS[3] .. job_id
+        local is_locked = redis.call('EXISTS', lock_key)
+
+        if is_locked == 1 then
+            -- Job already being processed, put back in queue
+            redis.call('RPUSH', KEYS[1], item)
+            return nil
+        end
+
+        -- Set the lock and move to processing queue
+        redis.call('SET', lock_key, 1, 'EX', 300)  -- 5 minute lock expiry
+        redis.call('LPUSH', KEYS[2], item)
+        return item
+        """
 
         try:
-            request = json.loads(item_json)
-            request['_processing_start_time'] = time.time()
-            request['_original_data'] = item_json
-            _logger.debug(f"Moved job {request.get('id')} to processing queue '{self.processing_queue_name}'.")
-            return request
-        except json.JSONDecodeError as e:
-            _logger.error(f"Failed to decode JSON from queue item: {e}. Item: {item_json[:100]}...")
-            removed = self._execute_command(self.client.lrem, self.processing_queue_name, 0, item_json)
-            _logger.warning(f"Removed invalid JSON item from processing queue (removed: {removed}).")
-            return None
+            # Register the script once
+            if not hasattr(self, '_get_next_script'):
+                self._get_next_script = self.client.register_script(lua_script)
 
+            # Execute the script with keys
+            item_json = self._get_next_script(
+                keys=[self.queue_name, self.processing_queue_name, self.lock_prefix],
+                args=[]
+            )
 
-    def complete_request(self, request: Dict[str, Any], success: bool):
-        """Removes a completed/failed request from the processing queue."""
+            if not item_json:
+                return None
+
+            try:
+                request = json.loads(item_json)
+                request['_processing_start_time'] = time.time()
+                request['_original_data'] = item_json
+                job_id = request.get('id', 'unknown')
+                _logger.debug(f"Moved job {job_id} to processing queue '{self.processing_queue_name}'.")
+                return request
+            except json.JSONDecodeError as e:
+                _logger.error(f"Failed to decode JSON from queue item: {e}. Item: {item_json[:100]}...")
+                removed = self._execute_command(self.client.lrem, self.processing_queue_name, 0, item_json)
+                _logger.warning(f"Removed invalid JSON item from processing queue (removed: {removed}).")
+                return None
+
+        except Exception as e:
+            _logger.exception(f"Error in get_next_request: {e}")
+
+            # Fallback to the old method if the Lua script fails
+            item_json = self._execute_command(
+                self.client.brpoplpush, self.queue_name, self.processing_queue_name, timeout=1
+            )
+
+            if not item_json:
+                return None
+
+            try:
+                request = json.loads(item_json)
+                request['_processing_start_time'] = time.time()
+                request['_original_data'] = item_json
+                _logger.debug(f"Moved job {request.get('id')} to processing queue '{self.processing_queue_name}'.")
+                return request
+            except json.JSONDecodeError as e:
+                _logger.error(f"Failed to decode JSON from queue item: {e}. Item: {item_json[:100]}...")
+                removed = self._execute_command(self.client.lrem, self.processing_queue_name, 0, item_json)
+                _logger.warning(f"Removed invalid JSON item from processing queue (removed: {removed}).")
+                return None
+
+    def complete_request(self, request: Dict[str, Any], success: bool, next_status: Optional[str] = None):
+        """Removes a completed/failed request from the processing queue and optionally updates its status."""
         if not self.client or not isinstance(request, dict): return False
 
         original_data = request.get('_original_data')
         job_id = request.get('id', 'unknown')
+
         if not original_data:
             _logger.error(f"Cannot complete job {job_id}: missing '_original_data' for removal.")
             return False
+
+        # Remove the lock for this job
+        lock_key = f"{self.lock_prefix}{job_id}"
+        self._execute_command(self.client.delete, lock_key)
 
         # Remove the specific item from the processing queue
         removed_count = self._execute_command(self.client.lrem, self.processing_queue_name, 0, original_data)
 
         if removed_count is not None and removed_count > 0:
-             _logger.debug(f"Completed job {job_id} (success={success}). Removed from processing queue.")
-             return True
+            _logger.debug(f"Completed job {job_id} (success={success}). Removed from processing queue.")
+            if next_status:
+                self.update_task_status(job_id, next_status)
+            return True
         elif removed_count == 0:
-             _logger.warning(f"Job {job_id} (success={success}) not found in processing queue for completion (already removed?).")
-             return False # Indicate item wasn't found/removed
+            _logger.warning(f"Job {job_id} (success={success}) not found in processing queue for completion (already removed?).")
+            return False 
         else:
-             _logger.error(f"Failed to remove job {job_id} (success={success}) from processing queue.")
-             return False
-
+            _logger.error(f"Failed to remove job {job_id} (success={success}) from processing queue.")
+            return False
 
     def store_result(self, job_id: str, result_data: Dict[str, Any], merge: bool = False, ttl: Optional[int] = None) -> bool:
         """Stores job result/status data in Redis with TTL."""
