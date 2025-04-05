@@ -9,7 +9,6 @@ from typing import Tuple, Dict, Optional
 from viralStoryGenerator.prompts.prompts import get_system_instructions, get_user_prompt, get_fix_prompt
 from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.utils.config import config as appconfig
-from viralStoryGenerator.utils.config import config as appconfig
 
 STORY_PATTERN = re.compile(r"(?s)### Story Script:\s*(.*?)\n### Video Description:")
 DESC_PATTERN = re.compile(r"### Video Description:\s*(.*)$")
