@@ -20,10 +20,13 @@ from viralStoryGenerator.utils.redis_manager import RedisManager as RedisQueueMa
 from viralStoryGenerator.utils.crawl4ai_scraper import get_scrape_result, queue_scrape_request, redis_manager as scraper_redis_manager
 from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.src.llm import process_with_llm
-from viralStoryGenerator.src.source_cleanser import chunkify_and_summarize
 from viralStoryGenerator.src.storyboard import generate_storyboard
 from viralStoryGenerator.src.elevenlabs_tts import generate_audio
 from viralStoryGenerator.src.logger import logger as _logger
+from viralStoryGenerator.utils.text_processing import split_text_into_chunks
+from viralStoryGenerator.utils.vector_db_manager import add_chunks_to_collection, query_collection, delete_collection, close_client as close_vector_db
+from viralStoryGenerator.utils.crawl4ai_scraper import close_scraper_redis_connections
+
 # TODO: Import storage manager needed for potential file URL construction? Maybe not needed directly here.
 # from viralStoryGenerator.utils.storage_manager import storage_manager
 
@@ -42,12 +45,7 @@ def handle_shutdown(sig, frame):
 
 async def process_story_request(job_id: str, request_data: Dict[str, Any], queue_manager: RedisQueueManager):
     """
-    Processes a single story generation request.
-
-    Args:
-        job_id: Unique identifier for the job.
-        request_data: Request data containing URLs, topic, and parameters.
-        queue_manager: Redis queue manager instance.
+    Processes a single story generation request using RAG.
     """
     start_time = time.time()
     _logger.info(f"Processing Job {job_id}: Starting story generation for topic '{request_data.get('topic', 'N/A')}'")
@@ -72,8 +70,13 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
     topic = request_data["topic"]
     generate_audio_flag = request_data.get("generate_audio", False)
     temperature = request_data.get("temperature", app_config.llm.TEMPERATURE)
-    chunk_size = request_data.get("chunk_size", app_config.llm.CHUNK_SIZE)
+    rag_chunk_size = app_config.rag.CHUNK_SIZE
+    rag_chunk_overlap = app_config.rag.CHUNK_OVERLAP # TODO: Currently not used by basic split_text_into_chunks
+    rag_relevant_chunks_count = app_config.rag.RELEVANT_CHUNKS_COUNT
     voice_id = request_data.get("voice_id", app_config.elevenLabs.VOICE_ID)
+
+    # Define collection name based on job_id for isolation
+    collection_name = f"job_{job_id.replace('-', '')}" # ChromaDB names need specific format
 
     try:
         # 1. Update Status: Processing Start
@@ -122,47 +125,62 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
 
         _logger.info(f"Job {job_id}: Successfully scraped content from {len(valid_content_list)} URL(s).")
         scraped_urls = [url for url, _ in valid_content_list]
-
-        # 3. Cleanse Content with Retry Mechanism
-        queue_manager.store_result(job_id, {"message": "Cleansing and summarizing content...", "updated_at": time.time()}, merge=True, ttl=RESULT_TTL)
         combined_raw_content = "\n\n".join([content for _, content in valid_content_list])
-        _logger.info(f"Job {job_id}: Cleansing content (length: {len(combined_raw_content)} chars)...")
 
-        max_chunk_retries = 3
-        cleansed_content = None
-        for attempt in range(max_chunk_retries):
-            try:
-                cleansed_content = chunkify_and_summarize(
-                    raw_sources=combined_raw_content,
-                    endpoint=app_config.llm.ENDPOINT,
-                    model=app_config.llm.MODEL,
-                    temperature=temperature,
-                    chunk_size=chunk_size
-                )
-                if cleansed_content is None:
-                    raise ValueError("Content cleansing and summarization failed.")
-                break  # Exit retry loop on success
-            except Exception as e:
-                _logger.error(f"Job {job_id}: Error during content cleansing (Attempt {attempt + 1}/{max_chunk_retries}): {e}")
-                if attempt + 1 == max_chunk_retries:
-                    raise
-                await asyncio.sleep(2)  # Wait before retrying
+        # 3. RAG - Chunk, Embed, and Store Content TODO: Move to separate function
+        queue_manager.store_result(job_id, {"message": "Chunking and embedding content...", "updated_at": time.time()}, merge=True, ttl=RESULT_TTL)
+        _logger.info(f"Job {job_id}: Chunking content (length: {len(combined_raw_content)} chars) for RAG...")
 
-        if cleansed_content is None:
-            raise ValueError("Content cleansing failed after retries.")
+        # Use the text processing utility to chunk the combined content
+        # TODO: Consider using a more sophisticated chunking strategy if needed (e.g., LangChain's text splitters)
+        chunks = split_text_into_chunks(combined_raw_content, rag_chunk_size) # Use RAG chunk size
+        if not chunks:
+             _logger.warning(f"Job {job_id}: No chunks generated from scraped content.")
+             # TODO: Decide how to proceed - fail or try generating story without context?
+             raise ValueError("Failed to generate text chunks from scraped content.")
 
-        _logger.info(f"Job {job_id}: Content cleansed (new length: {len(cleansed_content)} chars).")
+        _logger.info(f"Job {job_id}: Generated {len(chunks)} chunks. Storing in vector DB collection '{collection_name}'...")
 
-        # 4. Generate Story Script using LLM
+        # Prepare data for ChromaDB (Considering others)
+        doc_ids = [f"{job_id}_chunk_{i}" for i in range(len(chunks))]
+        metadatas = [{"source_url": url, "chunk_index": i} for i, chunk in enumerate(chunks) for url, content in valid_content_list if chunk in content] # Simple metadata, might need refinement
+        # Ensure metadatas length matches chunks length (TODO: handle cases where chunk might span multiple sources if not careful)
+        if len(metadatas) != len(chunks):
+             _logger.warning(f"Job {job_id}: Metadata length mismatch ({len(metadatas)}) vs chunk length ({len(chunks)}). Using basic metadata.")
+             metadatas = [{"chunk_index": i} for i in range(len(chunks))]
+
+        # Add chunks to the vector database collection
+        add_success = add_chunks_to_collection(collection_name, chunks, metadatas, doc_ids)
+        if not add_success:
+             raise RuntimeError(f"Failed to add chunks to vector database for job {job_id}.")
+        _logger.info(f"Job {job_id}: Successfully stored chunks in vector DB.")
+
+        # 4. RAG - Query Vector DB for Relevant Chunks
+        queue_manager.store_result(job_id, {"message": "Retrieving relevant content...", "updated_at": time.time()}, merge=True, ttl=RESULT_TTL)
+        _logger.info(f"Job {job_id}: Querying vector DB for chunks relevant to topic: '{topic}'")
+
+        query_results = query_collection(collection_name, query_texts=[topic], n_results=rag_relevant_chunks_count)
+
+        relevant_content = ""
+        if query_results and query_results.get('documents') and query_results['documents'][0]:
+            relevant_docs = query_results['documents'][0]
+            relevant_content = "\n\n".join(relevant_docs)
+            _logger.info(f"Job {job_id}: Retrieved {len(relevant_docs)} relevant chunks. Combined length: {len(relevant_content)} chars.")
+        else:
+            _logger.warning(f"Job {job_id}: Could not retrieve relevant chunks for topic '{topic}'. Proceeding with empty context.")
+            # TODO: Decide: fail, or proceed with just the topic? Let's proceed for now.
+
+        # 5. Generate Story Script using LLM with Relevant Content
         queue_manager.store_result(job_id, {"message": "Generating story script via LLM...", "updated_at": time.time()}, merge=True, ttl=RESULT_TTL)
-        _logger.info(f"Job {job_id}: Generating story script...")
-        story_script = process_with_llm(topic, cleansed_content, temperature)
+        _logger.info(f"Job {job_id}: Generating story script using relevant content...")
+        # Pass the retrieved relevant content
+        story_script = process_with_llm(topic, relevant_content, temperature) # llm.py might need prompt adjustment
         if not story_script or story_script.isspace():
-            _logger.error(f"Job {job_id}: LLM failed to generate a valid story script.")
+            _logger.error(f"Job {job_id}: LLM failed to generate a valid story script from relevant chunks.")
             raise ValueError("LLM generation resulted in empty script.")
         _logger.info(f"Job {job_id}: Story script generated.")
 
-        # 5. Generate Storyboard
+        # 6. Generate Storyboard
         queue_manager.store_result(job_id, {"message": "Generating storyboard...", "updated_at": time.time()}, merge=True, ttl=RESULT_TTL)
         _logger.info(f"Job {job_id}: Generating storyboard...")
         storyboard_data = generate_storyboard(
@@ -180,61 +198,68 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
              _logger.info(f"Job {job_id}: Storyboard generated with {len(storyboard_data.get('scenes', []))} scenes.")
              storyboard_result = storyboard_data
 
-        # 6. Generate Audio (Optional)
+        # 7. Generate Audio (Optional)
         audio_url_result = None
-        if generate_audio_flag:
-            queue_manager.store_result(job_id, {"message": "Generating audio...", "updated_at": time.time()}, merge=True, ttl=RESULT_TTL)
-            _logger.info(f"Job {job_id}: Generating audio (flag is True)...")
-            try:
-                from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
-                from viralStoryGenerator.utils.storage_manager import storage_manager
+        if generate_audio_flag and app_config.elevenLabs.ENABLED:
+            if not app_config.elevenLabs.API_KEY:
+                 _logger.warning(f"Job {job_id}: Audio generation requested, but ElevenLabs API key is missing in config. Skipping.")
+            elif not story_script:
+                 _logger.warning(f"Job {job_id}: Audio generation requested, but story script is empty. Skipping.")
+            else:
+                queue_manager.store_result(job_id, {"message": "Generating audio...", "updated_at": time.time()}, merge=True, ttl=RESULT_TTL)
+                _logger.info(f"Job {job_id}: Generating audio (request flag is True, global flag is True)...")
+                try:
+                    from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
+                    from viralStoryGenerator.utils.storage_manager import storage_manager
 
-                # Generate a safe filename
-                safe_topic_base = re.sub(r'[\\/*?:"<>|\0]', '_', topic)[:50]
-                audio_filename = f"{job_id}_{safe_topic_base}.mp3"
+                    # Generate a safe filename
+                    safe_topic_base = re.sub(r'[\\/*?:"<>|\0]', '_', topic)[:50]
+                    audio_filename = f"{job_id}_{safe_topic_base}.mp3"
 
-                # Generate audio to a temporary file
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_f:
-                    temp_audio_path = temp_f.name
+                    # Generate audio to a temporary file
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_f:
+                        temp_audio_path = temp_f.name
 
-                success = generate_elevenlabs_audio(
-                    text=story_script,
-                    api_key=app_config.elevenLabs.API_KEY,
-                    output_mp3_path=temp_audio_path,
-                    voice_id=voice_id
-                )
+                    success = generate_elevenlabs_audio(
+                        text=story_script,
+                        api_key=app_config.elevenLabs.API_KEY,
+                        output_mp3_path=temp_audio_path,
+                        voice_id=voice_id
+                    )
 
-                if success:
-                    _logger.info(f"Job {job_id}: Audio generated to temp file {temp_audio_path}.")
-                    with open(temp_audio_path, "rb") as audio_f:
-                        store_info = storage_manager.store_file(
-                            file_data=audio_f,
-                            file_type="audio",
-                            filename=audio_filename,
-                            content_type="audio/mpeg"
-                        )
-                    # Clean up temp file
-                    os.remove(temp_audio_path)
+                    if success:
+                        _logger.info(f"Job {job_id}: Audio generated to temp file {temp_audio_path}.")
+                        with open(temp_audio_path, "rb") as audio_f:
+                            store_info = storage_manager.store_file(
+                                file_data=audio_f,
+                                file_type="audio",
+                                filename=audio_filename,
+                                content_type="audio/mpeg"
+                            )
+                        # Clean up temp file
+                        os.remove(temp_audio_path)
 
-                    if "error" not in store_info:
-                        audio_key = store_info.get("file_path")
-                        audio_url_result = storage_manager.get_file_url(audio_key, "audio")
-                        _logger.info(f"Job {job_id}: Audio stored successfully. URL: {audio_url_result}")
+                        if "error" not in store_info:
+                            audio_key = store_info.get("file_path")
+                            audio_url_result = storage_manager.get_file_url(audio_key, "audio")
+                            _logger.info(f"Job {job_id}: Audio stored successfully. URL: {audio_url_result}")
+                        else:
+                             _logger.error(f"Job {job_id}: Failed to store generated audio: {store_info.get('error')}")
                     else:
-                         _logger.error(f"Job {job_id}: Failed to store generated audio: {store_info.get('error')}")
-                else:
-                     _logger.warning(f"Job {job_id}: Audio generation failed (elevenlabs).")
+                         _logger.warning(f"Job {job_id}: Audio generation failed (elevenlabs).")
 
-            except Exception as audio_err:
-                _logger.exception(f"Job {job_id}: Error during audio generation/storage: {audio_err}")
-            finally:
-                if 'temp_audio_path' in locals() and os.path.exists(temp_audio_path):
-                    try: os.remove(temp_audio_path)
-                    except OSError: pass
-        else:
-             _logger.info(f"Job {job_id}: Skipping audio generation (flag is False).")
+                except Exception as audio_err:
+                    _logger.exception(f"Job {job_id}: Error during audio generation/storage: {audio_err}")
+                finally:
+                    if 'temp_audio_path' in locals() and os.path.exists(temp_audio_path):
+                        try: os.remove(temp_audio_path)
+                        except OSError: pass
+        elif not app_config.elevenLabs.ENABLED:
+             _logger.info(f"Job {job_id}: Skipping audio generation (globally disabled via ENABLE_AUDIO_GENERATION=False).")
+        else: # generate_audio_flag must be False
+             _logger.info(f"Job {job_id}: Skipping audio generation (request flag is False).")
 
-        # 7. Prepare Final Result
+        # 8. Prepare Final Result
         processing_time = time.time() - start_time
         _logger.info(f"Job {job_id}: Processing successful. Time: {processing_time:.2f}s")
         final_result = JobStatusResponse(
@@ -266,17 +291,23 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
         ).model_dump(exclude_none=True)
         _logger.debug(f"Job {job_id}: Preparing final error result: {final_result}") # DEBUG ADDED
 
-    # 8. Store Final Result in Redis
-    try:
-        _logger.debug(f"Job {job_id}: Attempting to store final result in Redis.") # DEBUG ADDED
-        success = queue_manager.store_result(job_id, final_result, ttl=RESULT_TTL)
-        if not success:
-             _logger.error(f"Job {job_id}: CRITICAL - Failed to store final result in Redis!")
-        else:
-             _logger.debug(f"Job {job_id}: Final result stored in Redis.")
-    except Exception as redis_err:
-         _logger.exception(f"Job {job_id}: CRITICAL - Exception while storing final result in Redis: {redis_err}")
+    finally:
+        # 9. Cleanup Vector DB Collection for this job
+        _logger.info(f"Job {job_id}: Cleaning up vector database collection '{collection_name}'...")
+        delete_success = delete_collection(collection_name)
+        if not delete_success:
+             _logger.warning(f"Job {job_id}: Failed to cleanup vector database collection '{collection_name}'.")
 
+        # 10. Store Final Result in Redis
+        try:
+            _logger.debug(f"Job {job_id}: Attempting to store final result in Redis.") # DEBUG ADDED
+            success = queue_manager.store_result(job_id, final_result, ttl=RESULT_TTL)
+            if not success:
+                 _logger.error(f"Job {job_id}: CRITICAL - Failed to store final result in Redis!")
+            else:
+                 _logger.debug(f"Job {job_id}: Final result stored in Redis.")
+        except Exception as redis_err:
+             _logger.exception(f"Job {job_id}: CRITICAL - Exception while storing final result in Redis: {redis_err}")
 
 async def run_worker():
     """Main worker loop to poll Redis queue and process jobs."""
@@ -396,8 +427,19 @@ async def run_worker():
     # --- Shutdown Sequence ---
     _logger.info("Shutdown signal received. Waiting for active tasks to complete...")
     if active_tasks:
-        await asyncio.wait(active_tasks)
-    _logger.info("All active tasks finished. API Worker exiting.")
+        try:
+            await asyncio.wait_for(asyncio.gather(*active_tasks, return_exceptions=True), timeout=10.0)
+            _logger.info("Active tasks finished or timed out.")
+        except asyncio.TimeoutError:
+            _logger.warning("Timeout waiting for active tasks to complete during shutdown.")
+        except Exception as e:
+            _logger.exception(f"Error waiting for tasks during shutdown: {e}")
+
+    # Close resources
+    _logger.info("Closing Vector DB client...")
+    close_vector_db()
+
+    _logger.info("API Worker exiting.")
 
 
 def main():
@@ -416,6 +458,7 @@ def main():
         _logger.error("Redis is disabled in configuration (REDIS_ENABLED=False). API Worker cannot run.")
         sys.exit(1)
 
+    exit_code = 0
     try:
         asyncio.run(run_worker())
     except KeyboardInterrupt:
@@ -423,10 +466,14 @@ def main():
         _logger.info("API worker stopped by KeyboardInterrupt.")
     except Exception as e:
         _logger.exception(f"API worker failed with unhandled exception: {e}")
-        sys.exit(1)
-
+        exit_code = 1
+    finally:
+        _logger.info("API Worker performing final cleanup...")
+        close_vector_db()
+        close_scraper_redis_connections()
+        time.sleep(0.5)
     _logger.info("API Queue Worker shutdown complete.")
-    sys.exit(0)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

@@ -54,8 +54,8 @@ def generate_storyboard_structure(story: str, llm_endpoint: str, model: str, tem
         ],
         "temperature": temperature,
         "max_tokens": appconfig.llm.MAX_TOKENS,
-        "stream": False
-        # "response_format": {"type": "json_object"}
+        "stream": False,
+        "response_format": {"type": "json_object"}
 
     }
 
@@ -63,7 +63,7 @@ def generate_storyboard_structure(story: str, llm_endpoint: str, model: str, tem
         response = requests.post(
             llm_endpoint,
             headers=headers,
-            json=data,
+            json=json.dumps(data),
             timeout=appconfig.httpOptions.TIMEOUT
         )
         response.raise_for_status()
@@ -231,10 +231,17 @@ def generate_storyboard(story: str, topic: str, llm_endpoint: str, model: str, t
     # Get API keys from config
     openai_api_key = appconfig.openAI.API_KEY
     elevenlabs_api_key = appconfig.elevenLabs.API_KEY
+    image_generation_enabled = appconfig.openAI.ENABLED
+    audio_generation_enabled = appconfig.elevenLabs.ENABLED
 
-    if not openai_api_key:
+    if not image_generation_enabled:
+        _logger.warning("Image generation is globally disabled via config. Skipping DALL-E calls.")
+    elif not openai_api_key:
         _logger.warning("OpenAI API key (for DALL-E) is not configured. Skipping image generation.")
-    if not elevenlabs_api_key:
+
+    if not audio_generation_enabled:
+         _logger.warning("Audio generation is globally disabled via config. Skipping ElevenLabs calls.")
+    elif not elevenlabs_api_key:
         _logger.warning("ElevenLabs API key is not configured. Skipping audio generation.")
 
     cumulative_time = 0.0
@@ -263,24 +270,32 @@ def generate_storyboard(story: str, topic: str, llm_endpoint: str, model: str, t
 
         scene_texts.append(narration_text)
 
-        # Generate scene image
+        # Generate scene image only if enabled globally, key exists, and prompt exists
         scene["image_file"] = ""
-        if openai_api_key and image_prompt:
+        if image_generation_enabled and openai_api_key and image_prompt:
             image_filename = f"{base_filename}_scene_{scene_number}.png"
             image_path = os.path.join(base_folder_path, image_filename)
             try:
                 generated_path = generate_dalle_image(image_prompt, image_path, openai_api_key)
                 if generated_path:
                     scene["image_file"] = os.path.relpath(generated_path, os.path.dirname(base_folder_path))
-                    # Or filename: scene["image_file"] = image_filename
             except Exception as img_e:
                  _logger.error(f"Error generating DALL-E image for scene {scene_number}: {img_e}")
                  # Continue without image for this scene
+        elif not image_generation_enabled:
+             _logger.debug(f"Skipping image generation for scene {scene_number} (globally disabled).")
+        elif not openai_api_key:
+             _logger.debug(f"Skipping image generation for scene {scene_number} (API key missing).")
+
 
     # Combine narration
     combined_narration = "\n\n".join(scene_texts).strip()
     if not combined_narration:
          _logger.warning("Combined narration text is empty. Skipping audio generation.")
+         storyboard_data["audio_file"] = ""
+         storyboard_data["scene_timestamps"] = {}
+    elif not audio_generation_enabled:
+         _logger.info("Audio generation is globally disabled. Skipping audio generation.")
          storyboard_data["audio_file"] = ""
          storyboard_data["scene_timestamps"] = {}
     elif not elevenlabs_api_key:

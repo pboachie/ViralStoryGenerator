@@ -4,7 +4,7 @@ import requests
 import json
 import re
 import time
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, List
 
 from viralStoryGenerator.prompts.prompts import get_system_instructions, get_user_prompt, get_fix_prompt
 from viralStoryGenerator.src.logger import logger as _logger
@@ -18,114 +18,82 @@ THINK_PATTERN = re.compile(r'(<think>.*?</think>)', re.DOTALL)
 # Define a user agent for HTTP requests
 APP_USER_AGENT = f"{appconfig.APP_TITLE}/{appconfig.VERSION}"
 
-def _make_llm_request(endpoint: str, model: str, messages: list, temperature: float, max_tokens: int) -> requests.Response:
+def _make_llm_request(endpoint: str, model: str, messages: List[Dict[str, str]], temperature: float, max_tokens: int) -> requests.Response:
     """Helper function to make the actual HTTP request to the LLM."""
     headers = {
         "Content-Type": "application/json",
         "User-Agent": APP_USER_AGENT
     }
+    effective_max_tokens = min(max_tokens, 8192) # Cap at 8192, adjust if needed
     data = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": max_tokens,
+        "max_tokens": effective_max_tokens,
         "stream": False
     }
-
-    try:
-        response = requests.post(
-            endpoint,
-            headers=headers,
-            data=json.dumps(data),
-            timeout=appconfig.httpOptions.TIMEOUT
-        )
-        response.raise_for_status()
-        return response
-    except requests.exceptions.Timeout:
-        _logger.error(f"LLM request timed out after {appconfig.httpOptions.TIMEOUT} seconds to {endpoint}.")
-        raise
-    except requests.exceptions.ConnectionError as e:
-         _logger.error(f"LLM connection error to {endpoint}: {e}")
-         raise
-    except requests.exceptions.HTTPError as e:
-         _logger.error(f"LLM HTTP error: {e.status_code} {e.response.text[:200]}...")
-         raise
-    except requests.exceptions.RequestException as e:
-        _logger.error(f"An unexpected error occurred during the LLM request: {e}")
-        raise
-
+    _logger.debug(f"Sending request to LLM: {endpoint}, Model: {model}, Temp: {temperature}, MaxTokens: {effective_max_tokens}")
+    response = requests.post(
+        endpoint,
+        headers=headers,
+        json=data,
+        timeout=appconfig.httpOptions.TIMEOUT
+    )
+    response.raise_for_status()
+    return response
 
 def _reformat_text(raw_text: str, endpoint: str, model: str, temperature: float) -> Optional[str]:
-    """
-    Makes a second LLM call to reformat 'raw_text' if the first attempt was off-format.
-    Returns the reformatted text or None if reformatting fails.
-    """
-    _logger.warning("Attempting to reformat LLM output due to incorrect initial format.")
-    fix_prompt = get_fix_prompt(raw_text).strip()
-    messages = [{"role": "user", "content": fix_prompt}]
-
+    """Attempts to reformat LLM output if it doesn't match the expected structure."""
+    _logger.warning("Attempting to reformat LLM output.")
+    messages = [
+        {"role": "system", "content": get_system_instructions()},
+        {"role": "user", "content": get_fix_prompt(raw_text)}
+    ]
     try:
         response = _make_llm_request(endpoint, model, messages, temperature, appconfig.llm.MAX_TOKENS)
         response_json = response.json()
-        content = response_json["choices"][0]["message"]["content"]
-        _logger.info("LLM output successfully reformatted.")
-        return content
-    except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError, IndexError) as e:
-        _logger.error(f"Failed to reformat LLM output: {e}")
+        fixed_text = response_json["choices"][0]["message"]["content"]
+        return fixed_text
+    except Exception as e:
+        _logger.error(f"Reformatting request failed: {e}")
         return None
 
-
 def _check_format(completion_text: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Validates that the text has the expected sections using compiled regex.
-    Returns (story, description) if valid, else (None, None).
-    """
+    """Checks if the text contains the required sections."""
     story_match = STORY_PATTERN.search(completion_text)
     desc_match = DESC_PATTERN.search(completion_text)
-
-    if story_match and desc_match:
-        story = story_match.group(1).strip()
-        description = desc_match.group(1).strip()
-        if story and description:
-            return story, description
-    _logger.debug("LLM output format check failed.")
-    return None, None
-
+    story = story_match.group(1).strip() if story_match else None
+    description = desc_match.group(1).strip() if desc_match else None
+    return story, description
 
 def _extract_chain_of_thought(text: str) -> Tuple[str, str]:
-    """
-    Extracts chain-of-thought block (<think>...</think>) from text.
-    Returns a tuple (clean_text, chain_of_thought).
-    """
-    match = THINK_PATTERN.search(text)
-    chain = ""
-    clean_text = text
-    if match:
-        chain = match.group(1)
-        # Remove the matched block and surrounding whitespace
-        clean_text = THINK_PATTERN.sub('', text).strip()
-        _logger.debug("Extracted chain-of-thought block.")
-    return clean_text, chain
+    """Extracts <think> block and returns cleaned text and thinking block."""
+    think_match = THINK_PATTERN.search(text)
+    if think_match:
+        thinking = think_match.group(1)
+        # Remove the thinking block from the text
+        cleaned_text = THINK_PATTERN.sub('', text).strip()
+        return cleaned_text, thinking
+    return text, ""
 
-
-def process_with_llm(topic: str, cleansed_content: str, temperature: float) -> str:
+def process_with_llm(topic: str, relevant_content: str, temperature: float) -> str:
     """
-    Process the given topic and cleansed content using the LLM to generate a story script.
-    This is used by the api_worker.
+    Process the given topic and relevant content using the LLM to generate a story script.
+    This version is used by the api_worker with RAG.
 
     Args:
         topic: The topic for the story.
-        cleansed_content: The preprocessed content to use for story generation.
+        relevant_content: Relevant content snippets retrieved via RAG.
         temperature: The temperature setting for the LLM.
 
     Returns:
-        The generated story script (raw output from LLM).
+        The generated story script (including description, separated by markers).
 
     Raises:
         requests.exceptions.RequestException: If the LLM request fails.
-        ValueError: If the LLM response is malformed.
+        ValueError: If the LLM response is malformed or required config is missing.
     """
-    _logger.debug(f"Processing with LLM for topic: {topic}")
+    _logger.debug(f"Processing with LLM for topic: {topic} using RAG content.")
 
     # Basic input validation (more complex validation might be needed depending on LLM)
     if not topic:
@@ -138,17 +106,10 @@ def process_with_llm(topic: str, cleansed_content: str, temperature: float) -> s
          _logger.error("LLM processing request failed: LLM_ENDPOINT is not configured.")
          raise ValueError("LLM Endpoint not configured")
 
-
-    # Consider input length limit based on model (e.g., estimate token count)
-    # Simplified check: Warn if content is very long
-    MAX_INPUT_LEN_APPROX = 131072 # Very rough character limit guess
-    if len(cleansed_content) > MAX_INPUT_LEN_APPROX:
-        _logger.warning(f"Input content length ({len(cleansed_content)} chars) is large, may exceed LLM context window.")
-        cleansed_content = cleansed_content[:MAX_INPUT_LEN_APPROX]
-
-    # Prepare messages for the LLM API
+    # Prepare messages for the LLM API using the RAG-aware prompt
     system_prompt = get_system_instructions()
-    user_prompt = get_user_prompt(topic, cleansed_content)
+    # Pass relevant_content to get_user_prompt
+    user_prompt = get_user_prompt(topic, relevant_content)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt}
@@ -163,144 +124,35 @@ def process_with_llm(topic: str, cleansed_content: str, temperature: float) -> s
             appconfig.llm.MAX_TOKENS
         )
         response_json = response.json()
-
-        # Extract content safely
-        story_script = response_json["choices"][0]["message"]["content"]
+        completion_text = response_json["choices"][0]["message"]["content"]
         _logger.debug(f"LLM response received successfully for topic: {topic}")
-        return story_script
+
+        # --- Format Checking and Potential Reformatting ---
+        clean_completion_text, thinking = _extract_chain_of_thought(completion_text) # Extract thinking first
+        story, description = _check_format(clean_completion_text)
+
+        if story is None or description is None:
+            _logger.warning("Initial LLM output format incorrect, attempting reformat...")
+            fixed_text = _reformat_text(clean_completion_text, appconfig.llm.ENDPOINT, appconfig.llm.MODEL, temperature)
+            if fixed_text:
+                clean_fixed_text, _ = _extract_chain_of_thought(fixed_text) # Re-extract thinking if needed
+                story_fixed, description_fixed = _check_format(clean_fixed_text)
+                if story_fixed and description_fixed:
+                    _logger.info("Successfully reformatted LLM output.")
+                    # Return the reformatted text which includes both parts
+                    return clean_fixed_text
+                else:
+                    _logger.error("Reformatting failed to produce the correct structure. Returning original cleaned output.")
+                    return clean_completion_text # Fallback to original cleaned text
+            else:
+                _logger.error("Reformatting request failed. Returning original cleaned output.")
+                return clean_completion_text # Fallback to original cleaned text
+        else:
+            return clean_completion_text # Return text without thinking block
 
     except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-        _logger.error(f"LLM API call failed for topic '{topic}': {e}")
+        _logger.error(f"LLM API call failed for topic '{topic}': {e}", exc_info=True)
         raise
     except (KeyError, IndexError) as e:
-        _logger.error(f"Unexpected response structure from LLM for topic '{topic}': {e}. Response: {response_json}")
+        _logger.error(f"Unexpected response structure from LLM for topic '{topic}': {e}. Response: {response_json if 'response_json' in locals() else 'N/A'}")
         raise ValueError("Malformed response from LLM") from e
-
-
-def generate_story_script(topic: str,
-                          sources: str,
-                          endpoint: str,
-                          model: str,
-                          temperature: float,
-                          show_thinking: bool = False) -> dict:
-    """
-    Sends a request to an LLM to generate the story script and video description.
-    Attempts to ensure the output meets the specified format and extracts metadata.
-    This version is used by the CLI/direct calls.
-
-    Args:
-        topic: The topic for the story.
-        sources: Cleansed source material.
-        endpoint: LLM API endpoint URL.
-        model: Name of the LLM model.
-        temperature: Sampling temperature (0.0-1.0).
-        show_thinking: Whether to extract and include the <think> block.
-
-    Returns:
-        A dictionary containing:
-        - story: Extracted story script (str).
-        - video_description: Extracted video description (str).
-        - thinking: Extracted chain-of-thought (str, empty if not found/disabled).
-        - generation_time: Request duration in seconds (float).
-        - usage: Token usage dictionary from LLM response (dict).
-        - storyboard: Generated storyboard structure (dict, or None if failed - Placeholder).
-        - raw_output: Original full completion text from LLM (str).
-    """
-    _logger.info(f"Generating story script for topic: '{topic}' using model '{model}'")
-
-    # Prepare messages
-    system_instructions = get_system_instructions()
-    user_prompt = get_user_prompt(topic, sources).strip()
-    messages = [
-        {"role": "system", "content": system_instructions},
-        {"role": "user", "content": user_prompt}
-    ]
-
-    # Initialize result structure
-    result = {
-        "story": "",
-        "video_description": "",
-        "thinking": "",
-        "generation_time": 0.0,
-        "usage": {},
-        "storyboard": None,
-        "raw_output": ""
-    }
-
-    start_time = time.time()
-    try:
-        response = _make_llm_request(endpoint, model, messages, temperature, appconfig.llm.MAX_TOKENS)
-        result["generation_time"] = time.time() - start_time
-        response_json = response.json()
-        result["usage"] = response_json.get("usage", {})
-        completion_text = response_json["choices"][0]["message"]["content"]
-        result["raw_output"] = completion_text
-
-    except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError, IndexError) as e:
-        result["generation_time"] = time.time() - start_time # Record time even on failure
-        _logger.error(f"LLM request failed for story generation: {e}")
-        return result
-
-
-    # Extract thinking block if enabled
-    thinking = ""
-    clean_completion_text = completion_text
-    if show_thinking:
-        # Check specific field first if supported by LLM API
-        if response_json["choices"][0]["message"].get("reasoning_content"):
-            thinking = response_json["choices"][0]["message"]["reasoning_content"]
-        else:
-            # Fallback to regex extraction
-            clean_completion_text, thinking = _extract_chain_of_thought(completion_text)
-    result["thinking"] = thinking
-
-    # Check format of the (potentially cleaned) text
-    story, description = _check_format(clean_completion_text)
-
-    # If format is incorrect, attempt reformatting
-    if story is None or description is None:
-        _logger.warning("Initial LLM output format incorrect, attempting reformat...")
-        fixed_text = _reformat_text(clean_completion_text, endpoint, model, temperature)
-
-        if fixed_text:
-            # Re-check format and potentially re-extract thinking
-            clean_fixed_text = fixed_text
-            if show_thinking and not thinking: # Extract thinking only if not already found
-                clean_fixed_text, thinking = _extract_chain_of_thought(fixed_text)
-                result["thinking"] = thinking # Update thinking if found in reformatted text
-
-            story, description = _check_format(clean_fixed_text)
-            if story and description:
-                 _logger.info("Successfully reformatted LLM output.")
-                 result["raw_output"] = fixed_text # Update raw output to the reformatted version
-            else:
-                _logger.error("Reformatting failed to produce the correct structure.")
-                # Keep the original (cleaned) completion text in the story field as fallback
-                story = clean_completion_text
-                description = ""
-        else:
-             # Reformatting failed entirely
-             _logger.error("Reformatting request failed.")
-             story = clean_completion_text
-             description = ""
-
-
-    result["story"] = story
-    result["video_description"] = description
-
-    # Placeholder: Storyboard generation would happen here if needed by this function
-    # For now, it's handled separately or by the worker.
-    # if story and story.strip():
-    #     try:
-    #         _logger.info("Generating storyboard based on the story script...")
-    #         # Placeholder call - implement actual storyboard generation logic
-    #         storyboard_data = {"scenes": []} # Replace with actual call
-    #         result["storyboard"] = storyboard_data
-    #         _logger.info("Storyboard generation successful (placeholder).")
-    #     except Exception as e:
-    #         _logger.error(f"Storyboard generation failed: {e}")
-    #         result["storyboard"] = {"error": str(e)} # Store error in storyboard field
-
-
-    _logger.info(f"Story script generation complete. Time: {result['generation_time']:.2f}s. Tokens: {result['usage']}")
-    return result

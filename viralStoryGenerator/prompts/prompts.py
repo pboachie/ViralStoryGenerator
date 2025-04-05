@@ -110,46 +110,42 @@ def get_system_instructions():
   )
 
 
-def get_user_prompt(topic, sources):
+def get_user_prompt(topic: str, relevant_chunks: str) -> str:
+    """Generates the user prompt for the LLM, using relevant chunks from RAG."""
+    # If no relevant chunks were found, provide a basic prompt
+    if not relevant_chunks or relevant_chunks.isspace():
+        print("No relevant chunks found. Generating prompt based on topic alone.")
+        relevant_chunks_section = "No specific context snippets were retrieved. Please generate the story based on the topic alone."
+    else:
+        relevant_chunks_section = f"""## Relevant Information Snippets:
+{relevant_chunks}"""
+
     return f"""
-## Source Material Analysis
-Analyze these {topic} sources and identify:
-1. Core controversy or unique angle
-2. Key technical issues or failures (explain simply, avoid jargon)
-3. Unconfirmed or speculative claims from leaks (treat as rumors)
-4. Industry or public reactions if available
+## Task
+Generate a viral story script and video description about '{topic}' based *only* on the following relevant information snippets (if provided).
+
+{relevant_chunks_section}
 
 ## Story Requirements
-Transform these key points into a spicy, viral narrative:
+Transform the key points from the snippets (or general knowledge if no snippets provided) into a spicy, viral narrative:
 - Start with a bold, attention-grabbing hook
 - Use short, punchy sentences for drama
-- Weave in 2-3 controversial elements from the sources
-- Treat unverified info as 'alleged', 'rumored' or similar and avoid definitive statements. Warn about potential inaccuracies if needed.
+- Weave in 2-3 controversial elements if found in the snippets
+- Treat unverified info as 'alleged', 'rumored' or similar if applicable based on snippets.
 - End with an open question about possible implications
 
 ## Formatting Rules
-STRICTLY follow this structure:
+STRICTLY follow this structure. Output ONLY the two sections below, with NO additional text, labels, explanations, or markdown formatting before or after.
 
 ### Story Script:
-[Your story text in 3-5 short paragraphs, Must be a minumum of 200-220 words total. No markdown]
+[Your story text in 3-5 short paragraphs, Must be a minumum of 200-220 words total.]
 
 ### Video Description:
 [Single line, ≤100 chars, 3-5 hashtags related to {topic}, key entities, emotions]
 
-## Example Output
-Sources: "Internal memo suggests CEO knew about security flaws... Reddit leaks show prototype images..."
-
-### Story Script:
-You won't believe what leaked from TechCorp's secret servers. Internal docs reveal...
-
-### Video Description:
-CEO knew about security flaws? #TechScandal #DataLeak #CorporateDrama
-
-## Current Sources:
-{sources}
-
-Generate story script and description now using the source(s) provided tailored for the age group 13-25 years old. Be sure to use info from the sources if any..
+Generate the required output now.
 """.strip()
+
 
 def get_fix_prompt(raw_text):
     return f"""
@@ -192,9 +188,10 @@ def get_storyboard_prompt(story):
 You are a Storyboard Generator that chunks stories into structured JSON for video production.
 
 ## Task
-Convert this story into 3-5 scenes with narration timing and image prompts.
+Convert this story into 3-5 scenes with narration timing and image prompts. Output ONLY the valid JSON object, with NO other text before or after the JSON structure.
 
 ## JSON Requirements
+```json
 {{
   "scenes": [
     {{
@@ -203,8 +200,10 @@ Convert this story into 3-5 scenes with narration timing and image prompts.
       "image_prompt": "DALL-E description focusing on: [1] Main subject [2] Style refs [3] Key details",
       "duration": 5
     }}
+    // ... more scenes ...
   ]
 }}
+```
 
 ## Guidelines
 1. Narration text: 15-30 words per scene (150 WPM = 6-12s audio)
@@ -262,9 +261,10 @@ Now here's the kicker—alleged whistleblowers say NVIDIA is considering a recal
 ## Input Story
 {story}
 
-Generate valid JSON:
+Generate ONLY the valid JSON output now.
     """.strip()
 
+# TODO: To be implemented in the future
 def _identify_errors(text):
     """Helper to generate error descriptions"""
     errors = []

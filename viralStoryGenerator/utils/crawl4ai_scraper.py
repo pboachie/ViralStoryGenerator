@@ -220,28 +220,40 @@ async def process_scrape_queue_worker(
                  continue
 
             num_to_fetch = min(batch_size, max_concurrent - len(active_tasks))
-            if num_to_fetch <= 0:
-                if active_tasks:
-                     done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
-                     active_tasks = pending
-                else: await asyncio.sleep(0.1)
-                continue
 
+            # Wait for space or completed tasks if needed
+            while num_to_fetch <= 0 and active_tasks:
+                 _logger.debug(f"Scraper worker concurrency limit ({max_concurrent}) reached. Waiting...")
+                 done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED, timeout=sleep_interval)
+                 active_tasks = pending
+                 num_to_fetch = min(batch_size, max_concurrent - len(active_tasks))
+                 if not active_tasks and num_to_fetch <=0:
+                      break
+                 if num_to_fetch > 0: # Break if space becomes available
+                      break
+
+            # Fetch new batch if space available
             batch = []
-            for _ in range(num_to_fetch):
-                request = redis_manager.get_next_request()
-                if request:
-                     if isinstance(request, dict) and 'id' in request and 'data' in request:
-                         batch.append(request)
-                     else:
-                         _logger.error(f"Invalid item received from scrape queue: {str(request)[:100]}...")
-                         if hasattr(redis_manager, 'complete_request') and isinstance(request, dict) and '_original_data' in request:
-                             redis_manager.complete_request(request, success=False)
-                else: break # Queue empty
+            if num_to_fetch > 0:
+                for _ in range(num_to_fetch):
+                    request = redis_manager.get_next_request()
+                    if request:
+                         if isinstance(request, dict) and 'id' in request and 'data' in request:
+                             batch.append(request)
+                         else:
+                             _logger.error(f"Invalid item received from scrape queue: {str(request)[:100]}...")
+                             if hasattr(redis_manager, 'complete_request') and isinstance(request, dict) and '_original_data' in request:
+                                 redis_manager.complete_request(request, success=False)
+                    else: break # Queue empty
 
-            if not batch:
+            if not batch and not active_tasks:
+                # Queue is empty and no tasks running, sleep longer
                 await asyncio.sleep(sleep_interval)
                 continue
+            elif not batch and active_tasks:
+                 # No new jobs, but tasks are running, wait briefly before checking tasks again
+                 await asyncio.sleep(0.1)
+                 continue
 
             _logger.info(f"Scrape worker processing batch of {len(batch)} requests.")
 
@@ -250,9 +262,25 @@ async def process_scrape_queue_worker(
                 active_tasks.add(task)
                 task.add_done_callback(active_tasks.discard)
 
+        except asyncio.CancelledError:
+             _logger.info("Scrape worker main loop cancelled.")
+             break # Exit the loop cleanly on cancellation
         except Exception as e:
              _logger.exception(f"Error in scrape worker main loop: {e}")
+             # Avoid busy-looping on persistent errors
              await asyncio.sleep(sleep_interval * 2)
+
+    # Cleanup after loop exit (e.g., on cancellation)
+    _logger.info("Scrape worker loop finished. Waiting for remaining active tasks...")
+    if active_tasks:
+        try:
+            await asyncio.wait_for(asyncio.gather(*active_tasks, return_exceptions=True), timeout=15.0)
+            _logger.info("Remaining scrape tasks finished or timed out.")
+        except asyncio.TimeoutError:
+            _logger.warning("Timeout waiting for remaining scrape tasks during shutdown.")
+        except Exception as e:
+            _logger.exception(f"Error waiting for remaining scrape tasks: {e}")
+    _logger.info("Scrape worker task cleanup complete.")
 
 
 async def _process_single_scrape_job(request: Dict[str, Any], manager: RedisQueueManager):
@@ -326,3 +354,18 @@ async def _process_single_scrape_job(request: Dict[str, Any], manager: RedisQueu
         _logger.debug(f"Scraper Worker: Completion status for job {job_id} in processing queue: {completion_success}") # DEBUG ADDED
         if not completion_success:
              _logger.warning(f"Failed to properly complete/remove job {job_id} from processing queue.")
+
+# --- Cleanup Function ---
+def close_scraper_redis_connections():
+    """Closes the connection pool associated with the scraper's Redis manager."""
+    global redis_manager
+    if redis_manager and hasattr(redis_manager, 'close'):
+        try:
+            _logger.info("Closing scraper Redis manager connection pool...")
+            redis_manager.close()
+            _logger.info("Scraper Redis manager connection pool closed.")
+        except Exception as e:
+            _logger.exception(f"Error closing scraper Redis manager connection pool: {e}")
+    elif redis_manager:
+         _logger.warning("Scraper Redis manager exists but has no 'close' method.")
+    redis_manager = None
