@@ -4,6 +4,12 @@ import requests
 import time
 import json
 import base64
+import os
+import uuid
+import tempfile
+from typing import Dict, Any
+from viralStoryGenerator.src.logger import logger as _logger
+from viralStoryGenerator.utils.config import config
 
 DEFAULT_VOICE_ID = appconfig.elevenLabs.VOICE_ID or "JZ3e95uoTACVf6tXaaEi"
 DEFAULT_MODEL_ID = "eleven_multilingual_v2"
@@ -210,29 +216,29 @@ def generate_elevenlabs_audio(
 
     for attempt in range(1, max_retries + 1):
         try:
-            logging.info(f"Attempt {attempt}/{max_retries}: Sending TTS request to ElevenLabs for voice_id='{voice_id}' with timeout={timeout}s...")
-            logging.debug(f"URL: {url}")
-            logging.debug(f"Headers: {headers}")
-            logging.debug(f"Payload: {json.dumps(payload, indent=2)}")
+            _logger.info(f"Attempt {attempt}/{max_retries}: Sending TTS request to ElevenLabs for voice_id='{voice_id}' with timeout={timeout}s...")
+            _logger.debug(f"URL: {url}")
+            _logger.debug(f"Headers: {headers}")
+            _logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
             response = requests.post(url, headers=headers, json=payload, timeout=timeout)
             response.raise_for_status()
-            logging.debug(f"TTS response status code: {response.status_code}")
+            _logger.debug(f"TTS response status code: {response.status_code}")
             break  # success; exit retry loop
         except requests.exceptions.Timeout as e:
-            logging.error(f"Attempt {attempt} timed out after {timeout}s: {e}")
+            _logger.error(f"Attempt {attempt} timed out after {timeout}s: {e}")
         except requests.exceptions.HTTPError as e:
             error_content = response.text if response is not None else "No response"
-            logging.error(f"HTTP error during attempt {attempt}: {e}. Response content: {error_content}")
+            _logger.error(f"HTTP error during attempt {attempt}: {e}. Response content: {error_content}")
         except requests.exceptions.RequestException as e:
-            logging.error(f"Request exception during attempt {attempt}: {e}")
+            _logger.error(f"Request exception during attempt {attempt}: {e}")
         except Exception as e:
-            logging.error(f"Unexpected error during attempt {attempt}: {e}")
+            _logger.error(f"Unexpected error during attempt {attempt}: {e}")
 
         if attempt == max_retries:
-            logging.error("All attempts failed, giving up on audio generation.")
+            _logger.error("All attempts failed, giving up on audio generation.")
             return False
 
-        logging.info("Retrying TTS request...")
+        _logger.info("Retrying TTS request...")
         time.sleep(1)
 
     # --- Process Response ---
@@ -243,25 +249,25 @@ def generate_elevenlabs_audio(
             timestamps = response_data.get("timestamps")
 
             if not audio_b64:
-                logging.error("No audio data returned in the response.")
+                _logger.error("No audio data returned in the response.")
                 return False
 
             # Decode base64 audio and save
             audio_bytes = base64.b64decode(audio_b64)
             with open(output_mp3_path, "wb") as f:
                 f.write(audio_bytes)
-            logging.info(f"Audio with timestamps successfully saved to {output_mp3_path}")
+            _logger.info(f"Audio with timestamps successfully saved to {output_mp3_path}")
             return {"timestamps": timestamps}
         except Exception as e:
-            logging.error(f"Error processing TTS response with timestamps: {e}")
+            _logger.error(f"Error processing TTS response with timestamps: {e}")
             return False
     else:
         try:
             with open(output_mp3_path, "wb") as f:
                 f.write(response.content)
-            logging.info(f"Audio successfully saved to {output_mp3_path}")
+            _logger.info(f"Audio successfully saved to {output_mp3_path}")
         except Exception as e:
-            logging.error(f"Failed to save audio file at {output_mp3_path}: {e}")
+            _logger.error(f"Failed to save audio file at {output_mp3_path}: {e}")
             return False
 
         return True

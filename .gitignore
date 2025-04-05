@@ -6,3 +6,5 @@ __pycache__
 *.mp3
 *launch.json
 *_cache.db*
+/build/*
+build/*

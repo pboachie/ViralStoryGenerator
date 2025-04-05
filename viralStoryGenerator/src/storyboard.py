@@ -11,9 +11,7 @@ from typing import Dict, Any, Optional
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
 from viralStoryGenerator.prompts.prompts import get_storyboard_prompt
 from viralStoryGenerator.src.logger import logger as _logger
-from viralStoryGenerator.utils import config
-
-appconfig = config.config
+from viralStoryGenerator.utils.config import  config as appconfig
 
 def generate_storyboard_structure(story, llm_endpoint, model, temperature):
     """
