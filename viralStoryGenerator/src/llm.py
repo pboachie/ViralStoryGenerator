@@ -8,9 +8,7 @@ from typing import Tuple, Dict, Optional
 
 from viralStoryGenerator.prompts.prompts import get_system_instructions, get_user_prompt, get_fix_prompt
 from viralStoryGenerator.src.logger import logger as _logger
-from viralStoryGenerator.utils import config
-
-appconfig = config.config
+from viralStoryGenerator.utils.config import config as appconfig
 
 STORY_PATTERN = re.compile(r"(?s)### Story Script:\s*(.*?)\n### Video Description:")
 DESC_PATTERN = re.compile(r"### Video Description:\s*(.*)$")
@@ -108,6 +106,45 @@ def _extract_chain_of_thought(text: str) -> Tuple[str, str]:
         _logger.debug("Extracted chain-of-thought block.")
     return clean_text, chain
 
+def process_with_llm(topic: str, cleansed_content: str, temperature: float) -> str:
+    """
+    Process the given topic and cleansed content using the LLM to generate a story script.
+
+    Args:
+        topic (str): The topic for the story.
+        cleansed_content (str): The preprocessed content to use for story generation.
+        temperature (float): The temperature setting for the LLM.
+
+    Returns:
+        str: The generated story script.
+    """
+    _logger.debug(f"Processing with LLM for topic: {topic}")
+
+    # Prepare the payload for the LLM API
+    data = {
+        "model": appconfig.llm.MODEL,
+        "messages": [
+            {"role": "system", "content": get_system_instructions()},
+            {"role": "user", "content": get_user_prompt(topic, cleansed_content)}
+        ],
+        "temperature": temperature,
+        "max_tokens": appconfig.llm.MAX_TOKENS,
+        "stream": False
+    }
+
+    try:
+        response = requests.post(appconfig.llm.ENDPOINT, json=data, timeout=appconfig.httpOptions.TIMEOUT)
+        response.raise_for_status()
+        response_json = response.json()
+        story_script = response_json["choices"][0]["message"]["content"]
+        _logger.debug(f"LLM response received for topic: {topic}")
+        return story_script
+    except requests.exceptions.RequestException as e:
+        _logger.error(f"Error during LLM API call: {e}")
+        raise
+    except (KeyError, IndexError) as e:
+        _logger.error(f"Unexpected response structure from LLM: {e}")
+        raise
 
 def process_with_llm(topic: str, cleansed_content: str, temperature: float) -> str:
     """
@@ -287,7 +324,7 @@ def generate_story_script(topic: str,
     if show_thinking:
         _logger.debug("Thinking is enabled; extracting chain-of-thought...")
         # if reasoning_content is found in response, extract it
-        if response_json["choices"][0]["message"]["reasoning_content"] and response_json["choices"][0]["message"]["reasoning_content"] != "":
+        if response_json["choices"][0]["message"].get("reasoning_content") and response_json["choices"][0]["message"].get("reasoning_content") != "":
             thinking = response_json["choices"][0]["message"]["reasoning_content"]
         else:
             # Fallback to regex extraction
@@ -298,7 +335,7 @@ def generate_story_script(topic: str,
     story, description = _check_format(clean_completion_text)
 
     # Generate the storyboard
-    if story.strip():
+    if story and story.strip():
         try:
             _logger.info("Generating storyboard based on the story script...")
 
@@ -355,30 +392,3 @@ def generate_story_script(topic: str,
         "usage": usage_info,
         "storyboard": storyboard
     }
-
-    # if story is None or description is None:
-    #     _logger.info("Initial completion was off-format. Attempting reformatting...")
-    #     fixed_text = _reformat_text(completion_text, endpoint, model, temperature)
-    #     fixed_text, extra_thinking = _extract_chain_of_thought(fixed_text)
-    #     if not thinking and extra_thinking:
-    #         thinking = extra_thinking
-    #     story, description = _check_format(fixed_text)
-    #     if story is None or description is None:
-    #         _logger.warning("Reformatting did not produce the expected format; returning raw output.")
-    #         return {
-    #             "story": completion_text,
-    #             "video_description": "",
-    #             "thinking": thinking,
-    #             "generation_time": generation_time,
-    #             "usage": usage_info
-    #         }
-    #     else:
-    #         completion_text = fixed_text
-
-    # return {
-    #     "story": story,
-    #     "video_description": description,
-    #     "thinking": thinking,
-    #     "generation_time": generation_time,
-    #     "usage": usage_info
-    # }
