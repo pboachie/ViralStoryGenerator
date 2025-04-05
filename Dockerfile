@@ -7,13 +7,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Add system dependencies for playwright and other tools
-# RUN apt-get update && apt-get install -y --no-install-recommends \
-#     curl \
-#     gnupg \
-#     wget \
-#     && playwright install-deps \
-#     && python -m playwright install \
-#     && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    gnupg \
+    wget \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 
 # Copy application code
 COPY . .
