@@ -838,11 +838,14 @@ async def get_job_status(
         if not result_data:
             if queue_manager.check_key_exists(job_id):
                 _logger.debug(f"Job {job_id} found but no final result yet (pending/processing).")
-                # Return a pending status conforming to the model
                 return JobStatusResponse(status="pending", message="Job is pending or currently processing.")
             else:
                 _logger.warning(f"Job ID not found in Redis: {job_id}")
                 raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+        if result_data.get("status") == "error":
+            _logger.error(f"Error in job {job_id}: {result_data.get('error')}")
+            raise HTTPException(status_code=500, detail=result_data.get("error"))
 
         _logger.debug(f"Result found for job {job_id}, status: {result_data.get('status')}")
         return JobStatusResponse(**result_data)

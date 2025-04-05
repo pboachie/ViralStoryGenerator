@@ -54,15 +54,16 @@ def generate_storyboard_structure(story: str, llm_endpoint: str, model: str, tem
         ],
         "temperature": temperature,
         "max_tokens": appconfig.llm.MAX_TOKENS,
-        "stream": False,
-        "response_format": {"type": "json_object"}
+        "stream": False
+        # "response_format": {"type": "json_object"}
+
     }
 
     try:
         response = requests.post(
             llm_endpoint,
             headers=headers,
-            data=json.dumps(data),
+            json=data,
             timeout=appconfig.httpOptions.TIMEOUT
         )
         response.raise_for_status()
@@ -94,7 +95,8 @@ def generate_storyboard_structure(story: str, llm_endpoint: str, model: str, tem
          _logger.error(f"LLM request for storyboard timed out after {appconfig.httpOptions.TIMEOUT} seconds.")
          return None
     except requests.exceptions.RequestException as e:
-        _logger.error(f"Failed to generate storyboard structure from LLM: {e}")
+        payload_str = json.dumps(data)
+        _logger.error(f"Failed to generate storyboard structure from LLM: {e}. Request Payload: {payload_str}", exc_info=True)
         return None
     except json.JSONDecodeError as e:
          _logger.error(f"Failed to parse storyboard JSON response from LLM: {e}. Response text: {response.text[:500]}")
