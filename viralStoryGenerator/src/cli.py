@@ -5,8 +5,6 @@ import os
 import datetime
 import json
 
-from viralStoryGenerator.src.llm import generate_story_script
-from viralStoryGenerator.src.source_cleanser import chunkify_and_summarize
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
 from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.utils.config import config
@@ -197,72 +195,51 @@ def cli_main():
         raise ValueError("The --model argument must be provided, either via command line or the LLM_MODEL environment variable.")
 
     start_exec = time.time()
-    # === Process any queued failed audio generations first ===
-    # process_audio_queue()
 
-    raw_sources = None
+    # === CLI is now deprecated for story generation as logic moved to API worker ===
+    _logger.warning("CLI execution for story generation is deprecated and may not reflect the full API/worker workflow (like RAG).")
+    print("\nWARNING: CLI execution is deprecated. Use the API endpoint (/api/generate) for full functionality.\n")
 
-    # 1) Read all the files from the sources folder into one combined text
-    if args.sources_folder and len(args.sources_folder) >= 1:
-        _logger.debug(f"Reading all files in folder '{args.sources_folder}' for sources...")
-        raw_sources = _read_sources_from_folder(args.sources_folder)
+    # --- The following logic is based on the OLD workflow and will likely NOT work correctly ---
+    # --- It is kept here for reference or potential future CLI adaptation ---
 
-    # 2) Chunkify & Summarize them into a single cohesive summary
-    if raw_sources and raw_sources.strip():
-        _logger.debug("Splitting & summarizing sources via LLM (multi-chunk)...")
-        cleansed_sources = chunkify_and_summarize(
-            raw_sources=raw_sources,
-            endpoint=args.endpoint,
-            model=args.model,
-            temperature=args.temperature,
-            chunk_size=args.chunk_size
-        )
-        _logger.debug("Sources cleansed. Proceeding with story generation...")
-    else:
-        _logger.debug("No sources found. Skipping cleansing step.")
-        cleansed_sources = ""
+    # # 1) Read sources (remains the same)
+    # raw_sources = None
+    # if args.sources_folder and len(args.sources_folder) >= 1:
+    #     _logger.debug(f"Reading all files in folder '{args.sources_folder}' for sources...")
+    #     raw_sources = _read_sources_from_folder(args.sources_folder)
+    # else:
+    #      _logger.debug("No sources folder specified.")
 
-    # 3) Generate the story script from these cleansed/merged sources
+    # # 2) Chunkify & Summarize (OLD METHOD - REMOVED)
+    # cleansed_sources = ""
+    # if raw_sources and raw_sources.strip():
+    #     _logger.warning("CLI is using deprecated chunkify_and_summarize. RAG is not implemented here.")
+    #     # This function no longer exists or works as expected
+    #     # cleansed_sources = chunkify_and_summarize(...)
+    #     _logger.error("chunkify_and_summarize is deprecated/removed. Cannot proceed with cleansing in CLI.")
+    # else:
+    #     _logger.debug("No sources found. Skipping cleansing step.")
 
-    result = generate_story_script(
-        topic=args.topic,
-        sources=cleansed_sources,
-        endpoint=args.endpoint,
-        model=args.model,
-        temperature=args.temperature,
-        show_thinking=args.show_thinking
-    )
+    # # 3) Generate story script (OLD METHOD - REMOVED)
+    # _logger.warning("CLI is using deprecated generate_story_script. RAG is not implemented here.")
+    # # This function no longer exists or works as expected
+    # # result = generate_story_script(...)
+    # result = {"story": "CLI Generation Disabled", "video_description": "#CLI #Disabled"}
+    # print(f"=== STORY GENERATION RESULT (CLI Disabled) ===\n{result}")
 
-    print(f"=== STORY GENERATION RESULT ===\n{result}")
-    exit()
 
-    # 4) Print chain-of-thought if requested
-    if args.show_thinking and result.get("thinking"):
-        print("\n=== STORY CHAIN-OF-THOUGHT (DEBUG) ===")
-        print(result.get("thinking", ""))
+    # # 4) Print thinking (OLD METHOD)
+    # # ...
 
-        print("\n=== STORYBOARD CHAIN-OF-THOUGHT (DEBUG) ===")
-        print(result.get("storyboard", {}).get("thinking", ""))
+    # # 5) Print final story (OLD METHOD)
+    # # ...
 
-    # 5) Print final story
-    if "story" in result and "video_description" in result and 'storyboard' in result and result["story"] and result["video_description"] and result['storyboard']:
-        print("\n=== AGENT OUTPUT ===")
-        print(f"### Story Script:\n{result['story']}\n")
-        print(f"### Video Description:\n{result['video_description']}\n")
-        print(f"### Storyboard:\n{result['storyboard']['scenes']}\n")
-    else:
-        print("\n=== RAW OUTPUT (Unformatted) ===")
-        print(result)
-
-    # 6) Save the final outputs
-    _save_story_output(result, args.topic, voice_id=args.voice_id)
-
-    # 7) Generate storyboard from the story script (if available)
-
+    # # 6) Save outputs (OLD METHOD)
+    # # _save_story_output(result, args.topic, voice_id=args.voice_id)
 
     total_exec_time = time.time() - start_exec
-    _logger.info(f"Total execution time (CLI start to finish): {total_exec_time:.2f} seconds")
-
+    _logger.info(f"Total execution time (CLI): {total_exec_time:.2f} seconds")
 
 if __name__ == "__main__":
     cli_main()
