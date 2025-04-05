@@ -234,7 +234,7 @@ class RedisManager:
             return True
         elif removed_count == 0:
             _logger.warning(f"Job {job_id} (success={success}) not found in processing queue for completion (already removed?).")
-            return False 
+            return False
         else:
             _logger.error(f"Failed to remove job {job_id} (success={success}) from processing queue.")
             return False
@@ -333,3 +333,15 @@ class RedisManager:
 
         _logger.warning(f"Timeout ({timeout}s) reached waiting for job {job_id}")
         return {"status": "timeout", "error": f"Timeout waiting for result after {timeout}s."}
+
+    def close(self):
+        """Explicitly close Redis connection and release resources."""
+        if self.client:
+            try:
+                self.client.close()
+                _logger.debug("Redis connection closed successfully.")
+                return True
+            except Exception as e:
+                _logger.error(f"Error closing Redis connection: {e}")
+                return False
+        return False

@@ -262,7 +262,7 @@ async def process_scrape_queue_worker(
                                      redis_manager.complete_request(request, success=False)
                          else:
                              _logger.error(f"Invalid item received from scrape queue: {str(request)[:100]}...")
-                             # Try to complete the request if possible
+                             # Just try to complete the request if possible
                              if hasattr(redis_manager, 'complete_request') and isinstance(request, dict) and '_original_data' in request:
                                  redis_manager.complete_request(request, success=False)
                     else: break # Queue empty
