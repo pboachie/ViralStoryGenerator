@@ -4,13 +4,6 @@ import requests
 import time
 import json
 import base64
-import os
-import uuid
-import tempfile
-from typing import Dict, Any, Optional, Union
-
-from viralStoryGenerator.src.logger import logger as _logger
-from viralStoryGenerator.utils.config import config as appconfig
 
 DEFAULT_VOICE_ID = appconfig.elevenLabs.VOICE_ID or "JZ3e95uoTACVf6tXaaEi"
 DEFAULT_MODEL_ID = "eleven_multilingual_v2"
@@ -76,6 +69,54 @@ def generate_audio(text: str) -> Optional[Dict[str, Any]]:
         _logger.exception(f"Unexpected error in generate_audio: {e}")
         return None
 
+
+def generate_audio(text: str) -> Dict[str, Any]:
+    """
+    Generate audio from text using ElevenLabs TTS
+
+    Args:
+        text: Text to convert to speech
+
+    Returns:
+        Dict with file information including path and URL
+    """
+    try:
+        # Check for API key
+        api_key = config.elevenLabs.API_KEY
+        voice_id = config.elevenLabs.VOICE_ID
+
+        if not api_key:
+            _logger.error("No ElevenLabs API key configured. Cannot generate audio.")
+            raise ValueError("ElevenLabs API key not configured")
+
+        # Generate a unique filename
+        filename = f"{uuid.uuid4()}.mp3"
+        temp_path = os.path.join(tempfile.gettempdir(), filename)
+
+        # Generate the audio file
+        success = generate_elevenlabs_audio(
+            text=text,
+            api_key=api_key,
+            output_mp3_path=temp_path,
+            voice_id=voice_id,
+            model_id="eleven_multilingual_v2",
+            stability=0.5,
+            similarity_boost=0.75
+        )
+
+        if not success:
+            raise ValueError("Failed to generate audio with ElevenLabs API")
+
+        # Return a simple file info structure
+        return {
+            "name": filename,
+            "path": temp_path,
+            "file_path": temp_path
+        }
+
+    except Exception as e:
+        _logger.error(f"Error generating audio: {str(e)}")
+        raise
 
 def generate_elevenlabs_audio(
     text: str,
@@ -169,43 +210,30 @@ def generate_elevenlabs_audio(
 
     for attempt in range(1, max_retries + 1):
         try:
-            _logger.debug(f"TTS Request Attempt {attempt}/{max_retries} to {url}")
-            # _logger.debug(f"Payload (partial): {json.dumps(payload, indent=2)[:500]}...") # Avoid logging full text
+            logging.info(f"Attempt {attempt}/{max_retries}: Sending TTS request to ElevenLabs for voice_id='{voice_id}' with timeout={timeout}s...")
+            logging.debug(f"URL: {url}")
+            logging.debug(f"Headers: {headers}")
+            logging.debug(f"Payload: {json.dumps(payload, indent=2)}")
             response = requests.post(url, headers=headers, json=payload, timeout=timeout)
             response.raise_for_status()
-            _logger.debug(f"TTS response status code: {response.status_code}")
-            last_exception = None
-            break
-
+            logging.debug(f"TTS response status code: {response.status_code}")
+            break  # success; exit retry loop
         except requests.exceptions.Timeout as e:
-            last_exception = e
-            _logger.warning(f"TTS Attempt {attempt} timed out after {timeout}s: {e}")
+            logging.error(f"Attempt {attempt} timed out after {timeout}s: {e}")
         except requests.exceptions.HTTPError as e:
-            last_exception = e
-            error_content = response.text[:200] if response is not None else "No response content"
-            _logger.warning(f"TTS Attempt {attempt} HTTP error: {e.status_code}. Response: {error_content}...")
-            if response is not None:
-                 if response.status_code == 401:
-                      _logger.error("ElevenLabs API key is invalid or unauthorized.")
-                      return False
-                 elif response.status_code == 422:
-                      _logger.error(f"ElevenLabs returned 422 Unprocessable Entity. Check input text/voice settings. Response: {error_content}")
-                      return False
+            error_content = response.text if response is not None else "No response"
+            logging.error(f"HTTP error during attempt {attempt}: {e}. Response content: {error_content}")
         except requests.exceptions.RequestException as e:
-            last_exception = e
-            _logger.warning(f"TTS Attempt {attempt} request exception: {e}")
+            logging.error(f"Request exception during attempt {attempt}: {e}")
         except Exception as e:
-            last_exception = e
-            _logger.exception(f"TTS Attempt {attempt} unexpected error: {e}")
+            logging.error(f"Unexpected error during attempt {attempt}: {e}")
 
-        if attempt < max_retries:
-            wait_time = 1 * (2**(attempt-1))
-            _logger.info(f"Retrying TTS request in {wait_time} seconds...")
-            time.sleep(wait_time)
-        else:
-            _logger.error(f"All {max_retries} TTS attempts failed. Last error: {last_exception}")
+        if attempt == max_retries:
+            logging.error("All attempts failed, giving up on audio generation.")
             return False
 
+        logging.info("Retrying TTS request...")
+        time.sleep(1)
 
     # --- Process Response ---
     try:
@@ -215,24 +243,28 @@ def generate_elevenlabs_audio(
             timestamps = response_data.get("timestamps")
 
             if not audio_b64:
-                _logger.error("No 'audio' field found in ElevenLabs timestamp response.")
+                logging.error("No audio data returned in the response.")
                 return False
 
             # Decode base64 audio and save
             audio_bytes = base64.b64decode(audio_b64)
             with open(output_mp3_path, "wb") as f:
                 f.write(audio_bytes)
-
-            _logger.info(f"Audio with timestamps successfully saved to {output_mp3_path}")
-            return {"timestamps": timestamps} if timestamps else {}
-
-        else:
+            logging.info(f"Audio with timestamps successfully saved to {output_mp3_path}")
+            return {"timestamps": timestamps}
+        except Exception as e:
+            logging.error(f"Error processing TTS response with timestamps: {e}")
+            return False
+    else:
+        try:
             with open(output_mp3_path, "wb") as f:
-                # Stream content to handle potentially large files
-                for chunk in response.iter_content(chunk_size=8192):
-                     f.write(chunk)
-            _logger.info(f"Audio successfully saved to {output_mp3_path}")
-            return True
+                f.write(response.content)
+            logging.info(f"Audio successfully saved to {output_mp3_path}")
+        except Exception as e:
+            logging.error(f"Failed to save audio file at {output_mp3_path}: {e}")
+            return False
+
+        return True
 
     except (json.JSONDecodeError, base64.binascii.Error) as e:
          _logger.error(f"Error processing ElevenLabs response data: {e}")

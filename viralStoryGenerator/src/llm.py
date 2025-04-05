@@ -8,8 +8,9 @@ from typing import Tuple, Dict, Optional
 
 from viralStoryGenerator.prompts.prompts import get_system_instructions, get_user_prompt, get_fix_prompt
 from viralStoryGenerator.src.logger import logger as _logger
-from viralStoryGenerator.utils.config import config as appconfig
+from viralStoryGenerator.utils import config
 
+appconfig = config.config
 
 STORY_PATTERN = re.compile(r"(?s)### Story Script:\s*(.*?)\n### Video Description:")
 DESC_PATTERN = re.compile(r"### Video Description:\s*(.*)$")
@@ -176,6 +177,45 @@ def process_with_llm(topic: str, cleansed_content: str, temperature: float) -> s
         _logger.error(f"Unexpected response structure from LLM for topic '{topic}': {e}. Response: {response_json}")
         raise ValueError("Malformed response from LLM") from e
 
+def process_with_llm(topic: str, cleansed_content: str, temperature: float) -> str:
+    """
+    Process the given topic and cleansed content using the LLM to generate a story script.
+
+    Args:
+        topic (str): The topic for the story.
+        cleansed_content (str): The preprocessed content to use for story generation.
+        temperature (float): The temperature setting for the LLM.
+
+    Returns:
+        str: The generated story script.
+    """
+    _logger.debug(f"Processing with LLM for topic: {topic}")
+
+    # Prepare the payload for the LLM API
+    data = {
+        "model": appconfig.llm.MODEL,
+        "messages": [
+            {"role": "system", "content": get_system_instructions()},
+            {"role": "user", "content": get_user_prompt(topic, cleansed_content)}
+        ],
+        "temperature": temperature,
+        "max_tokens": appconfig.llm.MAX_TOKENS,
+        "stream": False
+    }
+
+    try:
+        response = requests.post(appconfig.llm.ENDPOINT, json=data, timeout=appconfig.httpOptions.TIMEOUT)
+        response.raise_for_status()
+        response_json = response.json()
+        story_script = response_json["choices"][0]["message"]["content"]
+        _logger.debug(f"LLM response received for topic: {topic}")
+        return story_script
+    except requests.exceptions.RequestException as e:
+        _logger.error(f"Error during LLM API call: {e}")
+        raise
+    except (KeyError, IndexError) as e:
+        _logger.error(f"Unexpected response structure from LLM: {e}")
+        raise
 
 def generate_story_script(topic: str,
                           sources: str,
@@ -245,8 +285,9 @@ def generate_story_script(topic: str,
     thinking = ""
     clean_completion_text = completion_text
     if show_thinking:
-        # Check specific field first if supported by LLM API
-        if response_json["choices"][0]["message"].get("reasoning_content"):
+        _logger.debug("Thinking is enabled; extracting chain-of-thought...")
+        # if reasoning_content is found in response, extract it
+        if response_json["choices"][0]["message"]["reasoning_content"] and response_json["choices"][0]["message"]["reasoning_content"] != "":
             thinking = response_json["choices"][0]["message"]["reasoning_content"]
         else:
             # Fallback to regex extraction
@@ -256,7 +297,34 @@ def generate_story_script(topic: str,
     # Check format of the (potentially cleaned) text
     story, description = _check_format(clean_completion_text)
 
-    # If format is incorrect, attempt reformatting
+    # Generate the storyboard
+    if story.strip():
+        try:
+            _logger.info("Generating storyboard based on the story script...")
+
+            # storyboard = generate_storyboard(
+            #     story=story,
+            #     topic=topic,
+            #     llm_endpoint=endpoint,
+            #     model=model,
+            #     temperature=temperature,
+            #     voice_id=appconfig.elevenLabs.VOICE_ID
+            # )
+            storyboard = None
+
+            _logger.info("Storyboard generation successful.")
+
+        except Exception as e:
+            _logger.error(f"Storyboard generation failed: {e}")
+            return {
+                "story": "",
+                "video_description": "",
+                "thinking": "",
+                "generation_time": 0,
+                "usage": {},
+                "storyboard": ""
+            }
+
     if story is None or description is None:
         _logger.warning("Initial LLM output format incorrect, attempting reformat...")
         fixed_text = _reformat_text(clean_completion_text, endpoint, model, temperature)
@@ -278,28 +346,39 @@ def generate_story_script(topic: str,
                 story = clean_completion_text
                 description = ""
         else:
-             # Reformatting failed entirely
-             _logger.error("Reformatting request failed.")
-             story = clean_completion_text
-             description = ""
+            completion_text = fixed_text
+    return {
+        "story": story,
+        "video_description": description,
+        "thinking": thinking,
+        "generation_time": generation_time,
+        "usage": usage_info,
+        "storyboard": storyboard
+    }
 
+    # if story is None or description is None:
+    #     _logger.info("Initial completion was off-format. Attempting reformatting...")
+    #     fixed_text = _reformat_text(completion_text, endpoint, model, temperature)
+    #     fixed_text, extra_thinking = _extract_chain_of_thought(fixed_text)
+    #     if not thinking and extra_thinking:
+    #         thinking = extra_thinking
+    #     story, description = _check_format(fixed_text)
+    #     if story is None or description is None:
+    #         _logger.warning("Reformatting did not produce the expected format; returning raw output.")
+    #         return {
+    #             "story": completion_text,
+    #             "video_description": "",
+    #             "thinking": thinking,
+    #             "generation_time": generation_time,
+    #             "usage": usage_info
+    #         }
+    #     else:
+    #         completion_text = fixed_text
 
-    result["story"] = story
-    result["video_description"] = description
-
-    # Placeholder: Storyboard generation would happen here if needed by this function
-    # For now, it's handled separately or by the worker.
-    # if story and story.strip():
-    #     try:
-    #         _logger.info("Generating storyboard based on the story script...")
-    #         # Placeholder call - implement actual storyboard generation logic
-    #         storyboard_data = {"scenes": []} # Replace with actual call
-    #         result["storyboard"] = storyboard_data
-    #         _logger.info("Storyboard generation successful (placeholder).")
-    #     except Exception as e:
-    #         _logger.error(f"Storyboard generation failed: {e}")
-    #         result["storyboard"] = {"error": str(e)} # Store error in storyboard field
-
-
-    _logger.info(f"Story script generation complete. Time: {result['generation_time']:.2f}s. Tokens: {result['usage']}")
-    return result
+    # return {
+    #     "story": story,
+    #     "video_description": description,
+    #     "thinking": thinking,
+    #     "generation_time": generation_time,
+    #     "usage": usage_info
+    # }
