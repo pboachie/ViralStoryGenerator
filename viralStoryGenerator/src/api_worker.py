@@ -21,7 +21,6 @@ from viralStoryGenerator.utils.crawl4ai_scraper import get_scrape_result, queue_
 from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.src.llm import process_with_llm
 from viralStoryGenerator.src.storyboard import generate_storyboard
-from viralStoryGenerator.src.elevenlabs_tts import generate_audio
 from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.utils.text_processing import split_text_into_chunks
 from viralStoryGenerator.utils.vector_db_manager import add_chunks_to_collection, query_collection, delete_collection, close_client as close_vector_db
@@ -208,6 +207,7 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
             else:
                 queue_manager.store_result(job_id, {"message": "Generating audio...", "updated_at": time.time()}, merge=True, ttl=RESULT_TTL)
                 _logger.info(f"Job {job_id}: Generating audio (request flag is True, global flag is True)...")
+                temp_audio_path = None
                 try:
                     from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
                     from viralStoryGenerator.utils.storage_manager import storage_manager
@@ -236,8 +236,6 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
                                 filename=audio_filename,
                                 content_type="audio/mpeg"
                             )
-                        # Clean up temp file
-                        os.remove(temp_audio_path)
 
                         if "error" not in store_info:
                             audio_key = store_info.get("file_path")
@@ -251,9 +249,12 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
                 except Exception as audio_err:
                     _logger.exception(f"Job {job_id}: Error during audio generation/storage: {audio_err}")
                 finally:
-                    if 'temp_audio_path' in locals() and os.path.exists(temp_audio_path):
-                        try: os.remove(temp_audio_path)
-                        except OSError: pass
+                    if temp_audio_path and os.path.exists(temp_audio_path):
+                        try:
+                            os.remove(temp_audio_path)
+                            _logger.debug(f"Cleaned up temporary audio file: {temp_audio_path}")
+                        except OSError as e:
+                             _logger.error(f"Failed to remove temporary audio file {temp_audio_path}: {e}")
         elif not app_config.elevenLabs.ENABLED:
              _logger.info(f"Job {job_id}: Skipping audio generation (globally disabled via ENABLE_AUDIO_GENERATION=False).")
         else: # generate_audio_flag must be False
@@ -294,7 +295,11 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
     finally:
         # 9. Cleanup Vector DB Collection for this job
         _logger.info(f"Job {job_id}: Cleaning up vector database collection '{collection_name}'...")
-        delete_success = delete_collection(collection_name)
+        try:
+            delete_success = delete_collection(collection_name)
+        except ValueError as ve:
+            _logger.debug(f"Collection {collection_name} does not exist; skipping deletion. ({ve})")
+            delete_success = True
         if not delete_success:
              _logger.warning(f"Job {job_id}: Failed to cleanup vector database collection '{collection_name}'.")
 
@@ -469,9 +474,32 @@ def main():
         exit_code = 1
     finally:
         _logger.info("API Worker performing final cleanup...")
+
+        # Ensure proper cleanup sequence
         close_vector_db()
         close_scraper_redis_connections()
-        time.sleep(0.5)
+
+        # Add explicit cleanup for multiprocessing resources
+        try:
+            import multiprocessing as mp
+            if hasattr(mp, "resource_tracker") and hasattr(mp.resource_tracker, "_resource_tracker"):
+                _logger.debug("Performing explicit multiprocessing resource cleanup")
+                rt = mp.resource_tracker._resource_tracker
+                if rt is not None:
+                    rt.ensure_running()
+                    rt.join()
+        except Exception as cleanup_err:
+            _logger.debug(f"Optional multiprocessing cleanup step failed: {cleanup_err}")
+
+        # Force garbage collection to clean up lingering resources
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+
+        time.sleep(1.0)
+
     _logger.info("API Queue Worker shutdown complete.")
     sys.exit(exit_code)
 

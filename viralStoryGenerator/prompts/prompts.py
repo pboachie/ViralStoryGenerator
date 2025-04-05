@@ -185,7 +185,11 @@ Generate the corrected version now.
 def get_storyboard_prompt(story):
     return f"""
 ## Role
-You are a Storyboard Generator that chunks stories into structured JSON for video production.
+"You are a Storyboard Generator. Convert the following story into valid JSON "
+"with a key 'scenes' that is a list of 3-5 scenes. Each scene must include "
+"'scene_number' (an integer), 'narration_text' (15-30 words), "
+"'image_prompt' (a short descriptive string), 'duration' (in seconds), and "
+"'start_time' (in seconds). Output ONLY the JSON without any extra text.\n"
 
 ## Task
 Convert this story into 3-5 scenes with narration timing and image prompts. Output ONLY the valid JSON object, with NO other text before or after the JSON structure.
@@ -261,7 +265,7 @@ Now here's the kicker—alleged whistleblowers say NVIDIA is considering a recal
 ## Input Story
 {story}
 
-Generate ONLY the valid JSON output now.
+Generate valid JSON output now.
     """.strip()
 
 # TODO: To be implemented in the future

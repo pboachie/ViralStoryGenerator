@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # viralStoryGenerator/models/models.py
 
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional, List, Union, Tuple
 from pydantic import BaseModel, AnyHttpUrl, Field, field_validator
 from viralStoryGenerator.utils.config import config as app_config
 
@@ -87,3 +87,56 @@ class JobStatusResponse(BaseModel):
     error: Optional[str] = Field(None, description="Error message if failed")
     created_at: Optional[float] = Field(None, description="Timestamp when job was created")
     updated_at: Optional[float] = Field(None, description="Timestamp when job was last updated")
+
+class StoryboardScene(BaseModel):
+    scene_number: int = Field(..., description="Scene number")
+    narration_text: str = Field(..., description="Narration text")
+    image_prompt: str = Field(..., description="Image prompt")
+    duration: float = Field(..., description="Duration in seconds")
+    start_time: float = Field(..., description="Start time in seconds")
+
+class StoryboardResponse(BaseModel):
+    scenes: List[StoryboardScene] = Field(..., description="List of scenes in storyboard")
+
+class ScrapeJobRequest(BaseModel):
+    job_id: str = Field(..., description="Unique job identifier for the scrape request")
+    urls: List[str] = Field(..., description="List of URLs to scrape")
+    browser_config: Optional[Dict[str, Any]] = Field(None, description="Optional browser configuration")
+    run_config: Optional[Dict[str, Any]] = Field(None, description="Optional crawler run configuration")
+    request_time: float = Field(..., description="Timestamp when the scrape request was created")
+
+class ScrapeJobResult(BaseModel):
+    status: str = Field(..., description="Job status: processing, completed, or failed")
+    message: Optional[str] = Field(None, description="Update or status message")
+    error: Optional[str] = Field(None, description="Error details if the job failed")
+    data: Optional[List[Tuple[str, Optional[str]]]] = Field(None, description="List of scraped results (url and content)")
+    created_at: float = Field(..., description="Timestamp when the job was created")
+    updated_at: float = Field(..., description="Timestamp when the job was last updated")
+
+STORYBOARD_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "storyboard_response",
+        "strict": "true",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "scenes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "scene_number": {"type": "integer"},
+                            "narration_text": {"type": "string"},
+                            "image_prompt": {"type": "string"},
+                            "duration": {"type": "number"},
+                            "start_time": {"type": "number"}
+                        },
+                        "required": ["scene_number", "narration_text", "image_prompt", "duration", "start_time"]
+                    }
+                }
+            },
+            "required": ["scenes"]
+        }
+    }
+}

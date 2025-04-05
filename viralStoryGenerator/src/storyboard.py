@@ -13,6 +13,7 @@ from viralStoryGenerator.prompts.prompts import get_storyboard_prompt
 from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.utils.config import config as appconfig
 from viralStoryGenerator.utils.security import is_safe_filename
+from viralStoryGenerator.models.models import STORYBOARD_RESPONSE_FORMAT
 
 APP_USER_AGENT = f"{appconfig.APP_TITLE}/{appconfig.VERSION}"
 
@@ -55,8 +56,7 @@ def generate_storyboard_structure(story: str, llm_endpoint: str, model: str, tem
         "temperature": temperature,
         "max_tokens": appconfig.llm.MAX_TOKENS,
         "stream": False,
-        "response_format": {"type": "json_object"}
-
+        "response_format": STORYBOARD_RESPONSE_FORMAT
     }
 
     try:

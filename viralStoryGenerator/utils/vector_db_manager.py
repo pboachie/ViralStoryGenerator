@@ -103,8 +103,10 @@ def close_client():
         try:
             _logger.info("Resetting ChromaDB client...")
             client.reset() # Resets the client state, effective for PersistentClient
-            client = None # Allow reinitialization if needed
+            client = None
             _logger.info("ChromaDB client reset successfully.")
+        except ValueError as ve:
+            _logger.warning(f"ChromaDB client reset skipped: {ve}")
         except Exception as e:
             _logger.exception(f"Error resetting ChromaDB client: {e}")
 

@@ -212,20 +212,20 @@ def validate_config_on_startup(cfg: config):
     if cfg.elevenLabs.ENABLED and not cfg.elevenLabs.API_KEY: # Check if enabled AND key missing
          _config_logger.warning("Audio generation (ENABLE_AUDIO_GENERATION) is TRUE, but ELEVENLABS_API_KEY is missing. Audio generation will fail.")
     elif not cfg.elevenLabs.ENABLED:
-         _config_logger.info("Audio generation via ElevenLabs is globally disabled (ENABLE_AUDIO_GENERATION=False).")
+         _config_logger.critical("Audio generation via ElevenLabs is globally disabled (ENABLE_AUDIO_GENERATION=False).")
 
 
     if cfg.openAI.ENABLED and not cfg.openAI.API_KEY: # Check if enabled AND key missing
         _config_logger.warning("Image generation (ENABLE_IMAGE_GENERATION) is TRUE, but OPENAI_API_KEY is missing. DALL-E image generation for storyboards will fail.")
     elif not cfg.openAI.ENABLED:
-         _config_logger.info("Image generation via DALL-E is globally disabled (ENABLE_IMAGE_GENERATION=False).")
+         _config_logger.critical("Image generation via DALL-E is globally disabled (ENABLE_IMAGE_GENERATION=False).")
 
 
     if not cfg.llm.ENDPOINT or not cfg.llm.MODEL:
-        _config_logger.warning("LLM_ENDPOINT or LLM_MODEL is not configured. Story generation will likely fail.")
+        _config_logger.critical("LLM_ENDPOINT or LLM_MODEL is not configured. Story generation will likely fail.")
 
     if cfg.openAI.API_KEY is None:
-         _config_logger.warning("OPENAI_API_KEY is not configured. DALL-E image generation for storyboards will fail.")
+         _config_logger.critical("OPENAI_API_KEY is not configured. DALL-E image generation for storyboards will fail.")
 
     if cfg.storage.PROVIDER == "s3" and (not cfg.storage.S3_BUCKET_NAME or not cfg.storage.S3_ACCESS_KEY or not cfg.storage.S3_SECRET_KEY):
         _config_logger.error("Storage provider is S3, but required S3 settings (BUCKET_NAME, ACCESS_KEY, SECRET_KEY) are missing.")

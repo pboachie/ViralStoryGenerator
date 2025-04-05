@@ -7,6 +7,7 @@ import asyncio
 import signal
 import sys
 import time
+import json
 
 from viralStoryGenerator.utils.crawl4ai_scraper import process_scrape_queue_worker, redis_manager as scraper_redis_manager, close_scraper_redis_connections # Import cleanup
 from viralStoryGenerator.src.logger import logger as _logger
@@ -32,6 +33,12 @@ async def run_scrape_worker_main():
         _logger.error("Scraper Worker: Redis manager is not initialized!")
         return
 
+    if not scraper_redis_manager.is_available():
+        _logger.error("Scraper Worker: Redis is not available. Check connection settings.")
+        return
+
+    await clear_stalled_processing_jobs()
+
     worker_task = None
     try:
         # Worker configuration from config
@@ -53,9 +60,9 @@ async def run_scrape_worker_main():
         # Wait for shutdown signal
         await shutdown_event.wait()
         _logger.info("Shutdown signal received by scrape worker main loop.")
-
     except Exception as e:
-         _logger.exception(f"Error in scrape worker main setup or wait loop: {e}")
+        _logger.exception(f"Error in scrape worker main loop: {e}")
+        worker_task = None
     finally:
         # --- Shutdown Sequence ---
         if worker_task and not worker_task.done():
@@ -77,6 +84,45 @@ async def run_scrape_worker_main():
         close_scraper_redis_connections()
 
         _logger.info("Scraper Worker exiting.")
+
+async def clear_stalled_processing_jobs(max_age_seconds: int = 300):
+    """Cleans up any jobs stuck in the processing queue from previous runs."""
+    if not scraper_redis_manager or not scraper_redis_manager.is_available():
+        return
+
+    _logger.info("Checking for stalled jobs in processing queue...")
+    processing_queue_name = f"{scraper_redis_manager.queue_name}_processing"
+
+    try:
+        # Get all items from processing queue
+        stalled_items = scraper_redis_manager.client.lrange(processing_queue_name, 0, -1)
+        stalled_count = 0
+
+        for item_str in stalled_items:
+            try:
+                item = json.loads(item_str)
+                job_id = item.get('id') or item.get('job_id')
+
+                if job_id:
+                    # Mark job as failed
+                    scraper_redis_manager.store_result(job_id, {
+                        "status": "failed",
+                        "error": "Job was found stalled in processing queue",
+                        "updated_at": time.time()
+                    })
+
+                    # Remove from processing queue
+                    scraper_redis_manager.client.lrem(processing_queue_name, 0, item_str)
+                    stalled_count += 1
+                    _logger.warning(f"Marked stalled job {job_id} as failed and removed from queue")
+            except (json.JSONDecodeError, TypeError):
+                # For badly formatted items, just try to remove them
+                scraper_redis_manager.client.lrem(processing_queue_name, 0, item_str)
+
+        if stalled_count > 0:
+            _logger.info(f"Cleared {stalled_count} stalled jobs from processing queue")
+    except Exception as e:
+        _logger.error(f"Error clearing stalled jobs: {e}")
 
 def main():
     """Entry point for the Scraper worker process."""
@@ -105,13 +151,7 @@ def main():
         _logger.info("Scraper worker stopped by KeyboardInterrupt.")
     except Exception as e:
         _logger.exception(f"Scraper worker failed with unhandled exception: {e}")
-        exit_code = 1
-    finally:
-        # Ensure cleanup runs even if run_scrape_worker_main fails
-        _logger.info("Scraper Worker performing final cleanup...")
-        close_vector_db()
-        close_scraper_redis_connections()
-        time.sleep(0.5) # Allow brief moment for resource release
+        sys.exit(1)
 
     _logger.info("Scraper Queue Worker shutdown complete.")
     sys.exit(exit_code)

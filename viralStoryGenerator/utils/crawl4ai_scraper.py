@@ -26,6 +26,7 @@ except ImportError:
 from .redis_manager import RedisManager as RedisQueueManager
 from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.src.logger import logger as _logger
+from viralStoryGenerator.models.models import ScrapeJobRequest, ScrapeJobResult
 
 # Initialize Redis queue manager only if Redis is enabled
 redis_manager: Optional[RedisQueueManager] = None
@@ -132,38 +133,34 @@ async def queue_scrape_request(
     if not redis_manager:
         _logger.warning("Redis manager for scraper not available, cannot queue scrape request.")
         return None
-    _logger.debug(f"Scraper: Using Redis Manager for queue '{redis_manager.queue_name}' to queue scrape request.") # DEBUG ADDED
 
     job_id = str(uuid.uuid4())
-    request_payload = {
-        'id': job_id,
-        'data': {
-            'urls': [urls] if isinstance(urls, str) else urls,
-            'browser_config': browser_config_dict,
-            'run_config': run_config_dict
-        },
-        'request_time': time.time()
-    }
-    _logger.debug(f"Scraper: Preparing request payload for job {job_id}: {request_payload}") # DEBUG ADDED
-
+    scrape_request = ScrapeJobRequest(
+        job_id=job_id,
+        urls=[urls] if isinstance(urls, str) else urls,
+        browser_config=browser_config_dict,
+        run_config=run_config_dict,
+        request_time=time.time()
+    )
+    request_payload = scrape_request.model_dump()
+    if 'id' not in request_payload:
+        request_payload['id'] = request_payload.get("job_id")
+    _logger.debug(f"Scraper: Prepared request payload for job {job_id}: {request_payload}")
     success = redis_manager.add_request(request_payload)
     if not success:
         _logger.error("Failed to add scrape request to Redis queue.")
         return None
-
     _logger.info(f"Scrape request {job_id} queued successfully.")
-
     if wait_for_result:
          _logger.warning(f"Waiting for scrape result {job_id} (timeout: {timeout}s) - Blocking operation.")
          result = redis_manager.wait_for_result(job_id, timeout=timeout)
-         _logger.debug(f"Scraper: Wait result for {job_id}: {result}") # DEBUG ADDED
+         _logger.debug(f"Scraper: Wait result for {job_id}: {result}")
          if result and result.get("status") == "completed":
              _logger.info(f"Received result for scrape request {job_id}.")
              return job_id
          else:
              _logger.warning(f"Timed out or error waiting for scrape result {job_id}. Status: {result.get('status') if result else 'N/A'}")
              return None
-
     return job_id
 
 
@@ -227,7 +224,7 @@ async def process_scrape_queue_worker(
                  done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED, timeout=sleep_interval)
                  active_tasks = pending
                  num_to_fetch = min(batch_size, max_concurrent - len(active_tasks))
-                 if not active_tasks and num_to_fetch <=0:
+                 if not active_tasks and num_to_fetch <=0: # Break if no tasks left and still can't fetch
                       break
                  if num_to_fetch > 0: # Break if space becomes available
                       break
@@ -238,10 +235,34 @@ async def process_scrape_queue_worker(
                 for _ in range(num_to_fetch):
                     request = redis_manager.get_next_request()
                     if request:
-                         if isinstance(request, dict) and 'id' in request and 'data' in request:
-                             batch.append(request)
+                         if isinstance(request, dict):
+                             # Some requests may have direct 'data' key, others might have the data directly
+                             if 'id' in request and 'data' in request:
+                                 batch.append(request)
+                             elif 'job_id' in request:
+                                 job_id = request.get('job_id')
+                                 # Create compatible format
+                                 batch.append({
+                                     'id': job_id,
+                                     'data': request,
+                                     '_original_data': request.get('_original_data')
+                                 })
+                             else:
+                                 _logger.error(f"Invalid item received from scrape queue: {str(request)[:100]}...")
+                                 # Mark job as failed in Redis
+                                 job_id = request.get('id') or request.get('job_id')
+                                 if job_id:
+                                     redis_manager.store_result(job_id, {
+                                         "status": "failed",
+                                         "error": "Invalid job format",
+                                         "updated_at": time.time()
+                                     })
+                                 # Complete the request to remove it from the queue
+                                 if hasattr(redis_manager, 'complete_request') and isinstance(request, dict) and '_original_data' in request:
+                                     redis_manager.complete_request(request, success=False)
                          else:
                              _logger.error(f"Invalid item received from scrape queue: {str(request)[:100]}...")
+                             # Try to complete the request if possible
                              if hasattr(redis_manager, 'complete_request') and isinstance(request, dict) and '_original_data' in request:
                                  redis_manager.complete_request(request, success=False)
                     else: break # Queue empty
@@ -285,13 +306,27 @@ async def process_scrape_queue_worker(
 
 async def _process_single_scrape_job(request: Dict[str, Any], manager: RedisQueueManager):
     """Helper coroutine to process one scrape job."""
-    job_id = request['id']
-    _logger.debug(f"Scraper Worker: Starting processing for job {job_id}. Request: {request}") # DEBUG ADDED
-    job_data = request.get('data', {})
-    urls = job_data.get('urls')
+    # Fix: Improved job ID extraction and data handling
+    job_id = request.get('id') or request.get('job_id') or str(uuid.uuid4())
+    _logger.debug(f"Scraper Worker: Starting processing for job {job_id}. Request: {request}")
+
+    # Fix: Get job data, handling both wrapped and direct formats
+    if 'data' in request and isinstance(request['data'], dict):
+        job_data = request['data']
+    else:
+        job_data = request  # The request itself might be the data
+
+    # Fix: Extract URLs with more flexible handling
+    if isinstance(job_data.get('urls'), list):
+        urls = job_data.get('urls')
+    elif 'urls' in job_data:
+        urls = [job_data['urls']] if isinstance(job_data['urls'], str) else job_data['urls']
+    else:
+        urls = None
+
     browser_config_dict = job_data.get('browser_config')
     run_config_dict = job_data.get('run_config')
-    start_time = request.get('request_time', time.time())
+    start_time = job_data.get('request_time') or request.get('request_time') or time.time()
 
     scrape_successful = False
     final_status = "failed" # Default to failed
@@ -330,18 +365,16 @@ async def _process_single_scrape_job(request: Dict[str, Any], manager: RedisQueu
         scrape_successful = False
 
     finally:
-        # Store the final result/status
-        result_payload = {
-            "status": final_status,
-            "error": error_message,
-            "data": scrape_result_data,
-            "created_at": start_time,
-            "updated_at": time.time()
-        }
-        # Make sure error is None if successful
-        if scrape_successful:
-            result_payload.pop("error", None)
-
+        # Build the result using ScrapeJobResult
+        result_obj = ScrapeJobResult(
+            status=final_status,
+            message=None if scrape_successful else error_message,
+            error=None if scrape_successful else error_message,
+            data=scrape_result_data,
+            created_at=request.get('request_time', time.time()),
+            updated_at=time.time()
+        )
+        result_payload = result_obj.model_dump()
         _logger.debug(f"Scraper Worker: Storing final result for job {job_id}: {result_payload}") # DEBUG ADDED
         store_success = manager.store_result(job_id, result_payload)
         if store_success:
