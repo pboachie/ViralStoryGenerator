@@ -37,7 +37,6 @@ if app_config.redis.ENABLED:
         scrape_ttl = getattr(app_config.redis, 'SCRAPE_TTL', app_config.redis.TTL)
 
         _logger.info(f"Initializing Scraper RedisManager with Queue: '{scrape_queue_name}', Prefix: '{scrape_result_prefix}'") # DEBUG ADDED
-
         redis_manager = RedisQueueManager(
             queue_name=scrape_queue_name,
             result_prefix=scrape_result_prefix,

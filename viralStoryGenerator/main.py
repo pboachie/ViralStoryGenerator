@@ -16,7 +16,6 @@ from viralStoryGenerator.utils.scheduled_cleanup import cleanup_task
 from viralStoryGenerator.utils.storage_manager import storage_manager
 from viralStoryGenerator.src.api_handlers import process_audio_queue
 
-
 # --- Configuration Validation ---
 try:
     validate_config_on_startup(app_config)
@@ -28,7 +27,6 @@ except ConfigError as e:
 except Exception as e:
      print(f"Unexpected error during configuration validation: {e}", file=sys.stderr)
      sys.exit(1)
-
 
 async def scheduled_cleanup_runner():
     """
@@ -76,7 +74,6 @@ async def scheduled_cleanup_runner():
             _logger.exception(f"Error in scheduled cleanup/audio processing task: {e}")
             _logger.info("Sleeping for 1 hour before retrying scheduled tasks...")
             await asyncio.sleep(3600)
-
 
 # --- FastAPI App Setup ---
 
@@ -126,6 +123,30 @@ async def shutdown_event():
             _logger.error(f"Error closing storage manager during shutdown: {e}")
     _logger.info("Application shutdown sequence completed.")
 
+# --- Main Function (Entry point for running the server) ---
+def main():
+    """
+    Parses arguments and starts the Uvicorn server for the FastAPI application.
+    """
+    _logger.debug("Parsing command-line arguments for API server...")
+    parser = argparse.ArgumentParser(
+        description="ViralStoryGenerator API Server"
+    )
+
+    # API server command line arguments using defaults from config
+    parser.add_argument("--host", type=str, default=app_config.http.HOST,
+                        help="Host to bind the server to")
+    parser.add_argument("--port", type=int, default=app_config.http.PORT,
+                        help="Port to bind the server to")
+    parser.add_argument("--workers", type=int, default=app_config.http.WORKERS,
+                        help="Number of worker processes (ignored if --reload is used)")
+    parser.add_argument("--reload", action="store_true", default=False,
+                        help="Enable auto-reload for development (forces workers=1)")
+    parser.add_argument("--log-level", type=str, default=app_config.LOG_LEVEL.lower(),
+                        choices=["debug", "info", "warning", "error", "critical"],
+                        help="Logging level for Uvicorn")
+
+    args = parser.parse_args()
 
 # --- Main Function (Entry point for running the server) ---
 def main():

@@ -107,7 +107,6 @@ def cleanse_sources_cached(raw_sources: str, endpoint: str, model: str, temperat
 
     return summary
 
-
 def _chunk_text_by_words(text: str, chunk_size: int = 1500) -> List[str]:
     """Splits text into chunks by word count."""
     if chunk_size <= 0:

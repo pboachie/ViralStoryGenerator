@@ -321,7 +321,6 @@ class RedisManager:
          """Gets the length of the processing queue."""
          return self.get_queue_length(self.processing_queue_name)
 
-
     def wait_for_result(self, job_id: str, timeout: int = 300, check_interval: float = 0.5) -> Optional[Dict[str, Any]]:
         """Waits for a job result with polling (use with caution, consider websockets/SSE)."""
         if not self.client: return None
