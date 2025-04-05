@@ -16,7 +16,11 @@ setup(
     name="viralStoryGenerator",
     version="0.1.2",
     description="Generate short story scripts via a local LLM endpoint.",
-    packages=find_packages(),
+    packages=find_packages(include=["viralStoryGenerator", "viralStoryGenerator.*"]),
+    package_data={
+        "viralStoryGenerator": ["src/*", "utils/*", "models/*", "prompts/*"]
+    },
+    include_package_data=True,
     install_requires=[
         "requests>=2.28.2",
         "python-dotenv>=1.0.0",
