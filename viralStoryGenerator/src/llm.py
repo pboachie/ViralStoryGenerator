@@ -325,6 +325,7 @@ def generate_story_script(topic: str,
         _logger.debug("Thinking is enabled; extracting chain-of-thought...")
         # if reasoning_content is found in response, extract it
         if response_json["choices"][0]["message"].get("reasoning_content") and response_json["choices"][0]["message"].get("reasoning_content") != "":
+        if response_json["choices"][0]["message"].get("reasoning_content") and response_json["choices"][0]["message"].get("reasoning_content") != "":
             thinking = response_json["choices"][0]["message"]["reasoning_content"]
         else:
             # Fallback to regex extraction
@@ -335,6 +336,7 @@ def generate_story_script(topic: str,
     story, description = _check_format(clean_completion_text)
 
     # Generate the storyboard
+    if story and story.strip():
     if story and story.strip():
         try:
             _logger.info("Generating storyboard based on the story script...")
