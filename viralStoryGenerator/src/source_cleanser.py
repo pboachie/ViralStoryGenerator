@@ -10,6 +10,7 @@ from typing import List, Optional
 
 from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.utils.config import config as appconfig
+from viralStoryGenerator.utils.text_processing import split_text_into_chunks
 
 # Define cache database filename
 CACHE_DB = "chunk_summary_cache.db"
@@ -128,6 +129,29 @@ def _chunk_text_by_words(text: str, chunk_size: int = 1500) -> List[str]:
     return chunks
 
 
+def _summarize_chunk(chunk: str, endpoint: str, model: str, temperature: float) -> Optional[str]:
+    """Sends a single chunk to the LLM for summarization."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": f"Summarize this text concisely:\n\n{chunk}"}],
+        "temperature": temperature,
+        "max_tokens": 1024
+    }
+    _logger.debug(f"Sending chunk (length: {len(chunk)}) to LLM for summarization. Payload: {payload}")
+    try:
+        response = requests.post(endpoint, json=payload, timeout=60)
+        response.raise_for_status()
+        response_json = response.json()
+        summary = response_json["choices"][0]["message"]["content"].strip()
+        return summary
+    except requests.exceptions.RequestException as e:
+        _logger.error(f"Error calling LLM for source cleansing: {e}", exc_info=True)
+        return None
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        _logger.error(f"Failed to parse LLM response during source cleansing: {e}")
+        return None
+
+
 def chunkify_and_summarize(raw_sources: str, endpoint: str, model: str,
                            temperature: float = 0.7, chunk_size: int = 3000) -> Optional[str]:
     """
@@ -138,40 +162,32 @@ def chunkify_and_summarize(raw_sources: str, endpoint: str, model: str,
         _logger.info("chunkify_and_summarize called with empty input.")
         return ""
 
-    # Split the sources text
-    chunks = _chunk_text_by_words(raw_sources, chunk_size=chunk_size)
+    _logger.info(f"Starting chunking and summarization. Input length: {len(raw_sources)}, Chunk size: {chunk_size}")
+
+    if chunk_size <= 0:
+        _logger.warning(f"Invalid chunk_size ({chunk_size}). Defaulting to 5000.")
+        chunk_size = 5000
+
+    chunks = split_text_into_chunks(raw_sources, chunk_size)
+    _logger.info(f"Split content into {len(chunks)} chunk(s).")
+
     if not chunks:
-         _logger.warning("Source text resulted in zero chunks.")
-         return ""
+        _logger.warning("Text splitting resulted in zero chunks.")
+        return ""
 
-    # If only one chunk, summarize directly
-    if len(chunks) == 1:
-        _logger.debug("Single chunk detected, performing direct summary.")
-        return cleanse_sources_cached(chunks[0], endpoint, model, temperature)
+    summarized_chunks = []
+    for i, chunk in enumerate(chunks):
+        _logger.debug(f"Processing chunk {i+1}/{len(chunks)} (length: {len(chunk)})...")
+        summary = _summarize_chunk(chunk, endpoint, model, temperature)
+        if summary:
+            summarized_chunks.append(summary)
+        else:
+            _logger.error(f"Failed to summarize chunk {i+1}. Skipping.")
 
-    # Summarize each chunk individually
-    _logger.info(f"Splitting sources into {len(chunks)} chunks (size ~{chunk_size} words). Summarizing chunks...")
-    partial_summaries = []
-    for i, chunk in enumerate(chunks, start=1):
-        _logger.info(f"Summarizing chunk {i}/{len(chunks)}...")
-        chunk_summary = cleanse_sources_cached(chunk, endpoint, model, temperature)
-        if chunk_summary is None:
-            _logger.error(f"Failed to summarize chunk {i}. Aborting multi-chunk summarization.")
-            return None
-        partial_summaries.append(chunk_summary)
+    if not summarized_chunks:
+         _logger.error("Content cleansing failed for all chunks.")
+         raise ValueError("Content cleansing and summarization failed for all chunks.")
 
-    # Unify chunk summaries
-    _logger.info("Merging chunk summaries into final summary...")
-    if not partial_summaries:
-        _logger.error("No partial summaries generated, cannot merge.")
-        return None
-
-    all_partial_text = "\n\n".join(partial_summaries)
-    final_summary = cleanse_sources_cached(all_partial_text, endpoint, model, temperature)
-
-    if final_summary is None:
-         _logger.error("Failed to merge partial summaries.")
-         return None
-
-    _logger.info("Multi-chunk summarization complete.")
+    final_summary = "\n\n".join(summarized_chunks).strip()
+    _logger.info(f"Completed summarization. Final length: {len(final_summary)}")
     return final_summary
