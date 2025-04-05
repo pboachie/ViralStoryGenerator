@@ -3,19 +3,10 @@
 from dotenv import load_dotenv
 import os
 import sys
-import logging
 from typing import List, Optional, Union
+from viralStoryGenerator.src.logger import logger as _logger
 
 load_dotenv()
-
-_config_logger = logging.getLogger(__name__)
-_config_logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
-if not _config_logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    _config_logger.addHandler(handler)
-_config_logger.propagate = False
 
 
 class ConfigError(Exception):
@@ -183,65 +174,65 @@ def validate_config_on_startup(cfg: config):
     Performs basic checks on the loaded configuration, especially for production.
     Call this function early in the application startup sequence.
     """
-    _config_logger.info("Validating application configuration...")
+    _logger.info("Validating application configuration...")
     is_production = cfg.ENVIRONMENT == "production"
 
     # --- Security Checks ---
     if is_production:
         if not cfg.http.API_KEY_ENABLED:
-            _config_logger.warning("SECURITY WARNING: API Key authentication (API_KEY_ENABLED) is DISABLED in production environment!")
+            _logger.warning("SECURITY WARNING: API Key authentication (API_KEY_ENABLED) is DISABLED in production environment!")
         elif not cfg.http.API_KEY:
             raise ConfigError("CRITICAL SECURITY ERROR: API Key authentication (API_KEY_ENABLED) is TRUE but no API_KEY is set in production environment!")
         elif len(cfg.http.API_KEY) < 32:
-             _config_logger.warning(f"SECURITY WARNING: API_KEY seems short ({len(cfg.http.API_KEY)} characters). Consider a longer, randomly generated key.")
+             _logger.warning(f"SECURITY WARNING: API_KEY seems short ({len(cfg.http.API_KEY)} characters). Consider a longer, randomly generated key.")
 
 
         if "*" in cfg.http.CORS_ORIGINS:
-            _config_logger.critical("CRITICAL SECURITY WARNING: CORS_ORIGINS allows '*' in production. This MUST be restricted to your frontend domain(s).")
+            _logger.critical("CRITICAL SECURITY WARNING: CORS_ORIGINS allows '*' in production. This MUST be restricted to your frontend domain(s).")
         elif not cfg.http.CORS_ORIGINS:
-             _config_logger.warning("CORS_ORIGINS is empty in production. Frontend access might be blocked unless hosted on the same origin.")
+             _logger.warning("CORS_ORIGINS is empty in production. Frontend access might be blocked unless hosted on the same origin.")
 
 
         if not cfg.http.RATE_LIMIT_ENABLED:
-            _config_logger.warning("Rate limiting (RATE_LIMIT_ENABLED) is DISABLED in production. Enabling is recommended.")
+            _logger.warning("Rate limiting (RATE_LIMIT_ENABLED) is DISABLED in production. Enabling is recommended.")
 
         if cfg.http.SSL_ENABLED and (not cfg.http.SSL_CERT_FILE or not cfg.http.SSL_KEY_FILE):
-             _config_logger.warning("SSL_ENABLED is true, but SSL_CERT_FILE or SSL_KEY_FILE is missing. SSL might not function correctly (unless handled by proxy).")
+             _logger.warning("SSL_ENABLED is true, but SSL_CERT_FILE or SSL_KEY_FILE is missing. SSL might not function correctly (unless handled by proxy).")
 
     # --- Service Dependency Checks ---
     if cfg.elevenLabs.ENABLED and not cfg.elevenLabs.API_KEY: # Check if enabled AND key missing
-         _config_logger.warning("Audio generation (ENABLE_AUDIO_GENERATION) is TRUE, but ELEVENLABS_API_KEY is missing. Audio generation will fail.")
+         _logger.warning("Audio generation (ENABLE_AUDIO_GENERATION) is TRUE, but ELEVENLABS_API_KEY is missing. Audio generation will fail.")
     elif not cfg.elevenLabs.ENABLED:
-         _config_logger.critical("Audio generation via ElevenLabs is globally disabled (ENABLE_AUDIO_GENERATION=False).")
+         _logger.critical("Audio generation via ElevenLabs is globally disabled (ENABLE_AUDIO_GENERATION=False).")
 
 
     if cfg.openAI.ENABLED and not cfg.openAI.API_KEY: # Check if enabled AND key missing
-        _config_logger.warning("Image generation (ENABLE_IMAGE_GENERATION) is TRUE, but OPENAI_API_KEY is missing. DALL-E image generation for storyboards will fail.")
+        _logger.warning("Image generation (ENABLE_IMAGE_GENERATION) is TRUE, but OPENAI_API_KEY is missing. DALL-E image generation for storyboards will fail.")
     elif not cfg.openAI.ENABLED:
-         _config_logger.critical("Image generation via DALL-E is globally disabled (ENABLE_IMAGE_GENERATION=False).")
+         _logger.critical("Image generation via DALL-E is globally disabled (ENABLE_IMAGE_GENERATION=False).")
 
 
     if not cfg.llm.ENDPOINT or not cfg.llm.MODEL:
-        _config_logger.critical("LLM_ENDPOINT or LLM_MODEL is not configured. Story generation will likely fail.")
+        _logger.critical("LLM_ENDPOINT or LLM_MODEL is not configured. Story generation will likely fail.")
 
     if cfg.openAI.API_KEY is None:
-         _config_logger.critical("OPENAI_API_KEY is not configured. DALL-E image generation for storyboards will fail.")
+         _logger.critical("OPENAI_API_KEY is not configured. DALL-E image generation for storyboards will fail.")
 
     if cfg.storage.PROVIDER == "s3" and (not cfg.storage.S3_BUCKET_NAME or not cfg.storage.S3_ACCESS_KEY or not cfg.storage.S3_SECRET_KEY):
-        _config_logger.error("Storage provider is S3, but required S3 settings (BUCKET_NAME, ACCESS_KEY, SECRET_KEY) are missing.")
+        _logger.error("Storage provider is S3, but required S3 settings (BUCKET_NAME, ACCESS_KEY, SECRET_KEY) are missing.")
     elif cfg.storage.PROVIDER == "azure" and (not cfg.storage.AZURE_ACCOUNT_NAME or not cfg.storage.AZURE_ACCOUNT_KEY or not cfg.storage.AZURE_CONTAINER_NAME):
-        _config_logger.error("Storage provider is Azure, but required Azure settings (ACCOUNT_NAME, ACCOUNT_KEY, CONTAINER_NAME) are missing.")
+        _logger.error("Storage provider is Azure, but required Azure settings (ACCOUNT_NAME, ACCOUNT_KEY, CONTAINER_NAME) are missing.")
 
     if cfg.redis.ENABLED and not (cfg.redis.HOST and cfg.redis.PORT is not None):
-         _config_logger.error("Redis is ENABLED, but REDIS_HOST or REDIS_PORT is not configured.")
+         _logger.error("Redis is ENABLED, but REDIS_HOST or REDIS_PORT is not configured.")
 
     # --- Path Checks ---
     if not os.path.exists(cfg.security.SOURCE_MATERIALS_PATH):
-        _config_logger.warning(f"Source materials base path does not exist: {cfg.security.SOURCE_MATERIALS_PATH}. Creating it.")
+        _logger.warning(f"Source materials base path does not exist: {cfg.security.SOURCE_MATERIALS_PATH}. Creating it.")
         try:
             os.makedirs(cfg.security.SOURCE_MATERIALS_PATH, exist_ok=True)
         except OSError as e:
-            _config_logger.error(f"Failed to create source materials directory: {e}")
+            _logger.error(f"Failed to create source materials directory: {e}")
             # Consider raising ConfigError if sources are essential
 
     if cfg.storage.PROVIDER == "local":
@@ -253,19 +244,19 @@ def validate_config_on_startup(cfg: config):
         }
         for name, path in paths_to_check.items():
             if not path.startswith(local_base):
-                _config_logger.error(f"Configuration Error: {name} ({path}) is not inside LOCAL_STORAGE_PATH ({local_base}). This might indicate misconfiguration or a security risk.")
+                _logger.error(f"Configuration Error: {name} ({path}) is not inside LOCAL_STORAGE_PATH ({local_base}). This might indicate misconfiguration or a security risk.")
                 # raise ConfigError(f"{name} path is outside the configured local storage base path.")
 
     # --- RAG Checks ---
     if cfg.rag.ENABLED:
         if not os.path.exists(cfg.rag.VECTOR_DB_PATH):
-            _config_logger.warning(f"RAG Vector DB path does not exist: {cfg.rag.VECTOR_DB_PATH}. Attempting to create.")
+            _logger.warning(f"RAG Vector DB path does not exist: {cfg.rag.VECTOR_DB_PATH}. Attempting to create.")
             try:
                 os.makedirs(cfg.rag.VECTOR_DB_PATH, exist_ok=True)
             except OSError as e:
-                _config_logger.error(f"Failed to create RAG Vector DB directory: {e}")
+                _logger.error(f"Failed to create RAG Vector DB directory: {e}")
 
-    _config_logger.info("Configuration validation complete.")
+    _logger.info("Configuration validation complete.")
 
 
 app_config = config()

@@ -29,7 +29,6 @@ from viralStoryGenerator.models import (
 )
 
 from viralStoryGenerator.utils.health_check import get_service_status
-from viralStoryGenerator.src.api_worker import process_story_request as process_story_generation
 from viralStoryGenerator.utils.redis_manager import RedisManager as RedisQueueManager
 from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.utils.storage_manager import storage_manager
@@ -671,11 +670,10 @@ async def stream_audio(filename: str, request: Request):
                       bytes_yielded += len(chunk)
                  if hasattr(stream, 'close'): stream.close()
 
-            elif hasattr(stream, 'chunks'): # Azure stream
+            elif hasattr(stream, 'chunks'): # Check if it's a file-like object/stream
                  async for chunk in stream.chunks():
                       yield chunk
                       bytes_yielded += len(chunk)
-                 # TODO: Refine Azure streaming based on actual 'chunks' behavior with range
 
             elif isinstance(stream, bytes):
                  yield stream
@@ -794,7 +792,7 @@ async def generate_story_from_urls(
                  "temperature": request.temperature if request.temperature is not None else app_config.llm.TEMPERATURE,
                  "chunk_size": request.chunk_size if request.chunk_size is not None else app_config.llm.CHUNK_SIZE
             },
-             "request_time": time.time()
+            "request_time": time.time()
         }
 
         # Add request to the queue
@@ -802,9 +800,6 @@ async def generate_story_from_urls(
         if not success:
             _logger.error(f"Failed to add job {job_id} to Redis queue.")
             raise HTTPException(status_code=500, detail="Failed to queue job for processing.")
-
-        # for testing purposes, we can call the worker directly
-        # background_tasks.add_task(process_story_generation, job_id, job_data['data']) # Remove this line
 
         _logger.info(f"Job {job_id} queued successfully for topic: '{request.topic}'")
         return JobResponse(

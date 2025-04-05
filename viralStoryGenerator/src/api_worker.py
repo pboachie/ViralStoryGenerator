@@ -17,15 +17,13 @@ from viralStoryGenerator.models import (
     JobStatusResponse
 )
 from viralStoryGenerator.utils.redis_manager import RedisManager as RedisQueueManager
-from viralStoryGenerator.utils.crawl4ai_scraper import get_scrape_result, queue_scrape_request, redis_manager as scraper_redis_manager
+from viralStoryGenerator.utils.crawl4ai_scraper import get_scrape_result, queue_scrape_request, get_redis_manager, close_scraper_redis_connections
 from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.src.llm import process_with_llm
 from viralStoryGenerator.src.storyboard import generate_storyboard
 from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.utils.text_processing import split_text_into_chunks
-from viralStoryGenerator.utils.vector_db_manager import add_chunks_to_collection, query_collection, delete_collection, close_client as close_vector_db
-from viralStoryGenerator.utils.crawl4ai_scraper import close_scraper_redis_connections
-
+from viralStoryGenerator.utils.vector_db_manager import add_chunks_to_collection, query_collection, delete_collection, close_client as close_vector_db, get_client as get_vector_db_client, get_embedding_function
 # TODO: Import storage manager needed for potential file URL construction? Maybe not needed directly here.
 # from viralStoryGenerator.utils.storage_manager import storage_manager
 
@@ -34,6 +32,12 @@ API_QUEUE_NAME = app_config.redis.QUEUE_NAME
 API_RESULT_PREFIX = app_config.redis.RESULT_PREFIX
 RESULT_TTL = app_config.redis.TTL
 
+# Global instances of pre-initialized components
+_api_queue_manager = None
+_scraper_redis_manager = None
+_vector_db_client = None
+_embedding_function = None
+
 # Graceful shutdown handler
 shutdown_event = asyncio.Event()
 
@@ -41,6 +45,92 @@ def handle_shutdown(sig, frame):
     """Handle shutdown signals gracefully."""
     _logger.info(f"Received signal {sig}, initiating shutdown for API worker...")
     shutdown_event.set()
+
+def preload_components():
+    """Preload and initialize key components at startup."""
+    global _api_queue_manager, _scraper_redis_manager, _vector_db_client, _embedding_function
+
+    _logger.info("Preloading key components to optimize performance...")
+
+    # 1. Initialize API Redis queue manager
+    try:
+        _logger.info("Initializing API Redis queue manager...")
+        _api_queue_manager = RedisQueueManager(
+            queue_name=API_QUEUE_NAME,
+            result_prefix=API_RESULT_PREFIX,
+            ttl=RESULT_TTL
+        )
+        if _api_queue_manager.is_available():
+            _logger.info(f"API Redis queue manager initialized successfully for queue '{API_QUEUE_NAME}'")
+        else:
+            _logger.warning("API Redis queue manager initialized but Redis is unavailable")
+    except Exception as e:
+        _logger.error(f"Failed to initialize API Redis queue manager: {e}")
+
+    # 2. Initialize Scraper Redis manager
+    try:
+        _logger.info("Initializing Scraper Redis manager...")
+        _scraper_redis_manager = get_redis_manager()
+        if _scraper_redis_manager and _scraper_redis_manager.is_available():
+            _logger.info(f"Scraper Redis manager initialized successfully for queue '{_scraper_redis_manager.queue_name}'")
+        else:
+            _logger.warning("Failed to initialize Scraper Redis manager or Redis is unavailable")
+    except Exception as e:
+        _logger.error(f"Error initializing Scraper Redis manager: {e}")
+
+    # 3. Initialize Vector DB client and embedding model
+    if app_config.rag.ENABLED:
+        try:
+            _logger.info("Initializing Vector DB client and embedding model...")
+            _vector_db_client = get_vector_db_client()
+            if _vector_db_client:
+                _logger.info("Vector DB client initialized successfully")
+
+                # Initialize embedding model (this is the slow part)
+                _embedding_function = get_embedding_function()
+                if _embedding_function:
+                    _logger.info("Embedding model initialized successfully")
+                else:
+                    _logger.warning("Failed to initialize embedding model")
+            else:
+                _logger.warning("Failed to initialize Vector DB client")
+        except Exception as e:
+            _logger.error(f"Error initializing Vector DB components: {e}")
+    else:
+        _logger.info("RAG is disabled in configuration, skipping Vector DB initialization")
+
+    _logger.info("Component preloading complete")
+
+def get_queue_manager() -> Optional[RedisQueueManager]:
+    """Get the pre-initialized queue manager or create a new one if needed."""
+    global _api_queue_manager
+    if _api_queue_manager is not None and _api_queue_manager.is_available():
+        return _api_queue_manager
+
+    # Initialize if not already done
+    try:
+        _api_queue_manager = RedisQueueManager(
+            queue_name=API_QUEUE_NAME,
+            result_prefix=API_RESULT_PREFIX,
+            ttl=RESULT_TTL
+        )
+        if not _api_queue_manager.is_available():
+            _logger.warning("API Redis queue manager initialized but Redis is unavailable")
+            return None
+        return _api_queue_manager
+    except Exception as e:
+        _logger.error(f"Failed to initialize API Redis queue manager: {e}")
+        return None
+
+def get_vector_db():
+    """Get the pre-initialized vector DB client."""
+    global _vector_db_client
+    return _vector_db_client or get_vector_db_client()
+
+def get_embedding():
+    """Get the pre-initialized embedding function."""
+    global _embedding_function
+    return _embedding_function or get_embedding_function()
 
 async def process_story_request(job_id: str, request_data: Dict[str, Any], queue_manager: RedisQueueManager):
     """
@@ -82,6 +172,12 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
         status_update = {"status": "processing", "message": "Starting job processing", "updated_at": time.time()}
         queue_manager.store_result(job_id, status_update, merge=True, ttl=RESULT_TTL)
 
+        global _scraper_redis_manager
+        scraper_redis_manager = _scraper_redis_manager or get_redis_manager()
+        if not scraper_redis_manager:
+            _logger.error(f"Job {job_id}: Failed to initialize scraper Redis manager")
+            raise ValueError("Scraper Redis manager unavailable")
+
         # 2. Scrape URLs
         _logger.info(f"Job {job_id}: Scraping content from {len(urls)} URL(s)...")
         queue_manager.store_result(job_id, {"message": "Scraping content...", "updated_at": time.time()}, merge=True, ttl=RESULT_TTL)
@@ -97,18 +193,63 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
         retry_interval = 5
         scrape_result = None
         for attempt in range(max_retries):
-            if scraper_redis_manager:
-                 _logger.debug(f"Job {job_id}: Attempt {attempt + 1}: Calling get_scrape_result for ID '{scrape_request_id}'. It will use manager with prefix '{scraper_redis_manager.result_prefix}'.") # DEBUG ADDED
-            else:
-                 _logger.error(f"Job {job_id}: Attempt {attempt + 1}: Cannot call get_scrape_result, scraper_redis_manager not initialized.")
-                 break
+            _logger.debug(f"Job {job_id}: Attempt {attempt + 1}: Calling get_scrape_result for ID '{scrape_request_id}'.")
 
+            # Get the current status from Redis directly
+            scrape_status_data = scraper_redis_manager.get_result(scrape_request_id)
+
+            # Check if job has failed or been completed
+            if scrape_status_data:
+                status = scrape_status_data.get("status")
+                if status == "failed":
+                    error_msg = scrape_status_data.get("error", "Unknown scraping error")
+                    _logger.error(f"Job {job_id}: Scrape job {scrape_request_id} failed with error: {error_msg}")
+                    raise ValueError(f"Web scraping failed: {error_msg}")
+
+            # Try to get the actual result
             scrape_result = await get_scrape_result(scrape_request_id)
             if scrape_result:
-                _logger.debug(f"Job {job_id}: Successfully retrieved scrape result for scrape ID {scrape_request_id}.") # DEBUG ADDED
+                _logger.debug(f"Job {job_id}: Successfully retrieved scrape result.")
                 break
-            scrape_status_data = scraper_redis_manager.get_result(scrape_request_id) if scraper_redis_manager else None
-            _logger.warning(f"Job {job_id}: Scrape result for scrape ID {scrape_request_id} not ready (Status: {scrape_status_data.get('status') if scrape_status_data else 'Not Found/Manager Unavailable'}). Retrying in {retry_interval}s (Attempt {attempt + 1}/{max_retries})...") # DEBUG ADDED
+
+            # Check if the job is missing from processing queue and has no result
+            if attempt > 0 and scrape_status_data and scrape_status_data.get("status") == "queued":
+                # Determine whether the job might have been removed from the queue without updating status
+                processing_queue = f"{scraper_redis_manager.queue_name}_processing"
+                main_queue = scraper_redis_manager.queue_name
+
+                # On the last attempt, check if the job is actually in any queue
+                if attempt == max_retries - 1:
+                    # Before giving up, check queues for this job
+                    try:
+                        # Check if job is in either queue
+                        job_in_queue = False
+                        for queue_name in [main_queue, processing_queue]:
+                            queue_items = scraper_redis_manager.client.lrange(queue_name, 0, -1)
+                            for item in queue_items:
+                                try:
+                                    item_data = json.loads(item)
+                                    if item_data.get('id') == scrape_request_id or item_data.get('job_id') == scrape_request_id:
+                                        job_in_queue = True
+                                        break
+                                except:
+                                    continue
+                            if job_in_queue:
+                                break
+
+                        if not job_in_queue:
+                            _logger.warning(f"Job {job_id}: Scrape job {scrape_request_id} not found in any queue but status is still 'queued'. It was likely rejected.")
+                            # Force update the status to failed
+                            scraper_redis_manager.store_result(scrape_request_id, {
+                                "status": "failed",
+                                "error": "Job was likely removed from queue without status update",
+                                "updated_at": time.time()
+                            })
+                            raise ValueError(f"Scrape job was rejected or removed without processing")
+                    except Exception as e:
+                        _logger.error(f"Error checking queue membership: {e}")
+
+            _logger.warning(f"Job {job_id}: Scrape result for scrape ID {scrape_request_id} not ready (Status: {scrape_status_data.get('status') if scrape_status_data else 'Not Found'}).")
             await asyncio.sleep(retry_interval)
 
         if not scrape_result:
@@ -149,7 +290,13 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
              metadatas = [{"chunk_index": i} for i in range(len(chunks))]
 
         # Add chunks to the vector database collection
-        add_success = add_chunks_to_collection(collection_name, chunks, metadatas, doc_ids)
+        vector_db = get_vector_db()
+        embedding_func = get_embedding()
+        if vector_db and embedding_func:
+            add_success = add_chunks_to_collection(collection_name, chunks, metadatas, doc_ids)
+        else:
+            # Fall back to the original functions if pre-initialized components aren't available
+            add_success = add_chunks_to_collection(collection_name, chunks, metadatas, doc_ids)
         if not add_success:
              raise RuntimeError(f"Failed to add chunks to vector database for job {job_id}.")
         _logger.info(f"Job {job_id}: Successfully stored chunks in vector DB.")
@@ -326,7 +473,13 @@ async def run_worker():
     _logger.info(f"API Worker Config: BatchSize={batch_size}, SleepInterval={sleep_interval}s, MaxConcurrent={max_concurrent}")
     _logger.info(f"API Worker: Listening to Redis queue: '{API_QUEUE_NAME}' with result prefix '{API_RESULT_PREFIX}'")
 
-    queue_manager = None
+    global _api_queue_manager
+    queue_manager = _api_queue_manager
+
+    if not queue_manager or not queue_manager.is_available():
+        # Try to initialize if not already done
+        queue_manager = get_queue_manager()
+
     while not queue_manager:
         if shutdown_event.is_set():
             _logger.info("Shutdown signal received during startup. Exiting.")
@@ -463,6 +616,9 @@ def main():
         _logger.error("Redis is disabled in configuration (REDIS_ENABLED=False). API Worker cannot run.")
         sys.exit(1)
 
+    # NEW: Preload components at startup
+    preload_components()
+
     exit_code = 0
     try:
         asyncio.run(run_worker())
@@ -475,9 +631,15 @@ def main():
     finally:
         _logger.info("API Worker performing final cleanup...")
 
-        # Ensure proper cleanup sequence
-        close_vector_db()
-        close_scraper_redis_connections()
+        try:
+            close_vector_db()
+        except Exception as e:
+            _logger.error(f"Error during vector DB cleanup: {e}")
+
+        try:
+            close_scraper_redis_connections()
+        except Exception as e:
+            _logger.error(f"Error closing scraper Redis connections: {e}")
 
         # Add explicit cleanup for multiprocessing resources
         try:

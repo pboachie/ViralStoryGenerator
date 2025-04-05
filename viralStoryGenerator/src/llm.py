@@ -95,7 +95,7 @@ def process_with_llm(topic: str, relevant_content: str, temperature: float) -> s
     """
     _logger.debug(f"Processing with LLM for topic: {topic} using RAG content.")
 
-    # Basic input validation (more complex validation might be needed depending on LLM)
+    # Basic input validation
     if not topic:
         _logger.error("LLM processing request failed: Topic cannot be empty.")
         raise ValueError("Topic cannot be empty")

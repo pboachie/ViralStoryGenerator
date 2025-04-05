@@ -15,6 +15,7 @@ try:
     from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
     _CRAWL4AI_AVAILABLE = True
 except ImportError:
+    from viralStoryGenerator.src.logger import logger as _logger
     _logger.error("Crawl4AI library not found. pip install crawl4ai")
     _CRAWL4AI_AVAILABLE = False
     class AsyncWebCrawler: pass
@@ -28,9 +29,18 @@ from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.models.models import ScrapeJobRequest, ScrapeJobResult
 
-# Initialize Redis queue manager only if Redis is enabled
 redis_manager: Optional[RedisQueueManager] = None
-if app_config.redis.ENABLED:
+
+# Function to get or initialize Redis manager
+def get_redis_manager() -> Optional[RedisQueueManager]:
+    """Lazily initialize Redis manager for scraping."""
+    global redis_manager
+    if redis_manager is not None:
+        return redis_manager
+
+    if not app_config.redis.ENABLED:
+        return None
+
     try:
         # Use scrape-specific config values
         scrape_queue_name = getattr(app_config.redis, 'SCRAPE_QUEUE_NAME', 'viralstory_scrape_queue')
@@ -49,6 +59,8 @@ if app_config.redis.ENABLED:
     except Exception as e:
          _logger.exception(f"Failed to initialize RedisManager for scraper: {e}")
          redis_manager = None
+
+    return redis_manager
 
 
 # --- Main Scraping Function ---
@@ -130,7 +142,8 @@ async def queue_scrape_request(
     timeout: int = 300
 ) -> Optional[str]:
     """Queues a scraping request via Redis if manager is available."""
-    if not redis_manager:
+    manager = get_redis_manager()
+    if not manager:
         _logger.warning("Redis manager for scraper not available, cannot queue scrape request.")
         return None
 
@@ -146,14 +159,14 @@ async def queue_scrape_request(
     if 'id' not in request_payload:
         request_payload['id'] = request_payload.get("job_id")
     _logger.debug(f"Scraper: Prepared request payload for job {job_id}: {request_payload}")
-    success = redis_manager.add_request(request_payload)
+    success = manager.add_request(request_payload)
     if not success:
         _logger.error("Failed to add scrape request to Redis queue.")
         return None
     _logger.info(f"Scrape request {job_id} queued successfully.")
     if wait_for_result:
          _logger.warning(f"Waiting for scrape result {job_id} (timeout: {timeout}s) - Blocking operation.")
-         result = redis_manager.wait_for_result(job_id, timeout=timeout)
+         result = manager.wait_for_result(job_id, timeout=timeout)
          _logger.debug(f"Scraper: Wait result for {job_id}: {result}")
          if result and result.get("status") == "completed":
              _logger.info(f"Received result for scrape request {job_id}.")
@@ -166,14 +179,15 @@ async def queue_scrape_request(
 
 async def get_scrape_result(request_id: str) -> Optional[List[Tuple[str, Optional[str]]]]:
     """Gets the result of a previously queued scraping request."""
-    if not redis_manager:
+    manager = get_redis_manager()
+    if not manager:
         _logger.error("Redis manager for scraper not available, cannot get scrape result.")
         return None
 
-    result_data = redis_manager.get_result(request_id)
+    result_data = manager.get_result(request_id)
     _logger.debug(f"Scraper: get_scrape_result for {request_id}. Raw data from Redis: {result_data}") # DEBUG ADDED
     if not result_data:
-        if redis_manager.check_key_exists(request_id):
+        if manager.check_key_exists(request_id):
             _logger.debug(f"Scrape job {request_id} is pending/processing.")
         else:
             _logger.warning(f"Scrape job {request_id} not found.")
@@ -402,3 +416,7 @@ def close_scraper_redis_connections():
     elif redis_manager:
          _logger.warning("Scraper Redis manager exists but has no 'close' method.")
     redis_manager = None
+
+# Export get_redis_manager to make sure it's properly available
+__all__ = ['scrape_urls', 'queue_scrape_request', 'get_scrape_result', 'get_redis_manager',
+           'process_scrape_queue_worker', 'close_scraper_redis_connections']

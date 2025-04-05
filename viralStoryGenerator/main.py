@@ -148,31 +148,6 @@ def main():
 
     args = parser.parse_args()
 
-# --- Main Function (Entry point for running the server) ---
-def main():
-    """
-    Parses arguments and starts the Uvicorn server for the FastAPI application.
-    """
-    _logger.debug("Parsing command-line arguments for API server...")
-    parser = argparse.ArgumentParser(
-        description="ViralStoryGenerator API Server"
-    )
-
-    # API server command line arguments using defaults from config
-    parser.add_argument("--host", type=str, default=app_config.http.HOST,
-                        help="Host to bind the server to")
-    parser.add_argument("--port", type=int, default=app_config.http.PORT,
-                        help="Port to bind the server to")
-    parser.add_argument("--workers", type=int, default=app_config.http.WORKERS,
-                        help="Number of worker processes (ignored if --reload is used)")
-    parser.add_argument("--reload", action="store_true", default=False,
-                        help="Enable auto-reload for development (forces workers=1)")
-    parser.add_argument("--log-level", type=str, default=app_config.LOG_LEVEL.lower(),
-                        choices=["debug", "info", "warning", "error", "critical"],
-                        help="Logging level for Uvicorn")
-
-    args = parser.parse_args()
-
     # Log startup information using the colored logger
     log_startup(
         environment=app_config.ENVIRONMENT,

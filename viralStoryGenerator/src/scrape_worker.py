@@ -9,10 +9,15 @@ import sys
 import time
 import json
 
-from viralStoryGenerator.utils.crawl4ai_scraper import process_scrape_queue_worker, redis_manager as scraper_redis_manager, close_scraper_redis_connections # Import cleanup
+from viralStoryGenerator.utils.crawl4ai_scraper import (
+    process_scrape_queue_worker,
+    get_redis_manager,
+    close_scraper_redis_connections
+)
 from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.utils.config import config as app_config
-from viralStoryGenerator.utils.vector_db_manager import close_client as close_vector_db
+
+_scraper_redis_manager = None
 
 # Graceful shutdown handler
 shutdown_event = asyncio.Event()
@@ -22,9 +27,30 @@ def handle_shutdown(sig, frame):
     _logger.info(f"Received signal {sig}, initiating shutdown for Scraper worker...")
     shutdown_event.set()
 
+def preload_components():
+    """Preload and initialize key components at startup."""
+    global _scraper_redis_manager
+
+    _logger.info("Preloading scraper components for optimal performance...")
+
+    try:
+        _logger.info("Initializing Scraper Redis manager...")
+        _scraper_redis_manager = get_redis_manager()
+        if _scraper_redis_manager and _scraper_redis_manager.is_available():
+            _logger.info(f"Scraper Redis manager initialized successfully for queue '{_scraper_redis_manager.queue_name}'")
+        else:
+            _logger.error("Failed to initialize Scraper Redis manager or Redis is unavailable")
+    except Exception as e:
+        _logger.error(f"Error initializing Scraper Redis manager: {e}")
+
+    _logger.info("Scraper component preloading complete")
+
 async def run_scrape_worker_main():
     """Runs the main scrape worker loop and handles shutdown."""
     _logger.info("Starting Scraper Worker process...")
+
+    global _scraper_redis_manager
+    scraper_redis_manager = _scraper_redis_manager or get_redis_manager()
 
     # Explicitly log the queue name being used by the scraper's redis_manager
     if scraper_redis_manager:
@@ -78,8 +104,6 @@ async def run_scrape_worker_main():
                 _logger.exception(f"Exception during scrape worker task cancellation/cleanup: {e}")
 
         # Close resources
-        _logger.info("Closing Vector DB client (from scrape worker)...")
-        close_vector_db()
         _logger.info("Closing Scraper Redis connection pool...")
         close_scraper_redis_connections()
 
@@ -87,6 +111,9 @@ async def run_scrape_worker_main():
 
 async def clear_stalled_processing_jobs(max_age_seconds: int = 300):
     """Cleans up any jobs stuck in the processing queue from previous runs."""
+    global _scraper_redis_manager
+    scraper_redis_manager = _scraper_redis_manager or get_redis_manager()
+
     if not scraper_redis_manager or not scraper_redis_manager.is_available():
         return
 
@@ -139,6 +166,12 @@ def main():
     if not app_config.redis.ENABLED:
         _logger.error("Redis is disabled in configuration (REDIS_ENABLED=False). Scraper Worker cannot run.")
         sys.exit(1)
+
+    preload_components()
+
+    global _scraper_redis_manager
+    scraper_redis_manager = _scraper_redis_manager
+
     # Use the imported manager for the check
     if not scraper_redis_manager or not scraper_redis_manager.is_available():
         _logger.error("Scraper Redis manager failed to initialize or connect. Scraper Worker cannot run.")

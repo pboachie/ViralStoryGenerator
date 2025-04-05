@@ -50,7 +50,7 @@ def generate_storyboard_structure(story: str, llm_endpoint: str, model: str, tem
     data = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "You are a helpful assistant that strictly follows instructions to generate structured JSON output."},
+            {"role": "system", "content": "You are a helpful assistant that strictly follows instructions to generate structured JSON output with no extra text."},
             {"role": "user", "content": prompt}
         ],
         "temperature": temperature,
@@ -67,30 +67,15 @@ def generate_storyboard_structure(story: str, llm_endpoint: str, model: str, tem
             timeout=appconfig.httpOptions.TIMEOUT
         )
         response.raise_for_status()
-        response_json = response.json()
-        content = response_json["choices"][0]["message"]["content"]
-
-        if isinstance(content, str):
-             content = re.sub(r'^```(?:json)?\s*|\s*```$', '', content).strip()
-             storyboard_data = json.loads(content)
-        elif isinstance(content, dict):
-             storyboard_data = content
+    except requests.exceptions.HTTPError as e:
+        if response.status_code == 400:
+            _logger.warning("LLM returned 400 Bad Request, retrying without 'response_format' parameter.")
+            data.pop("response_format", None)
+            response = requests.post(llm_endpoint, headers=headers, json=data, timeout=appconfig.httpOptions.TIMEOUT)
+            response.raise_for_status()
         else:
-             _logger.error(f"Unexpected content type in LLM response for storyboard: {type(content)}")
-             return None
-
-        # Basic validation of structure
-        if "scenes" not in storyboard_data or not isinstance(storyboard_data["scenes"], list):
-             _logger.error("Generated storyboard JSON is missing 'scenes' list.")
-             return None
-
-        _logger.info(f"Successfully generated storyboard structure with {len(storyboard_data['scenes'])} scenes.")
-
-        thinking = response_json["choices"][0]["message"].get("reasoning_content")
-        if thinking: storyboard_data["thinking"] = thinking
-
-        return storyboard_data
-
+            _logger.error(f"LLM request for storyboard failed: {e}")
+            return None
     except requests.exceptions.Timeout:
          _logger.error(f"LLM request for storyboard timed out after {appconfig.httpOptions.TIMEOUT} seconds.")
          return None
@@ -104,6 +89,30 @@ def generate_storyboard_structure(story: str, llm_endpoint: str, model: str, tem
     except (KeyError, IndexError) as e:
          _logger.error(f"Unexpected LLM response structure for storyboard: {e}. Response: {response_json}")
          return None
+
+    response_json = response.json()
+    content = response_json["choices"][0]["message"]["content"]
+
+    if isinstance(content, str):
+         content = re.sub(r'^```(?:json)?\s*|\s*```$', '', content).strip()
+         storyboard_data = json.loads(content)
+    elif isinstance(content, dict):
+         storyboard_data = content
+    else:
+         _logger.error(f"Unexpected content type in LLM response for storyboard: {type(content)}")
+         return None
+
+    # Basic validation of structure
+    if "scenes" not in storyboard_data or not isinstance(storyboard_data["scenes"], list):
+         _logger.error("Generated storyboard JSON is missing 'scenes' list.")
+         return None
+
+    _logger.info(f"Successfully generated storyboard structure with {len(storyboard_data['scenes'])} scenes.")
+
+    thinking = response_json["choices"][0]["message"].get("reasoning_content")
+    if thinking: storyboard_data["thinking"] = thinking
+
+    return storyboard_data
 
 
 def generate_dalle_image(image_prompt: str, output_image_path: str, openai_api_key: str) -> Optional[str]:

@@ -17,10 +17,11 @@ from viralStoryGenerator.utils.config import config as appconfig
 from viralStoryGenerator.utils.redis_manager import RedisManager
 from viralStoryGenerator.utils.storage_manager import storage_manager
 from viralStoryGenerator.utils.security import is_file_in_directory, validate_path_component, sanitize_for_filename
+from viralStoryGenerator.src.client import get_api_redis_manager
 
-
-# Initialize Redis manager only if enabled in config
-redis_manager = RedisManager() if appconfig.redis.ENABLED else None
+def get_redis_manager() -> Optional[RedisManager]:
+    """Get Redis manager for API handlers"""
+    return get_api_redis_manager()
 
 class StoryTask:
     """Basic representation of a task state for API response."""

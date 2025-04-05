@@ -9,3 +9,5 @@ __pycache__
 /build/*
 build/*
 *.log
+*.sqlite3
+storage/*
