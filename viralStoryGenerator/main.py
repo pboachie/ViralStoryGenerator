@@ -168,11 +168,10 @@ def main():
         workers=args.workers if not args.reload else 1,
         reload=args.reload,
         log_level=args.log_level,
-        # Add SSL parameters if needed, though typically handled by proxy
+        access_log=False,
         ssl_keyfile=app_config.http.SSL_KEY_FILE if app_config.http.SSL_ENABLED else None,
         ssl_certfile=app_config.http.SSL_CERT_FILE if app_config.http.SSL_ENABLED else None,
     )
-
 
 # --- Script Execution Guard ---
 if __name__ == "__main__":
