@@ -17,7 +17,7 @@ from viralStoryGenerator.models import (
     JobStatusResponse
 )
 from viralStoryGenerator.utils.redis_manager import RedisManager as RedisQueueManager
-from viralStoryGenerator.utils.crawl4ai_scraper import get_scrape_result, queue_scrape_request
+from viralStoryGenerator.utils.crawl4ai_scraper import get_scrape_result, queue_scrape_request, redis_manager as scraper_redis_manager
 from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.src.llm import process_with_llm
 from viralStoryGenerator.src.source_cleanser import chunkify_and_summarize
@@ -75,8 +75,6 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
     chunk_size = request_data.get("chunk_size", app_config.llm.CHUNK_SIZE)
     voice_id = request_data.get("voice_id", app_config.elevenLabs.VOICE_ID)
 
-    final_result = {}
-
     try:
         # 1. Update Status: Processing Start
         status_update = {"status": "processing", "message": "Starting job processing", "updated_at": time.time()}
@@ -90,14 +88,33 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
         if not scrape_request_id:
             _logger.error(f"Job {job_id}: Failed to queue scrape request for URLs: {urls}")
             raise ValueError("Failed to queue scrape request.")
+        _logger.info(f"Job {job_id}: Queued scrape request with ID: {scrape_request_id}")
 
-        # Wait for scrape result
-        scraped_content_list = await get_scrape_result(scrape_request_id)
-        if not scraped_content_list:
-            _logger.warning(f"Job {job_id}: Failed to retrieve scrape results for request ID: {scrape_request_id}")
+        # Wait for scrape result with retries
+        max_retries = 5
+        retry_interval = 5
+        scrape_result = None
+        for attempt in range(max_retries):
+            if scraper_redis_manager:
+                 _logger.debug(f"Job {job_id}: Attempt {attempt + 1}: Calling get_scrape_result for ID '{scrape_request_id}'. It will use manager with prefix '{scraper_redis_manager.result_prefix}'.") # DEBUG ADDED
+            else:
+                 _logger.error(f"Job {job_id}: Attempt {attempt + 1}: Cannot call get_scrape_result, scraper_redis_manager not initialized.")
+                 break
+
+            scrape_result = await get_scrape_result(scrape_request_id)
+            if scrape_result:
+                _logger.debug(f"Job {job_id}: Successfully retrieved scrape result for scrape ID {scrape_request_id}.") # DEBUG ADDED
+                break
+            scrape_status_data = scraper_redis_manager.get_result(scrape_request_id) if scraper_redis_manager else None
+            _logger.warning(f"Job {job_id}: Scrape result for scrape ID {scrape_request_id} not ready (Status: {scrape_status_data.get('status') if scrape_status_data else 'Not Found/Manager Unavailable'}). Retrying in {retry_interval}s (Attempt {attempt + 1}/{max_retries})...") # DEBUG ADDED
+            await asyncio.sleep(retry_interval)
+
+        if not scrape_result:
+            scrape_status_data = scraper_redis_manager.get_result(scrape_request_id) if scraper_redis_manager else None
+            _logger.error(f"Job {job_id}: Failed to retrieve scrape results for scrape ID {scrape_request_id} after {max_retries} attempts. Final status check: {scrape_status_data}") # DEBUG ADDED
             raise ValueError("Failed to retrieve scrape results.")
 
-        valid_content_list = [(url, content) for url, content in scraped_content_list if content and content.strip()]
+        valid_content_list = [(url, content) for url, content in scrape_result if content and content.strip()]
 
         if not valid_content_list:
             _logger.warning(f"Job {job_id}: No valid content scraped from URLs: {urls}")
@@ -106,22 +123,35 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
         _logger.info(f"Job {job_id}: Successfully scraped content from {len(valid_content_list)} URL(s).")
         scraped_urls = [url for url, _ in valid_content_list]
 
-        # 3. Cleanse Content
+        # 3. Cleanse Content with Retry Mechanism
         queue_manager.store_result(job_id, {"message": "Cleansing and summarizing content...", "updated_at": time.time()}, merge=True, ttl=RESULT_TTL)
         combined_raw_content = "\n\n".join([content for _, content in valid_content_list])
         _logger.info(f"Job {job_id}: Cleansing content (length: {len(combined_raw_content)} chars)...")
-        cleansed_content = chunkify_and_summarize(
-            raw_sources=combined_raw_content,
-            endpoint=app_config.llm.ENDPOINT,
-            model=app_config.llm.MODEL,
-            temperature=temperature,
-            chunk_size=chunk_size
-        )
-        if cleansed_content is None:
-             _logger.error(f"Job {job_id}: Content cleansing/summarization failed.")
-             raise ValueError("Content cleansing and summarization failed.")
-        _logger.info(f"Job {job_id}: Content cleansed (new length: {len(cleansed_content)} chars).")
 
+        max_chunk_retries = 3
+        cleansed_content = None
+        for attempt in range(max_chunk_retries):
+            try:
+                cleansed_content = chunkify_and_summarize(
+                    raw_sources=combined_raw_content,
+                    endpoint=app_config.llm.ENDPOINT,
+                    model=app_config.llm.MODEL,
+                    temperature=temperature,
+                    chunk_size=chunk_size
+                )
+                if cleansed_content is None:
+                    raise ValueError("Content cleansing and summarization failed.")
+                break  # Exit retry loop on success
+            except Exception as e:
+                _logger.error(f"Job {job_id}: Error during content cleansing (Attempt {attempt + 1}/{max_chunk_retries}): {e}")
+                if attempt + 1 == max_chunk_retries:
+                    raise
+                await asyncio.sleep(2)  # Wait before retrying
+
+        if cleansed_content is None:
+            raise ValueError("Content cleansing failed after retries.")
+
+        _logger.info(f"Job {job_id}: Content cleansed (new length: {len(cleansed_content)} chars).")
 
         # 4. Generate Story Script using LLM
         queue_manager.store_result(job_id, {"message": "Generating story script via LLM...", "updated_at": time.time()}, merge=True, ttl=RESULT_TTL)
@@ -131,7 +161,6 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
             _logger.error(f"Job {job_id}: LLM failed to generate a valid story script.")
             raise ValueError("LLM generation resulted in empty script.")
         _logger.info(f"Job {job_id}: Story script generated.")
-
 
         # 5. Generate Storyboard
         queue_manager.store_result(job_id, {"message": "Generating storyboard...", "updated_at": time.time()}, merge=True, ttl=RESULT_TTL)
@@ -150,7 +179,6 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
         else:
              _logger.info(f"Job {job_id}: Storyboard generated with {len(storyboard_data.get('scenes', []))} scenes.")
              storyboard_result = storyboard_data
-
 
         # 6. Generate Audio (Optional)
         audio_url_result = None
@@ -206,7 +234,6 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
         else:
              _logger.info(f"Job {job_id}: Skipping audio generation (flag is False).")
 
-
         # 7. Prepare Final Result
         processing_time = time.time() - start_time
         _logger.info(f"Job {job_id}: Processing successful. Time: {processing_time:.2f}s")
@@ -222,6 +249,7 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
             processing_time_seconds=round(processing_time, 2),
             original_request_data=request_data
         ).model_dump(exclude_none=True)
+        _logger.debug(f"Job {job_id}: Preparing final result: {final_result}") # DEBUG ADDED
 
     except Exception as e:
         # Catch all errors during processing steps
@@ -236,9 +264,11 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
             updated_at=time.time(),
             original_request_data=request_data
         ).model_dump(exclude_none=True)
+        _logger.debug(f"Job {job_id}: Preparing final error result: {final_result}") # DEBUG ADDED
 
     # 8. Store Final Result in Redis
     try:
+        _logger.debug(f"Job {job_id}: Attempting to store final result in Redis.") # DEBUG ADDED
         success = queue_manager.store_result(job_id, final_result, ttl=RESULT_TTL)
         if not success:
              _logger.error(f"Job {job_id}: CRITICAL - Failed to store final result in Redis!")
@@ -257,8 +287,8 @@ async def run_worker():
     sleep_interval = app_config.redis.WORKER_SLEEP_INTERVAL
     max_concurrent = app_config.redis.WORKER_MAX_CONCURRENT
 
-    _logger.info(f"Worker Config: BatchSize={batch_size}, SleepInterval={sleep_interval}s, MaxConcurrent={max_concurrent}")
-    _logger.info(f"Listening to Redis queue: '{API_QUEUE_NAME}'")
+    _logger.info(f"API Worker Config: BatchSize={batch_size}, SleepInterval={sleep_interval}s, MaxConcurrent={max_concurrent}")
+    _logger.info(f"API Worker: Listening to Redis queue: '{API_QUEUE_NAME}' with result prefix '{API_RESULT_PREFIX}'")
 
     queue_manager = None
     while not queue_manager:
@@ -268,16 +298,16 @@ async def run_worker():
         try:
             queue_manager = RedisQueueManager(
                 queue_name=API_QUEUE_NAME,
-                result_prefix=API_RESULT_PREFIX
+                result_prefix=API_RESULT_PREFIX,
+                ttl=RESULT_TTL
             )
             if not queue_manager.is_available():
                  raise ConnectionError("Initial Redis connection failed.")
-            _logger.info("Redis Queue Manager initialized successfully.")
+            _logger.info(f"API Worker: Redis Queue Manager initialized successfully for queue '{API_QUEUE_NAME}'.")
         except Exception as e:
             _logger.error(f"Failed to initialize Redis queue manager: {e}. Retrying in 5 seconds...")
             queue_manager = None
             await asyncio.sleep(5)
-
 
     active_tasks = set()
     while not shutdown_event.is_set():
@@ -294,13 +324,12 @@ async def run_worker():
                       _logger.error("Reconnect failed. Will retry next cycle.")
                       continue
 
-
             # Fetch jobs only if concurrency limit allows
             num_to_fetch = min(batch_size, max_concurrent - len(active_tasks))
             if num_to_fetch <= 0:
                 # Max concurrency reached, wait for tasks to complete
                 if active_tasks:
-                    _logger.debug(f"Concurrency limit ({max_concurrent}) reached. Waiting for tasks to finish.")
+                    _logger.critical(f"Concurrency limit ({max_concurrent}) reached. Waiting for tasks to finish.")
                     done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
                     active_tasks = pending
                 else:
@@ -308,23 +337,27 @@ async def run_worker():
                      await asyncio.sleep(0.1)
                 continue
 
-            _logger.debug(f"Checking for up to {num_to_fetch} new jobs...")
             batch = []
+            # _logger.debug(f"API Worker: Checking queue '{queue_manager.queue_name}' for up to {num_to_fetch} new jobs.") # DEBUG ADDED
             for _ in range(num_to_fetch):
                 request = queue_manager.get_next_request()
                 if request:
                     if isinstance(request, dict) and 'id' in request and 'data' in request:
+                        job_id = request['id'] # DEBUG ADDED
+                        job_status_data = queue_manager.get_result(job_id) # DEBUG ADDED
+                        current_status = job_status_data.get("status") if job_status_data else "unknown" # DEBUG ADDED
+                        _logger.debug(f"API Worker: Checking job {job_id}. Current status: {current_status}") # DEBUG ADDED
                         batch.append(request)
+                        _logger.debug(f"API Worker: Added job {job_id} to current batch.") # DEBUG ADDED
                     else:
                         _logger.error(f"Invalid item received from queue: {str(request)[:100]}...")
-                        if isinstance(request, dict) and '_original_data' in request:
-                             if hasattr(queue_manager, 'complete_request'):
-                                 queue_manager.complete_request(request, success=False)
+                        # ... error handling ...
                 else:
-                    break
+                    # _logger.debug("API Worker: Queue appears empty.") # DEBUG ADDED
+                    break # Queue empty
 
             if not batch:
-                _logger.debug(f"No new jobs found. Sleeping for {sleep_interval}s.")
+                # _logger.debug(f"No new jobs found. Sleeping for {sleep_interval}s.")
                 await asyncio.sleep(sleep_interval)
                 continue
 
@@ -336,6 +369,13 @@ async def run_worker():
                 request_data = request['data']
                 request_data["request_time"] = request.get("request_time", time.time())
 
+                # Check if the job is already completed
+                job_status = queue_manager.get_result(job_id)
+                if job_status and job_status.get("status") == "completed":
+                    _logger.info(f"Job {job_id} is already completed. Skipping.")
+                    continue
+
+                _logger.debug(f"API Worker: Creating task for job {job_id}.") # DEBUG ADDED
                 # Create task and add to active set
                 task = asyncio.create_task(process_story_request(job_id, request_data, queue_manager))
                 active_tasks.add(task)
@@ -345,7 +385,6 @@ async def run_worker():
             # Wait briefly if batch was full to allow task completion checks
             if len(batch) == num_to_fetch:
                  await asyncio.sleep(0.1)
-
 
         except ConnectionError as e:
              _logger.error(f"Redis connection error in main loop: {e}. Worker will pause and retry.")
