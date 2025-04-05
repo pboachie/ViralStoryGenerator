@@ -31,9 +31,12 @@ from viralStoryGenerator.src.logger import logger as _logger
 redis_manager: Optional[RedisQueueManager] = None
 if app_config.redis.ENABLED:
     try:
-        scrape_queue_name = app_config.redis.QUEUE_NAME
-        scrape_result_prefix = app_config.redis.RESULT_PREFIX + "scrape:"
-        scrape_ttl = app_config.redis.TTL
+        # Use scrape-specific config values
+        scrape_queue_name = getattr(app_config.redis, 'SCRAPE_QUEUE_NAME', 'viralstory_scrape_queue')
+        scrape_result_prefix = getattr(app_config.redis, 'SCRAPE_RESULT_PREFIX', 'viralstory_scrape_results:')
+        scrape_ttl = getattr(app_config.redis, 'SCRAPE_TTL', app_config.redis.TTL)
+
+        _logger.info(f"Initializing Scraper RedisManager with Queue: '{scrape_queue_name}', Prefix: '{scrape_result_prefix}'") # DEBUG ADDED
 
         redis_manager = RedisQueueManager(
             queue_name=scrape_queue_name,
@@ -130,6 +133,7 @@ async def queue_scrape_request(
     if not redis_manager:
         _logger.warning("Redis manager for scraper not available, cannot queue scrape request.")
         return None
+    _logger.debug(f"Scraper: Using Redis Manager for queue '{redis_manager.queue_name}' to queue scrape request.") # DEBUG ADDED
 
     job_id = str(uuid.uuid4())
     request_payload = {
@@ -141,6 +145,7 @@ async def queue_scrape_request(
         },
         'request_time': time.time()
     }
+    _logger.debug(f"Scraper: Preparing request payload for job {job_id}: {request_payload}") # DEBUG ADDED
 
     success = redis_manager.add_request(request_payload)
     if not success:
@@ -152,6 +157,7 @@ async def queue_scrape_request(
     if wait_for_result:
          _logger.warning(f"Waiting for scrape result {job_id} (timeout: {timeout}s) - Blocking operation.")
          result = redis_manager.wait_for_result(job_id, timeout=timeout)
+         _logger.debug(f"Scraper: Wait result for {job_id}: {result}") # DEBUG ADDED
          if result and result.get("status") == "completed":
              _logger.info(f"Received result for scrape request {job_id}.")
              return job_id
@@ -169,6 +175,7 @@ async def get_scrape_result(request_id: str) -> Optional[List[Tuple[str, Optiona
         return None
 
     result_data = redis_manager.get_result(request_id)
+    _logger.debug(f"Scraper: get_scrape_result for {request_id}. Raw data from Redis: {result_data}") # DEBUG ADDED
     if not result_data:
         if redis_manager.check_key_exists(request_id):
             _logger.debug(f"Scrape job {request_id} is pending/processing.")
@@ -177,6 +184,7 @@ async def get_scrape_result(request_id: str) -> Optional[List[Tuple[str, Optiona
         return None
 
     status = result_data.get("status")
+    _logger.debug(f"Scraper: Job {request_id} status from Redis: {status}") # DEBUG ADDED
     if status == "completed":
         scrape_output = result_data.get("data")
         if isinstance(scrape_output, list):
@@ -203,8 +211,6 @@ async def process_scrape_queue_worker(
     if not _CRAWL4AI_AVAILABLE:
          _logger.error("Crawl4AI library not available. Scrape worker cannot start.")
          return
-
-    _logger.info(f"Starting dedicated Scrape Queue Worker (Queue: '{redis_manager.queue_name}')...")
 
     active_tasks = set()
     while True:
@@ -249,48 +255,75 @@ async def process_scrape_queue_worker(
              _logger.exception(f"Error in scrape worker main loop: {e}")
              await asyncio.sleep(sleep_interval * 2)
 
+
 async def _process_single_scrape_job(request: Dict[str, Any], manager: RedisQueueManager):
     """Helper coroutine to process one scrape job."""
     job_id = request['id']
+    _logger.debug(f"Scraper Worker: Starting processing for job {job_id}. Request: {request}") # DEBUG ADDED
     job_data = request.get('data', {})
     urls = job_data.get('urls')
     browser_config_dict = job_data.get('browser_config')
     run_config_dict = job_data.get('run_config')
     start_time = request.get('request_time', time.time())
 
-    result_payload = {}
+    scrape_successful = False
+    final_status = "failed" # Default to failed
+    error_message = "Unknown processing error"
+    scrape_result_data = None
+
     try:
         if not urls:
             raise ValueError("No URLs found in scrape job data.")
 
-        # Convert dicts back to Pydantic models if needed by scrape_urls
+        # Convert dicts back to Pydantic models
         browser_config = BrowserConfig(**browser_config_dict) if browser_config_dict else None
         run_config = CrawlerRunConfig(**run_config_dict) if run_config_dict else None
 
         # Perform the actual scraping
         manager.store_result(job_id, {"status": "processing", "message": f"Scraping {len(urls)} URLs...", "updated_at": time.time()}, merge=True)
+        _logger.info(f"Job {job_id}: Starting scrape for {len(urls)} URLs...")
         scrape_result = await scrape_urls(urls, browser_config, run_config)
 
-        # Store result
-        result_payload = {
-            "status": "completed",
-            "data": scrape_result,
-            "created_at": start_time,
-            "updated_at": time.time()
-        }
-        manager.store_result(job_id, result_payload)
-        _logger.debug(f"Updated job {job_id} status to 'completed' in Redis.")
-        _logger.info(f"Scrape job {job_id} completed successfully.")
-        manager.complete_request(request, success=True)
+        # Check if *any* URL succeeded
+        if scrape_result and any(content is not None for _, content in scrape_result):
+            scrape_successful = True
+            final_status = "completed" # <-- Changed from "scraped"
+            scrape_result_data = scrape_result
+            error_message = None
+            _logger.info(f"Scrape job {job_id} completed successfully.")
+        else:
+             error_message = "Scraping failed for all URLs after retries or returned no content."
+             _logger.error(f"Scrape job {job_id} failed: {error_message}")
+             scrape_result_data = scrape_result
 
     except Exception as e:
         _logger.exception(f"Error processing scrape job {job_id}: {e}")
+        error_message = str(e)
+        final_status = "failed"
+        scrape_successful = False
+
+    finally:
+        # Store the final result/status
         result_payload = {
-            "status": "failed",
-            "error": str(e),
+            "status": final_status,
+            "error": error_message,
+            "data": scrape_result_data,
             "created_at": start_time,
             "updated_at": time.time()
         }
-        manager.store_result(job_id, result_payload)
-        _logger.debug(f"Updated job {job_id} status to 'failed' in Redis.")
-        manager.complete_request(request, success=False)
+        # Make sure error is None if successful
+        if scrape_successful:
+            result_payload.pop("error", None)
+
+        _logger.debug(f"Scraper Worker: Storing final result for job {job_id}: {result_payload}") # DEBUG ADDED
+        store_success = manager.store_result(job_id, result_payload)
+        if store_success:
+             _logger.debug(f"Updated job {job_id} status to '{final_status}' in Redis.")
+        else:
+             _logger.error(f"CRITICAL: Failed to store final status '{final_status}' for job {job_id} in Redis.")
+
+        # Complete the request in the processing queue
+        completion_success = manager.complete_request(request, success=scrape_successful)
+        _logger.debug(f"Scraper Worker: Completion status for job {job_id} in processing queue: {completion_success}") # DEBUG ADDED
+        if not completion_success:
+             _logger.warning(f"Failed to properly complete/remove job {job_id} from processing queue.")
