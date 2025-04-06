@@ -151,6 +151,7 @@ async def clear_stalled_processing_jobs(max_age_seconds: int = 300):
     except Exception as e:
         _logger.error(f"Error clearing stalled jobs: {e}")
 
+
 def main():
     """Entry point for the Scraper worker process."""
     _logger.info("Initializing Scraper Queue Worker...")

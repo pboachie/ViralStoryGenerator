@@ -345,3 +345,55 @@ class RedisManager:
                 _logger.error(f"Error closing Redis connection: {e}")
                 return False
         return False
+
+class RedisMessageBroker:
+    """A Redis-based message broker using Redis Streams."""
+
+    def __init__(self, redis_url: str, stream_name: str):
+        self.redis = redis.StrictRedis.from_url(redis_url)
+        self.stream_name = stream_name
+
+    def publish_message(self, message: Dict[str, Any]) -> str:
+        """Publish a message to the Redis stream."""
+        return self.redis.xadd(self.stream_name, message)
+
+    def create_consumer_group(self, group_name: str) -> None:
+        """Create a consumer group for the Redis stream."""
+        try:
+            self.redis.xgroup_create(self.stream_name, group_name, id='0', mkstream=True)
+        except redis.exceptions.ResponseError as e:
+            if "BUSYGROUP" in str(e):
+                pass  # Group already exists
+            else:
+                raise
+
+    def consume_messages(self, group_name: str, consumer_name: str, count: int = 1, block: int = 5000) -> List[Dict[str, Any]]:
+        """Consume messages from the Redis stream."""
+        messages = self.redis.xreadgroup(group_name, consumer_name, {self.stream_name: '>'}, count=count, block=block)
+        return messages
+
+    def acknowledge_message(self, group_name: str, message_id: str) -> None:
+        """Acknowledge a message in the Redis stream."""
+        self.redis.xack(self.stream_name, group_name, message_id)
+
+    def pending_messages(self, group_name: str) -> List[Dict[str, Any]]:
+        """Get pending messages for a consumer group."""
+        return self.redis.xpending(self.stream_name, group_name)
+
+    def track_job_progress(self, job_id: str, status: str, details: Optional[Dict[str, Any]] = None) -> None:
+        """Track the progress of a job by updating its status in the stream."""
+        message = {"job_id": job_id, "status": status, "timestamp": time.time()}
+        if details:
+            message.update(details)
+        self.publish_message(message)
+
+    def get_job_status(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve the latest status of a job from the stream."""
+        try:
+            messages = self.redis.xrevrange(self.stream_name, count=100)
+            for message_id, message_data in messages:
+                if message_data.get(b"job_id") == job_id.encode():
+                    return {key.decode(): value.decode() for key, value in message_data.items()}
+        except Exception as e:
+            _logger.error(f"Error retrieving job status for {job_id}: {e}")
+        return None

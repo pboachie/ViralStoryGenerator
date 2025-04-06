@@ -13,6 +13,7 @@ from viralStoryGenerator.models import (
     JobStatusResponse
 )
 from viralStoryGenerator.src.logger import logger as _logger
+from viralStoryGenerator.utils import redis_manager
 from viralStoryGenerator.utils.config import config as appconfig
 from viralStoryGenerator.utils.redis_manager import RedisManager
 from viralStoryGenerator.utils.storage_manager import storage_manager

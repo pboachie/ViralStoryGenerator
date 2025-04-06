@@ -79,44 +79,42 @@ async def scrape_urls(
         return [(url, None) for url in url_list]
 
     url_list = [urls] if isinstance(urls, str) else urls
-    if not url_list: return []
+    if not url_list:
+        return []
 
     _logger.info(f"Starting direct Crawl4AI scraping for {len(url_list)} URL(s)...")
-    # Add default browser config if none provided (e.g., headless)
     effective_browser_config = browser_config or BrowserConfig(headless=True)
     results_data: List[Tuple[str, Optional[str]]] = []
 
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # Initialize crawler within async context manager
             async with AsyncWebCrawler(config=effective_browser_config) as crawler:
                 tasks = [crawler.arun(url, config=run_config) for url in url_list]
                 crawl_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Process results
             for url, result in zip(url_list, crawl_results):
                 if isinstance(result, Exception):
                     error_msg = str(result)
                     if "Executable doesn't exist" in error_msg and "playwright" in error_msg.lower():
-                         _logger.error(f"Playwright browser not installed for {url}. Run 'playwright install'. Error: {result}")
+                        _logger.error(f"Playwright browser not installed for {url}. Run 'playwright install'. Error: {result}")
                     else:
-                         _logger.error(f"Error crawling {url}: {result}")
+                        _logger.error(f"Error crawling {url}: {result}")
                     results_data.append((url, None))
                 elif hasattr(result, 'markdown'):
                     results_data.append((url, result.markdown))
                 else:
-                     _logger.warning(f"Unexpected result type from crawl4ai for {url}: {type(result)}")
-                     results_data.append((url, None))
+                    _logger.warning(f"Unexpected result type from crawl4ai for {url}: {type(result)}")
+                    results_data.append((url, None))
 
-            break  # Exit retry loop on success
+            break
 
         except playwright._impl._errors.TargetClosedError as e:
             _logger.warning(f"Attempt {attempt + 1}/{max_retries} failed due to TargetClosedError: {e}")
             if attempt + 1 == max_retries:
                 _logger.error("Max retries reached. Failing the scraping process.")
                 return [(url, None) for url in url_list]
-            await asyncio.sleep(2)  # Wait before retrying
+            await asyncio.sleep(2)
 
         except Exception as e:
             error_msg = str(e)
@@ -130,6 +128,9 @@ async def scrape_urls(
                 _logger.exception(f"Unexpected error during Crawl4AI execution: {e}")
                 return [(url, None) for url in url_list]
 
+        finally:
+            _logger.debug("Ensuring browser cleanup after attempt.")
+            await asyncio.sleep(1)
 
     _logger.info(f"Direct Crawl4AI scraping finished for {len(url_list)} URL(s).")
     return results_data

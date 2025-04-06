@@ -93,24 +93,27 @@ def generate_storyboard_structure(story: str, llm_endpoint: str, model: str, tem
     response_json = response.json()
     content = response_json["choices"][0]["message"]["content"]
 
-    if isinstance(content, str):
+    if content.startswith("```"):
          content = re.sub(r'^```(?:json)?\s*|\s*```$', '', content).strip()
+
+    try:
          storyboard_data = json.loads(content)
-    elif isinstance(content, dict):
-         storyboard_data = content
+    except json.JSONDecodeError as e:
+         _logger.error(f"JSON decode error: {e}. Using original content without reformatting.")
+         storyboard_data = {"raw_content": content}
+
+    if not (isinstance(storyboard_data, dict) and
+            "scenes" in storyboard_data and
+            isinstance(storyboard_data["scenes"], list) and
+            storyboard_data["scenes"]):
+         _logger.warning("Parsed JSON missing valid 'scenes'. Skipping reformat attempt and using original cleaned output.")
+
     else:
-         _logger.error(f"Unexpected content type in LLM response for storyboard: {type(content)}")
-         return None
-
-    # Basic validation of structure
-    if "scenes" not in storyboard_data or not isinstance(storyboard_data["scenes"], list):
-         _logger.error("Generated storyboard JSON is missing 'scenes' list.")
-         return None
-
-    _logger.info(f"Successfully generated storyboard structure with {len(storyboard_data['scenes'])} scenes.")
+         _logger.info(f"Successfully generated storyboard structure with {len(storyboard_data['scenes'])} scenes.")
 
     thinking = response_json["choices"][0]["message"].get("reasoning_content")
-    if thinking: storyboard_data["thinking"] = thinking
+    if thinking:
+         storyboard_data["thinking"] = thinking
 
     return storyboard_data
 

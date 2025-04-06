@@ -16,7 +16,7 @@ from typing import Dict, Any, Optional
 from viralStoryGenerator.models import (
     JobStatusResponse
 )
-from viralStoryGenerator.utils.redis_manager import RedisManager as RedisQueueManager
+from viralStoryGenerator.utils.redis_manager import RedisManager as RedisQueueManager, RedisMessageBroker
 from viralStoryGenerator.utils.crawl4ai_scraper import get_scrape_result, queue_scrape_request, get_redis_manager, close_scraper_redis_connections
 from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.src.llm import process_with_llm
@@ -60,7 +60,7 @@ def preload_components():
             result_prefix=API_RESULT_PREFIX,
             ttl=RESULT_TTL
         )
-        if _api_queue_manager.is_available():
+        if (_api_queue_manager.is_available()):
             _logger.info(f"API Redis queue manager initialized successfully for queue '{API_QUEUE_NAME}'")
         else:
             _logger.warning("API Redis queue manager initialized but Redis is unavailable")
@@ -71,7 +71,7 @@ def preload_components():
     try:
         _logger.info("Initializing Scraper Redis manager...")
         _scraper_redis_manager = get_redis_manager()
-        if _scraper_redis_manager and _scraper_redis_manager.is_available():
+        if (_scraper_redis_manager and _scraper_redis_manager.is_available()):
             _logger.info(f"Scraper Redis manager initialized successfully for queue '{_scraper_redis_manager.queue_name}'")
         else:
             _logger.warning("Failed to initialize Scraper Redis manager or Redis is unavailable")
@@ -100,6 +100,7 @@ def preload_components():
         _logger.info("RAG is disabled in configuration, skipping Vector DB initialization")
 
     _logger.info("Component preloading complete")
+    _logger.info(f"API Worker is now actively monitoring the queue: '{API_QUEUE_NAME}'")
 
 def get_queue_manager() -> Optional[RedisQueueManager]:
     """Get the pre-initialized queue manager or create a new one if needed."""
@@ -461,144 +462,43 @@ async def process_story_request(job_id: str, request_data: Dict[str, Any], queue
         except Exception as redis_err:
              _logger.exception(f"Job {job_id}: CRITICAL - Exception while storing final result in Redis: {redis_err}")
 
-async def run_worker():
-    """Main worker loop to poll Redis queue and process jobs."""
-    _logger.info("Starting API Worker process...")
+# Initialize the RedisMessageBroker
+redis_url = "redis://" + app_config.redis.HOST + ":" + str(app_config.redis.PORT)
+message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
 
-    # Worker configuration
-    batch_size = app_config.redis.WORKER_BATCH_SIZE
-    sleep_interval = app_config.redis.WORKER_SLEEP_INTERVAL
-    max_concurrent = app_config.redis.WORKER_MAX_CONCURRENT
+# Create a consumer group for the API worker
+message_broker.create_consumer_group(group_name="api_worker_group")
 
-    _logger.info(f"API Worker Config: BatchSize={batch_size}, SleepInterval={sleep_interval}s, MaxConcurrent={max_concurrent}")
-    _logger.info(f"API Worker: Listening to Redis queue: '{API_QUEUE_NAME}' with result prefix '{API_RESULT_PREFIX}'")
-
-    global _api_queue_manager
-    queue_manager = _api_queue_manager
-
-    if not queue_manager or not queue_manager.is_available():
-        # Try to initialize if not already done
-        queue_manager = get_queue_manager()
-
-    while not queue_manager:
-        if shutdown_event.is_set():
-            _logger.info("Shutdown signal received during startup. Exiting.")
-            return
-        try:
-            queue_manager = RedisQueueManager(
-                queue_name=API_QUEUE_NAME,
-                result_prefix=API_RESULT_PREFIX,
-                ttl=RESULT_TTL
-            )
-            if not queue_manager.is_available():
-                 raise ConnectionError("Initial Redis connection failed.")
-            _logger.info(f"API Worker: Redis Queue Manager initialized successfully for queue '{API_QUEUE_NAME}'.")
-        except Exception as e:
-            _logger.error(f"Failed to initialize Redis queue manager: {e}. Retrying in 5 seconds...")
-            queue_manager = None
-            await asyncio.sleep(5)
-
-    active_tasks = set()
+async def process_api_jobs():
+    """Process API jobs from the Redis stream."""
     while not shutdown_event.is_set():
         try:
-            # Check Redis connection periodically
-            if not queue_manager.is_available():
-                 _logger.error("Redis connection lost. Attempting to reconnect...")
-                 await asyncio.sleep(5)
-                 try:
-                      queue_manager = RedisQueueManager(queue_name=API_QUEUE_NAME, result_prefix=API_RESULT_PREFIX)
-                      if not queue_manager.is_available(): continue
-                      _logger.info("Reconnected to Redis.")
-                 except Exception:
-                      _logger.error("Reconnect failed. Will retry next cycle.")
-                      continue
+            messages = message_broker.consume_messages(
+                group_name="api_worker_group",
+                consumer_name="api_worker_1",
+                count=5,
+                block=5000
+            )
 
-            # Fetch jobs only if concurrency limit allows
-            num_to_fetch = min(batch_size, max_concurrent - len(active_tasks))
-            if num_to_fetch <= 0:
-                # Max concurrency reached, wait for tasks to complete
-                if active_tasks:
-                    _logger.critical(f"Concurrency limit ({max_concurrent}) reached. Waiting for tasks to finish.")
-                    done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
-                    active_tasks = pending
-                else:
-                     # Should not happen if num_to_fetch <= 0, but as safeguard
-                     await asyncio.sleep(0.1)
-                continue
+            for stream, message_list in messages:
+                for message_id, message_data in message_list:
+                    _logger.info(f"Processing message {message_id}: {message_data}")
 
-            batch = []
-            # _logger.debug(f"API Worker: Checking queue '{queue_manager.queue_name}' for up to {num_to_fetch} new jobs.") # DEBUG ADDED
-            for _ in range(num_to_fetch):
-                request = queue_manager.get_next_request()
-                if request:
-                    if isinstance(request, dict) and 'id' in request and 'data' in request:
-                        job_id = request['id'] # DEBUG ADDED
-                        job_status_data = queue_manager.get_result(job_id) # DEBUG ADDED
-                        current_status = job_status_data.get("status") if job_status_data else "unknown" # DEBUG ADDED
-                        _logger.debug(f"API Worker: Checking job {job_id}. Current status: {current_status}") # DEBUG ADDED
-                        batch.append(request)
-                        _logger.debug(f"API Worker: Added job {job_id} to current batch.") # DEBUG ADDED
-                    else:
-                        _logger.error(f"Invalid item received from queue: {str(request)[:100]}...")
-                        # ... error handling ...
-                else:
-                    # _logger.debug("API Worker: Queue appears empty.") # DEBUG ADDED
-                    break # Queue empty
+                    # Track job progress
+                    job_id = message_data.get("job_id")
+                    if job_id:
+                        message_broker.track_job_progress(job_id, "processing", "Job is being processed")
 
-            if not batch:
-                # _logger.debug(f"No new jobs found. Sleeping for {sleep_interval}s.")
-                await asyncio.sleep(sleep_interval)
-                continue
+                    # Acknowledge the message
+                    message_broker.acknowledge_message("api_worker_group", message_id)
 
-            _logger.info(f"Fetched {len(batch)} new job(s). Processing...")
-
-            # Create and manage tasks
-            for request in batch:
-                job_id = request['id']
-                request_data = request['data']
-                request_data["request_time"] = request.get("request_time", time.time())
-
-                # Check if the job is already completed
-                job_status = queue_manager.get_result(job_id)
-                if job_status and job_status.get("status") == "completed":
-                    _logger.info(f"Job {job_id} is already completed. Skipping.")
-                    continue
-
-                _logger.debug(f"API Worker: Creating task for job {job_id}.") # DEBUG ADDED
-                # Create task and add to active set
-                task = asyncio.create_task(process_story_request(job_id, request_data, queue_manager))
-                active_tasks.add(task)
-                # Remove task from set upon completion (success or failure)
-                task.add_done_callback(active_tasks.discard)
-
-            # Wait briefly if batch was full to allow task completion checks
-            if len(batch) == num_to_fetch:
-                 await asyncio.sleep(0.1)
-
-        except ConnectionError as e:
-             _logger.error(f"Redis connection error in main loop: {e}. Worker will pause and retry.")
-             await asyncio.sleep(10)
         except Exception as e:
-            _logger.exception(f"FATAL: Unexpected error in API worker main loop: {e}. Sleeping before retry...")
-            await asyncio.sleep(sleep_interval * 5)
+            _logger.error(f"Error processing API jobs: {e}")
 
-    # --- Shutdown Sequence ---
-    _logger.info("Shutdown signal received. Waiting for active tasks to complete...")
-    if active_tasks:
-        try:
-            await asyncio.wait_for(asyncio.gather(*active_tasks, return_exceptions=True), timeout=10.0)
-            _logger.info("Active tasks finished or timed out.")
-        except asyncio.TimeoutError:
-            _logger.warning("Timeout waiting for active tasks to complete during shutdown.")
-        except Exception as e:
-            _logger.exception(f"Error waiting for tasks during shutdown: {e}")
-
-    # Close resources
-    _logger.info("Closing Vector DB client...")
-    close_vector_db()
-
-    _logger.info("API Worker exiting.")
-
+async def run_worker():
+    """Main worker loop to process API jobs."""
+    _logger.info("Starting API Worker process with Redis Streams...")
+    await process_api_jobs()
 
 def main():
     """Entry point for the API worker process."""
