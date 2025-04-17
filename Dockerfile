@@ -2,27 +2,17 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install dependencies first for better caching
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Add system dependencies for playwright and other tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gnupg \
     wget \
+    && pip install --no-cache-dir -r requirements.txt \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
-
-# Copy the .env file to the container
-COPY .env .env
-
-# Ensure the .env file is loaded by the application
-ENV DOTENV_PATH=.env
 
 # Install the package in development mode
 RUN pip install -e .

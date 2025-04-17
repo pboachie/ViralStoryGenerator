@@ -1,72 +1,66 @@
 """
-Client module for making API requests to workers via Redis.
-This module provides lightweight functions for submitting jobs and checking results
-without initializing worker resources.
+Client utilities for ViralStoryGenerator API services
 """
+import os
 import time
+import json
 import uuid
-from typing import Dict, Any, List, Optional, Union, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Union
 
-from viralStoryGenerator.utils.redis_manager import RedisManager
+import redis
+
+from viralStoryGenerator.utils.redis_manager import RedisMessageBroker
 from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.src.logger import logger as _logger
 
-# Initialize Redis managers lazily
-_api_redis_manager = None
-_scrape_redis_manager = None
+# Redis message broker for communication
+def get_api_message_broker() -> RedisMessageBroker:
+    """Get Redis message broker for API client operations"""
+    redis_url = "redis://" + app_config.redis.HOST + ":" + str(app_config.redis.PORT)
+    return RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
 
-def get_api_redis_manager() -> Optional[RedisManager]:
-    """Get or initialize the API Redis manager."""
-    global _api_redis_manager
-    if (_api_redis_manager is not None):
-        return _api_redis_manager
+def get_scrape_message_broker() -> RedisMessageBroker:
+    """Get Redis message broker for scraper client operations"""
+    redis_url = "redis://" + app_config.redis.HOST + ":" + str(app_config.redis.PORT)
+    return RedisMessageBroker(redis_url=redis_url, stream_name="scraper_jobs")
 
-    if not app_config.redis.ENABLED:
-        return None
+async def queue_api_request(request_data: Dict[str, Any], wait_for_result: bool = False, timeout: int = 300) -> Optional[str]:
+    """Queues an API request via Redis Streams"""
+    message_broker = get_api_message_broker()
 
-    try:
-        _api_redis_manager = RedisManager(
-            queue_name=app_config.redis.QUEUE_NAME,
-            result_prefix=app_config.redis.RESULT_PREFIX,
-            ttl=app_config.redis.TTL
-        )
-        if not _api_redis_manager.is_available():
-            _logger.warning("API Redis manager initialized but Redis is unavailable.")
-            _api_redis_manager = None
-    except Exception as e:
-        _logger.exception(f"Failed to initialize API Redis manager: {e}")
-        _api_redis_manager = None
-
-    return _api_redis_manager
-
-def get_scrape_redis_manager() -> Optional[RedisManager]:
-    """Get or initialize the Scraper Redis manager."""
-    global _scrape_redis_manager
-    if _scrape_redis_manager is not None:
-        return _scrape_redis_manager
-
-    if not app_config.redis.ENABLED:
-        return None
+    job_id = request_data.get("job_id", str(uuid.uuid4()))
+    if "job_id" not in request_data:
+        request_data["job_id"] = job_id
 
     try:
-        # Use scrape-specific config values
-        scrape_queue_name = getattr(app_config.redis, 'SCRAPE_QUEUE_NAME', 'viralstory_scrape_queue')
-        scrape_result_prefix = getattr(app_config.redis, 'SCRAPE_RESULT_PREFIX', 'viralstory_scrape_results:')
-        scrape_ttl = getattr(app_config.redis, 'SCRAPE_TTL', app_config.redis.TTL)
+        # Ensure the stream exists
+        message_broker.ensure_stream_exists("api_jobs")
 
-        _scrape_redis_manager = RedisManager(
-            queue_name=scrape_queue_name,
-            result_prefix=scrape_result_prefix,
-            ttl=scrape_ttl
-        )
-        if not _scrape_redis_manager.is_available():
-            _logger.warning("Scraper Redis manager initialized but Redis is unavailable.")
-            _scrape_redis_manager = None
+        # Publish message to stream
+        message_id = message_broker.publish_message(request_data)
+        success = message_id is not None
     except Exception as e:
-        _logger.exception(f"Failed to initialize Scraper Redis manager: {e}")
-        _scrape_redis_manager = None
+        _logger.error(f"Failed to publish to Redis Stream: {e}")
+        success = False
 
-    return _scrape_redis_manager
+    if not success:
+        _logger.error("Failed to add API request to Redis Stream.")
+        return None
+
+    _logger.info(f"API request {job_id} queued successfully in Redis Stream.")
+
+    if wait_for_result:
+        result = await wait_for_job_result(job_id, timeout=timeout)
+        _logger.debug(f"API: Wait result for {job_id}: {result}")
+
+        if result and result.get("status") == "completed":
+            _logger.info(f"Received result for API request {job_id}.")
+            return job_id
+        else:
+            _logger.warning(f"Timed out or error waiting for API result {job_id}. Status: {result.get('status') if result else 'N/A'}")
+            return None
+
+    return job_id
 
 async def queue_scrape_request(
     urls: Union[str, List[str]],
@@ -75,15 +69,11 @@ async def queue_scrape_request(
     wait_for_result: bool = False,
     timeout: int = 300
 ) -> Optional[str]:
-    """Queues a scraping request via Redis if manager is available."""
-    manager = get_scrape_redis_manager()
-    if not manager:
-        _logger.warning("Redis manager for scraper not available, cannot queue scrape request.")
-        return None
+    """Queues a scraping request via Redis Streams"""
+    message_broker = get_scrape_message_broker()
 
     job_id = str(uuid.uuid4())
     request_payload = {
-        'id': job_id,
         'job_id': job_id,
         'urls': [urls] if isinstance(urls, str) else urls,
         'browser_config': browser_config_dict,
@@ -92,63 +82,98 @@ async def queue_scrape_request(
     }
 
     _logger.debug(f"Client: Prepared request payload for job {job_id}")
-    success = manager.add_request(request_payload)
+
+    try:
+        # Ensure the stream exists
+        message_broker.ensure_stream_exists("scraper_jobs")
+
+        # Publish message to stream
+        message_id = message_broker.publish_message(request_payload)
+        success = message_id is not None
+    except Exception as e:
+        _logger.error(f"Failed to publish to Redis Stream: {e}")
+        success = False
+
     if not success:
-        _logger.error("Failed to add scrape request to Redis queue.")
+        _logger.error("Failed to add scrape request to Redis Stream.")
         return None
 
-    _logger.info(f"Scrape request {job_id} queued successfully.")
+    _logger.info(f"Scrape request {job_id} queued successfully in Redis Stream.")
+
+    if wait_for_result:
+        result = await wait_for_job_result(job_id, timeout=timeout, stream_name="scraper_jobs")
+        _logger.debug(f"Scraper: Wait result for {job_id}: {result}")
+
+        if result and result.get("status") == "completed":
+            _logger.info(f"Received result for scrape request {job_id}.")
+            return job_id
+        else:
+            _logger.warning(f"Timed out or error waiting for scrape result {job_id}. Status: {result.get('status') if result else 'N/A'}")
+            return None
+
     return job_id
 
 async def get_scrape_result(request_id: str) -> Optional[List[Tuple[str, Optional[str]]]]:
-    """Gets the result of a previously queued scraping request."""
-    manager = get_scrape_redis_manager()
-    if not manager:
-        _logger.error("Redis manager for scraper not available, cannot get scrape result.")
+    """Gets the result of a previously queued scraping request from Redis Stream."""
+    message_broker = get_scrape_message_broker()
+
+    # Get job status from stream
+    job_status = message_broker.get_job_status(request_id)
+
+    if not job_status:
+        _logger.warning(f"No status found for scrape request {request_id}")
         return None
 
-    result_data = manager.get_result(request_id)
-    _logger.debug(f"Client: get_scrape_result for {request_id}. Raw data from Redis: {result_data}")
-
-    if not result_data:
-        if manager.check_key_exists(request_id):
-            _logger.debug(f"Scrape job {request_id} is pending/processing.")
-        else:
-            _logger.warning(f"Scrape job {request_id} not found.")
+    if job_status.get("status") != "completed":
+        _logger.debug(f"Scrape request {request_id} is not yet completed. Status: {job_status.get('status')}")
         return None
 
-    status = result_data.get("status")
-    _logger.debug(f"Client: Job {request_id} status from Redis: {status}")
-    if status == "completed":
-        scrape_output = result_data.get("data")
-        if isinstance(scrape_output, list):
-            return scrape_output
-        else:
-            _logger.error(f"Unexpected data format in completed scrape job {request_id}: {type(scrape_output)}")
-            return None
-    elif status == "failed":
-        _logger.error(f"Scrape job {request_id} failed: {result_data.get('error')}")
+    # For completed jobs, retrieve the results
+    scraped_results = job_status.get("results", [])
+    if not scraped_results:
+        _logger.warning(f"No results data found for completed scrape request {request_id}")
+        return []
+
+    try:
+        return scraped_results
+    except Exception as e:
+        _logger.error(f"Error parsing scrape results for {request_id}: {e}")
         return None
-    else:
-        _logger.debug(f"Scrape job {request_id} status: {status}. Result not ready.")
-        return None
+
+async def wait_for_job_result(job_id: str, timeout: int = 300, check_interval: float = 0.5, stream_name: str = "api_jobs") -> Optional[Dict[str, Any]]:
+    """
+    Wait for a job result from Redis Stream with polling.
+    Checks the stream for job updates until it completes or times out.
+    """
+    redis_url = "redis://" + app_config.redis.HOST + ":" + str(app_config.redis.PORT)
+    message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=stream_name)
+
+    start_time = time.time()
+    while (time.time() - start_time) < timeout:
+        # Check for job status in the stream
+        job_status = message_broker.get_job_status(job_id)
+
+        if job_status:
+            status = job_status.get("status")
+            # If job completed or failed, return the result
+            if status in ["completed", "failed"]:
+                return job_status
+
+        # Wait before checking again
+        time.sleep(check_interval)
+
+    _logger.warning(f"Timeout reached while waiting for job {job_id}")
+    return {
+        "status": "timeout",
+        "error": f"Timeout reached waiting for job result after {timeout} seconds",
+        "job_id": job_id
+    }
 
 def close_redis_connections():
-    """Close all Redis connections."""
-    global _api_redis_manager, _scrape_redis_manager
-
-    if _api_redis_manager and hasattr(_api_redis_manager, 'close'):
-        try:
-            _logger.info("Closing API Redis manager connection pool...")
-            _api_redis_manager.close()
-        except Exception as e:
-            _logger.exception(f"Error closing API Redis manager connection pool: {e}")
-    _api_redis_manager = None
-
-    if _scrape_redis_manager and hasattr(_scrape_redis_manager, 'close'):
-        try:
-            _logger.info("Closing Scraper Redis manager connection pool...")
-            _scrape_redis_manager.close()
-        except Exception as e:
-            _logger.exception(f"Error closing Scraper Redis manager connection pool: {e}")
-    _scrape_redis_manager = None
+    """
+    Close all Redis connections.
+    Note: Redis connections in MessageBroker are created as needed and closed automatically.
+    This function is kept for compatibility with existing code that might call it.
+    """
+    _logger.debug("Redis connections are managed automatically by the MessageBroker.")
+    pass

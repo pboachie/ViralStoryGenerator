@@ -29,7 +29,7 @@ from viralStoryGenerator.models import (
 )
 
 from viralStoryGenerator.utils.health_check import get_service_status
-from viralStoryGenerator.utils.redis_manager import RedisManager as RedisQueueManager
+from viralStoryGenerator.utils.redis_manager import RedisMessageBroker
 from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.utils.storage_manager import storage_manager
 from viralStoryGenerator.src.logger import logger as _logger
@@ -304,34 +304,12 @@ async def metrics_logging_middleware(request: Request, call_next):
 
 
 # Redis queue manager dependency
-def get_queue_manager() -> RedisQueueManager:
-    # Check if Redis is enabled globally
-    if not app_config.redis.ENABLED:
-         _logger.error("Attempted to use Queue Manager, but Redis is disabled in config.")
-         raise HTTPException(status_code=503, detail="Queue service is disabled")
-
-    try:
-        # Consider creating one instance and reusing, or managing connections carefully
-        manager = RedisQueueManager(
-            queue_name=API_QUEUE_NAME,
-            result_prefix=RESULT_PREFIX
-        )
-        if not manager.is_available():
-             raise redis.exceptions.ConnectionError("Redis connection check failed in get_queue_manager")
-
-        try:
-            QUEUE_SIZE.set(manager.get_queue_length())
-        except Exception as metric_e:
-            _logger.warning(f"Could not update QUEUE_SIZE metric: {metric_e}")
-            pass
-
-        return manager
-    except redis.exceptions.ConnectionError as e:
-         _logger.error(f"Failed to connect to Redis queue: {str(e)}")
-         raise HTTPException(status_code=503, detail="Redis queue service unavailable") # 503 Service Unavailable
-    except Exception as e:
-         _logger.error(f"Failed to initialize Redis queue manager: {str(e)}")
-         raise HTTPException(status_code=500, detail="Internal server error initializing queue")
+def get_message_broker() -> RedisMessageBroker:
+    broker = RedisMessageBroker(
+        redis_url="redis://localhost:6379",
+        stream_name="message_stream",
+    )
+    return broker
 
 
 # Error handler
@@ -770,12 +748,11 @@ RESULT_PREFIX = app_config.redis.RESULT_PREFIX
 async def generate_story_from_urls(
     request: StoryGenerationRequest,
     background_tasks: BackgroundTasks,
-    queue_manager: RedisQueueManager = Depends(get_queue_manager)
 ):
     """
     Generate a viral story from the provided URLs.
     This endpoint queues the request for processing and returns a job ID.
-    Relies on a separate worker process consuming from the Redis queue.
+    Relies on a separate worker process consuming from the Redis stream.
     """
     _logger.info(f"Received request to generate story from URLs for topic: '{request.topic}'")
     try:
@@ -784,21 +761,30 @@ async def generate_story_from_urls(
 
         # Prepare job data matching worker expectations
         job_data = {
-            "id": job_id,
-            "data": {
-                 "urls": [str(url) for url in request.urls],
-                 "topic": request.topic,
-                 "generate_audio": request.generate_audio,
-                 "temperature": request.temperature if request.temperature is not None else app_config.llm.TEMPERATURE,
-                 "chunk_size": request.chunk_size if request.chunk_size is not None else app_config.llm.CHUNK_SIZE
-            },
-            "request_time": time.time()
+            "job_id": job_id,
+            "job_type": "generate_story",
+            "urls": json.dumps([str(url) for url in request.urls]),
+            "topic": request.topic,
+            "include_images": "true" if request.generate_audio else "false",
+            "temperature": str(request.temperature if request.temperature is not None else app_config.llm.TEMPERATURE),
+            "chunk_size": str(request.chunk_size if request.chunk_size is not None else app_config.llm.CHUNK_SIZE),
+            "request_time": str(time.time())
         }
 
-        # Add request to the queue
-        success = queue_manager.add_request(job_data)
+        redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
+        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
+
+        message_broker.ensure_stream_exists("api_jobs")
+
+        try:
+            message_id = message_broker.publish_message(job_data)
+            success = message_id is not None
+        except Exception as e:
+            _logger.error(f"Failed to publish message to stream api_jobs: {e}")
+            success = False
+
         if not success:
-            _logger.error(f"Failed to add job {job_id} to Redis queue.")
+            _logger.error(f"Failed to add job {job_id} to Redis stream.")
             raise HTTPException(status_code=500, detail="Failed to queue job for processing.")
 
         _logger.info(f"Job {job_id} queued successfully for topic: '{request.topic}'")
@@ -815,10 +801,7 @@ async def generate_story_from_urls(
 
 
 @router.get("/status/{job_id}", response_model=JobStatusResponse, tags=["Job Management"], dependencies=[Depends(get_api_key)])
-async def get_job_status(
-    job_id: str,
-    queue_manager: RedisQueueManager = Depends(get_queue_manager)
-):
+async def get_job_status(job_id: str):
     """
     Get the status of a story generation job queued via /generate endpoint.
     Returns the result if the job has completed.
@@ -828,19 +811,29 @@ async def get_job_status(
         raise HTTPException(status_code=400, detail="Invalid job ID format")
 
     try:
-        result_data = queue_manager.get_result(job_id)
+        # Connect to Redis directly
+        redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
+        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
 
-        if not result_data:
-            if queue_manager.check_key_exists(job_id):
-                _logger.debug(f"Job {job_id} found but no final result yet (pending/processing).")
-                return JobStatusResponse(status="pending", message="Job is pending or currently processing.")
-            else:
-                _logger.warning(f"Job ID not found in Redis: {job_id}")
-                raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+        # Get job status from the Redis Stream
+        job_status = message_broker.get_job_status(job_id)
 
-        if result_data.get("status") == "error":
-            _logger.error(f"Error in job {job_id}: {result_data.get('error')}")
-            raise HTTPException(status_code=500, detail=result_data.get("error"))
+        if not job_status:
+            _logger.warning(f"Job ID not found in Redis Stream: {job_id}")
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+        # Format the response
+        result_data = {
+            "job_id": job_id,
+            "status": job_status.get("status", "pending"),
+            "timestamp": job_status.get("timestamp", ""),
+            "message": job_status.get("message", "")
+        }
+
+        # Include additional fields if present
+        for key in ["result", "error", "storyboard", "processing_time"]:
+            if key in job_status:
+                result_data[key] = job_status[key]
 
         _logger.debug(f"Result found for job {job_id}, status: {result_data.get('status')}")
         return JobStatusResponse(**result_data)
@@ -860,136 +853,169 @@ queue_router = APIRouter(
 )
 
 @queue_router.get("/status")
-async def get_queue_status(
-    queue_manager: RedisQueueManager = Depends(get_queue_manager)
-):
+async def get_queue_status():
     """
     Get the current status of the job queue system.
     Returns metrics like queue length and processing jobs.
     """
     _logger.info("Request received for queue status.")
     try:
-        # Get main queue length
-        main_queue_length = queue_manager.get_queue_length()
+        redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
+        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
 
-        # Get processing queue length (if applicable, depends on manager impl)
-        processing_length = 0
-        if hasattr(queue_manager, 'get_processing_queue_length'): # Check if method exists
-             processing_length = queue_manager.get_processing_queue_length()
-        elif queue_manager.client: # Check Redis client directly if needed
-            try:
-                 processing_queue_name = f"{queue_manager.queue_name}_processing" # Standard pattern assumption
-                 processing_length = queue_manager.client.llen(processing_queue_name)
-            except Exception as e:
-                 _logger.warning(f"Could not get processing queue length: {e}")
+        # Use Redis client to get stream information
+        redis_client = message_broker.redis
 
+        # Get stream length (number of messages)
+        stream_length = redis_client.xlen("api_jobs")
 
-        # Add more stats if needed (e.g., failed jobs count, recent jobs)
-        # Example: Get ~10 recent job statuses
-        recent_jobs_info = []
+        # Get consumer group information
+        consumer_info = []
         try:
-            keys = queue_manager.client.keys(f"{queue_manager.result_prefix}*")
-            # Sort keys potentially by time if needed, or just take sample
-            sample_keys = keys[:10] # Get up to 10 keys
-            for key in sample_keys:
-                job_data_str = queue_manager.client.get(key)
-                if job_data_str:
-                    try:
-                        job_info = json.loads(job_data_str)
-                        job_id = key.replace(queue_manager.result_prefix, "")
-                        recent_jobs_info.append({
-                            "job_id": job_id,
-                            "status": job_info.get("status", "unknown"),
-                            "updated_at": job_info.get("updated_at") # Assuming worker adds this
-                        })
-                    except json.JSONDecodeError:
-                        _logger.warning(f"Could not decode job data for key {key}")
-        except Exception as e:
-            _logger.warning(f"Could not retrieve recent job info: {e}")
+            # Get consumer groups
+            groups = redis_client.xinfo_groups("api_jobs")
+            for group in groups:
+                group_name = group.get(b'name').decode()
+                pending = group.get(b'pending')
+                consumers = redis_client.xinfo_consumers("api_jobs", group_name)
 
+                consumer_info.append({
+                    "group_name": group_name,
+                    "pending": pending,
+                    "consumers": len(consumers),
+                    "consumer_details": [
+                        {
+                            "name": c.get(b'name').decode(),
+                            "pending": c.get(b'pending'),
+                            "idle": c.get(b'idle')
+                        } for c in consumers
+                    ]
+                })
+        except Exception as e:
+            _logger.warning(f"Could not retrieve consumer group info: {e}")
+
+        # Get recent messages (last 10)
+        recent_messages = []
+        try:
+            messages = redis_client.xrevrange("api_jobs", count=10)
+            for message_id, message_data in messages:
+                message_id_str = message_id.decode()
+                message_info = {
+                    "id": message_id_str,
+                    "timestamp": message_id_str.split("-")[0],
+                    "job_id": message_data.get(b"job_id", b"unknown").decode(),
+                    "status": message_data.get(b"status", b"unknown").decode() if b"status" in message_data else "queued"
+                }
+                recent_messages.append(message_info)
+        except Exception as e:
+            _logger.warning(f"Could not retrieve recent messages: {e}")
 
         return {
             "status": "available",
-            "main_queue_length": main_queue_length,
-            "processing_jobs": processing_length,
-            "recent_jobs_sample": recent_jobs_info
-            # Add more detailed stats here
+            "stream_length": stream_length,
+            "consumer_groups": consumer_info,
+            "recent_messages": recent_messages
         }
     except Exception as e:
         _logger.exception(f"Error getting queue status: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get queue status: {str(e)}")
 
 @queue_router.post("/clear-stalled")
-async def clear_stalled_jobs(
-    max_age_seconds: int = 600, # Default: older than 10 minutes
-    queue_manager: RedisQueueManager = Depends(get_queue_manager)
-):
+async def clear_stalled_jobs(max_age_seconds: int = 600): # Default: older than 10 minutes
     """
-    EXPERIMENTAL: Clear potentially stalled jobs from the processing queue.
-    Moves jobs older than max_age_seconds back to the main queue or marks as failed.
-    Requires specific implementation in RedisManager or direct Redis commands.
+    Clear potentially stalled jobs from the stream's consumer groups.
+    Claims and processes messages that have been pending for longer than max_age_seconds.
     """
     _logger.warning(f"Request received to clear stalled jobs older than {max_age_seconds}s.")
-    # This functionality is complex and depends heavily on how workers manage the processing state.
-    # A robust implementation might involve:
-    # 1. Workers heartbeating their progress.
-    # 2. Using Redis streams with consumer groups.
-    # 3. A separate monitoring process.
-    # Providing a generic, safe implementation here is difficult.
-    # Placeholder implementation (requires RedisManager support or direct commands):
-    cleared_count = 0
-    requeued_count = 0
-    failed_count = 0
+
     try:
-        # Example using BRPOPLPUSH pattern with timeout tracking (conceptual)
-        processing_queue_name = f"{queue_manager.queue_name}_processing"
-        all_processing = queue_manager.client.lrange(processing_queue_name, 0, -1)
-        current_time = time.time()
+        redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
+        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
 
-        for item_str in all_processing:
-            try:
-                item_data = json.loads(item_str)
-                job_id = item_data.get("id")
-                # Need a timestamp when the job was moved to processing
-                # Assuming RedisManager adds this when using get_next_request or similar
-                processing_start_time = item_data.get("_processing_start_time") # Needs to be added by manager
+        # Use Redis client directly
+        redis_client = message_broker.redis
 
-                if job_id and processing_start_time and (current_time - processing_start_time > max_age_seconds):
-                     _logger.warning(f"Job {job_id} appears stalled (processing since {processing_start_time}).")
-                     # Remove from processing queue
-                     removed = queue_manager.client.lrem(processing_queue_name, 0, item_str)
-                     if removed > 0:
-                          cleared_count += 1
-                          # Option 1: Re-queue
-                          # queue_manager.client.lpush(queue_manager.queue_name, item_str)
-                          # requeued_count += 1
-                          # Option 2: Mark as failed
-                          queue_manager.update_task_error(job_id, f"Job stalled and cleared after {max_age_seconds}s")
-                          failed_count += 1
-            except Exception as item_e:
-                 _logger.error(f"Error processing potentially stalled item: {item_str[:100]}... - {item_e}")
+        # Get all consumer groups for the stream
+        groups = redis_client.xinfo_groups("api_jobs")
 
-        _logger.info(f"Stalled job cleanup finished. Cleared: {cleared_count}, Requeued: {requeued_count}, Marked Failed: {failed_count}")
+        claimed_count = 0
+        failed_count = 0
+        reprocessed_count = 0
+
+        for group in groups:
+            group_name = group.get(b'name').decode()
+            # Get pending messages for this group
+            pending_info = redis_client.xpending_range(
+                "api_jobs",
+                group_name,
+                min="-",  # Start from oldest
+                max="+",  # End with newest
+                count=100  # Limit number of messages
+            )
+
+            for item in pending_info:
+                message_id = item.get(b'message_id').decode()
+                consumer = item.get(b'consumer').decode()
+                idle_time = item.get(b'idle')
+
+                # If message has been idle longer than max_age_seconds
+                if idle_time > max_age_seconds * 1000:  # Redis uses milliseconds
+                    try:
+                        # Claim the message
+                        claimed = redis_client.xclaim(
+                            "api_jobs",
+                            group_name,
+                            "stalled_job_processor",  # New consumer name
+                            min_idle_time=idle_time,
+                            message_ids=[message_id]
+                        )
+
+                        if claimed:
+                            claimed_count += 1
+                            # Get the claimed message data
+                            for msg_id, msg_data in claimed:
+                                try:
+                                    # Get job_id from the message
+                                    job_id = msg_data.get(b'job_id', b'unknown').decode()
+
+                                    # Update status to failed due to stalling
+                                    error_message = f"Job stalled: no progress for {idle_time/1000} seconds"
+
+                                    # Add a new message to the stream indicating failure
+                                    message_broker.publish_message({
+                                        "job_id": job_id,
+                                        "status": "failed",
+                                        "error": error_message,
+                                        "timestamp": time.time()
+                                    })
+
+                                    failed_count += 1
+
+                                except Exception as msg_e:
+                                    _logger.error(f"Error processing stalled message {message_id}: {msg_e}")
+
+                            # Acknowledge the message to remove it from pending
+                            redis_client.xack("api_jobs", group_name, message_id)
+
+                    except Exception as claim_e:
+                        _logger.error(f"Error claiming stalled message {message_id}: {claim_e}")
+
+        _logger.info(f"Stalled job cleanup finished. Claimed: {claimed_count}, Failed: {failed_count}, Reprocessed: {reprocessed_count}")
         return {
-            "message": f"Stalled job cleanup attempted. Cleared: {cleared_count}, Requeued: {requeued_count}, Marked Failed: {failed_count}",
-            "cleared_count": cleared_count,
-            "requeued_count": requeued_count,
-            "failed_count": failed_count
+            "message": f"Stalled job cleanup completed. Claimed: {claimed_count}, Failed: {failed_count}, Reprocessed: {reprocessed_count}",
+            "claimed_count": claimed_count,
+            "failed_count": failed_count,
+            "reprocessed_count": reprocessed_count
         }
     except Exception as e:
         _logger.exception(f"Error clearing stalled jobs: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to clear stalled jobs: {str(e)}")
 
-
 @queue_router.delete("/purge")
-async def purge_queue(
-    confirmation: str,
-    queue_manager: RedisQueueManager = Depends(get_queue_manager)
-):
+async def purge_queue(confirmation: str):
     """
-    PURGE ALL jobs from the queue system (main and processing).
+    PURGE ALL jobs from the Redis Stream.
     This is a DESTRUCTIVE operation. Requires confirmation query parameter.
-    Does NOT delete job results by default.
     """
     CONFIRMATION_CODE = "CONFIRM_PURGE_ALL_JOBS_SERIOUSLY"
     if confirmation != CONFIRMATION_CODE:
@@ -998,79 +1024,98 @@ async def purge_queue(
 
     _logger.critical(f"Executing QUEUE PURGE operation with confirmation '{confirmation}'")
     try:
-        # Clear main queue
-        main_queue_name = queue_manager.queue_name
-        main_removed = queue_manager.client.delete(main_queue_name)
+        redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
+        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
 
-        # Clear processing queue
-        processing_queue_name = f"{queue_manager.queue_name}_processing"
-        processing_removed = queue_manager.client.delete(processing_queue_name)
+        # Use Redis client directly
+        redis_client = message_broker.redis
 
-        _logger.critical(f"Queue system purged. Main queue ('{main_queue_name}') removed: {main_removed}. Processing queue ('{processing_queue_name}') removed: {processing_removed}.")
+        # Delete the entire stream
+        stream_deleted = redis_client.delete("api_jobs")
+
+        # Re-create the stream with an initial message
+        message_broker.ensure_stream_exists("api_jobs")
+
+        _logger.critical(f"Queue system purged. Stream 'api_jobs' deleted: {bool(stream_deleted)}. Stream recreated.")
         return {
             "message": f"Queue system purged successfully.",
-            "main_queue_cleared": bool(main_removed),
-            "processing_queue_cleared": bool(processing_removed),
+            "stream_deleted": bool(stream_deleted),
+            "stream_recreated": True
         }
     except Exception as e:
         _logger.exception(f"Error purging queue: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to purge queue: {str(e)}")
 
-
 @queue_router.post("/job/{job_id}/retry")
-async def retry_failed_job(
-    job_id: str,
-    background_tasks: BackgroundTasks, # Not used in this case, but kept for consistency
-    queue_manager: RedisQueueManager = Depends(get_queue_manager)
-):
+async def retry_failed_job(job_id: str, background_tasks: BackgroundTasks):
     """
-    Retry a FAILED job by re-queuing its original request data.
+    Retry a FAILED job by re-queuing a new message to the stream.
     """
     _logger.info(f"Request received to retry job_id: {job_id}")
     if not is_valid_uuid(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID format")
 
     try:
-        result_data = queue_manager.get_result(job_id)
-        if not result_data:
+        redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
+        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
+
+        # Find the latest status for the job
+        job_status = message_broker.get_job_status(job_id)
+
+        if not job_status:
             raise HTTPException(status_code=404, detail=f"Job {job_id} not found, cannot retry.")
 
-        current_status = result_data.get("status")
+        current_status = job_status.get("status")
         if current_status != "failed":
             raise HTTPException(status_code=400, detail=f"Only 'failed' jobs can be retried. Current status: '{current_status}'")
 
-        # --- Retrieve original request data ---
-        original_request_data = result_data.get("original_request_data")
-        if not original_request_data:
-             # Fallback: Try to reconstruct from available fields if possible (less reliable)
-             _logger.warning(f"Original request data not found for job {job_id}. Attempting reconstruction.")
-             if not all(k in result_data for k in ["urls", "topic"]): # Example check
-                  raise HTTPException(status_code=400, detail="Cannot retry job: missing essential original request data.")
-             original_request_data = {
-                 "urls": result_data.get("sources", []),
-                 "topic": result_data.get("topic", "Unknown Topic"),
-                 "generate_audio": result_data.get("audio_url") is not None,
-                 # TODO: Add temperature, chunk_size etc.
-             }
+        # Reconstruct the job information based on the stored data
+        # This would typically include original request information
+        original_urls = job_status.get("urls", [])
+        original_topic = job_status.get("topic", "Unknown Topic")
+        include_images = job_status.get("include_images", "false")
+        temperature = job_status.get("temperature", str(app_config.llm.TEMPERATURE))
+        chunk_size = job_status.get("chunk_size", str(app_config.llm.CHUNK_SIZE))
 
-        # Prepare new job payload for the queue
+        # Create new job ID for the retry
+        new_job_id = str(uuid.uuid4())
+
+        # Prepare job data for Redis Streams - ensure all values are strings and include job_type
         new_job_payload = {
-            "id": job_id,
-            "data": original_request_data,
-            "retry_of": job_id, # Add metadata indicating it's a retry
-            "request_time": time.time()
+            "job_id": new_job_id,
+            "job_type": "generate_story",  # Add explicit job_type to make processing easier
+            "urls": original_urls if isinstance(original_urls, str) else json.dumps(original_urls),
+            "topic": original_topic,
+            "include_images": include_images if isinstance(include_images, str) else str(include_images).lower(),
+            "temperature": temperature if isinstance(temperature, str) else str(temperature),
+            "chunk_size": chunk_size if isinstance(chunk_size, str) else str(chunk_size),
+            "retry_of": job_id,  # Reference original job ID
+            "request_time": str(time.time())
         }
 
-        # Re-queue the job
-        success = queue_manager.add_request(new_job_payload)
-        if not success:
+        # Ensure the stream exists
+        message_broker.ensure_stream_exists("api_jobs")
+
+        # Publish the retry message to the stream
+        message_id = message_broker.publish_message(new_job_payload)
+
+        if not message_id:
             _logger.error(f"Failed to re-queue job {job_id} for retry.")
             raise HTTPException(status_code=500, detail="Failed to queue job for retry.")
 
-        _logger.info(f"Job {job_id} successfully re-queued for retry.")
+        # Also update status for the original job to indicate it's being retried
+        message_broker.publish_message({
+            "job_id": job_id,
+            "status": "retried",
+            "retry_job_id": new_job_id,
+            "timestamp": str(time.time())
+        })
+
+        _logger.info(f"Job {job_id} successfully retried as new job {new_job_id}.")
         return {
-            "message": f"Job {job_id} has been re-queued for processing.",
-            "job_id": job_id
+            "message": f"Job {job_id} has been retried as new job {new_job_id}.",
+            "original_job_id": job_id,
+            "new_job_id": new_job_id
         }
     except HTTPException:
         raise

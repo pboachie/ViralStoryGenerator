@@ -1,5 +1,5 @@
 # viralStoryGenerator/utils/crawl4ai_scraper.py
-"""Web scraping utilities using Crawl4AI with optional Redis queuing."""
+"""Web scraping utilities using Crawl4AI with Redis Streams message broker."""
 import asyncio
 import os
 from typing import List, Union, Optional, Tuple, Dict, Any
@@ -23,44 +23,38 @@ except ImportError:
     class CrawlerRunConfig: pass
 
 
-# TODO: Use shared RedisManager instance or create one specifically? Shared seems okay.
-from .redis_manager import RedisManager as RedisQueueManager
+from .redis_manager import RedisMessageBroker
 from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.models.models import ScrapeJobRequest, ScrapeJobResult
 
-redis_manager: Optional[RedisQueueManager] = None
+_message_broker = None
 
-# Function to get or initialize Redis manager
-def get_redis_manager() -> Optional[RedisQueueManager]:
-    """Lazily initialize Redis manager for scraping."""
-    global redis_manager
-    if redis_manager is not None:
-        return redis_manager
+# Function to get or initialize Redis message broker
+def get_message_broker() -> Optional[RedisMessageBroker]:
+    """Get or initialize Redis message broker for scraping."""
+    global _message_broker
+    if _message_broker is not None:
+        return _message_broker
 
     if not app_config.redis.ENABLED:
         return None
 
     try:
-        # Use scrape-specific config values
-        scrape_queue_name = getattr(app_config.redis, 'SCRAPE_QUEUE_NAME', 'viralstory_scrape_queue')
-        scrape_result_prefix = getattr(app_config.redis, 'SCRAPE_RESULT_PREFIX', 'viralstory_scrape_results:')
-        scrape_ttl = getattr(app_config.redis, 'SCRAPE_TTL', app_config.redis.TTL)
+        redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
+        _message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="scraper_jobs")
+        _logger.info(f"Initialized Scraper RedisMessageBroker with stream: 'scraper_jobs'")
 
-        _logger.info(f"Initializing Scraper RedisManager with Queue: '{scrape_queue_name}', Prefix: '{scrape_result_prefix}'") # DEBUG ADDED
-        redis_manager = RedisQueueManager(
-            queue_name=scrape_queue_name,
-            result_prefix=scrape_result_prefix,
-            ttl=scrape_ttl
-        )
-        if not redis_manager.is_available():
-             _logger.warning("Scraper RedisManager initialized but Redis is unavailable.")
-             redis_manager = None
+        # Create the consumer group if it doesn't exist
+        try:
+            _message_broker.create_consumer_group("scraper-workers")
+        except Exception as e:
+            _logger.warning(f"Error creating consumer group (may already exist): {e}")
+
+        return _message_broker
     except Exception as e:
-         _logger.exception(f"Failed to initialize RedisManager for scraper: {e}")
-         redis_manager = None
-
-    return redis_manager
+         _logger.exception(f"Failed to initialize RedisMessageBroker for scraper: {e}")
+         return None
 
 
 # --- Main Scraping Function ---
@@ -71,7 +65,7 @@ async def scrape_urls(
 ) -> List[Tuple[str, Optional[str]]]:
     """
     Scrapes URLs using Crawl4AI, returning Markdown content.
-    Does NOT use Redis queue; called directly by worker or API if Redis disabled.
+    Does NOT use Redis; called directly by worker or API.
     """
     if not _CRAWL4AI_AVAILABLE:
         _logger.error("Cannot scrape URLs: Crawl4AI library is not available.")
@@ -142,171 +136,187 @@ async def queue_scrape_request(
     wait_for_result: bool = False,
     timeout: int = 300
 ) -> Optional[str]:
-    """Queues a scraping request via Redis if manager is available."""
-    manager = get_redis_manager()
-    if not manager:
-        _logger.warning("Redis manager for scraper not available, cannot queue scrape request.")
+    """Queues a scraping request via Redis Streams."""
+    message_broker = get_message_broker()
+    if not message_broker:
+        _logger.warning("Redis message broker for scraper not available, cannot queue scrape request.")
         return None
 
     job_id = str(uuid.uuid4())
-    scrape_request = ScrapeJobRequest(
-        job_id=job_id,
-        urls=[urls] if isinstance(urls, str) else urls,
-        browser_config=browser_config_dict,
-        run_config=run_config_dict,
-        request_time=time.time()
-    )
-    request_payload = scrape_request.model_dump()
-    if 'id' not in request_payload:
-        request_payload['id'] = request_payload.get("job_id")
-    _logger.debug(f"Scraper: Prepared request payload for job {job_id}: {request_payload}")
-    success = manager.add_request(request_payload)
+    request_payload = {
+        'job_id': job_id,
+        'urls': [urls] if isinstance(urls, str) else urls,
+        'browser_config': browser_config_dict,
+        'run_config': run_config_dict,
+        'request_time': time.time(),
+        'status': 'pending'
+    }
+
+    _logger.debug(f"Scraper: Prepared request payload for job {job_id}")
+
+    try:
+        # Ensure stream exists
+        message_broker.ensure_stream_exists("scraper_jobs")
+
+        # Publish message to stream
+        message_id = message_broker.publish_message(request_payload)
+        success = message_id is not None
+    except Exception as e:
+        _logger.error(f"Failed to publish to Redis Stream: {e}")
+        success = False
+
     if not success:
-        _logger.error("Failed to add scrape request to Redis queue.")
+        _logger.error("Failed to add scrape request to Redis Stream.")
         return None
-    _logger.info(f"Scrape request {job_id} queued successfully.")
+
+    _logger.info(f"Scrape request {job_id} queued successfully in Redis Stream.")
+
     if wait_for_result:
-         _logger.warning(f"Waiting for scrape result {job_id} (timeout: {timeout}s) - Blocking operation.")
-         result = manager.wait_for_result(job_id, timeout=timeout)
-         _logger.debug(f"Scraper: Wait result for {job_id}: {result}")
-         if result and result.get("status") == "completed":
-             _logger.info(f"Received result for scrape request {job_id}.")
-             return job_id
-         else:
-             _logger.warning(f"Timed out or error waiting for scrape result {job_id}. Status: {result.get('status') if result else 'N/A'}")
-             return None
+        _logger.warning(f"Waiting for scrape result {job_id} (timeout: {timeout}s) - Blocking operation.")
+        start_time = time.time()
+
+        while (time.time() - start_time) < timeout:
+            result = message_broker.get_job_status(job_id)
+            _logger.debug(f"Scraper: Wait result for {job_id}: {result}")
+
+            if result and result.get("status") in ["completed", "failed"]:
+                _logger.info(f"Received result for scrape request {job_id}.")
+                return job_id if result.get("status") == "completed" else None
+
+            # Wait before checking again
+            await asyncio.sleep(0.5)
+
+        _logger.warning(f"Timed out waiting for scrape result {job_id}.")
+        return None
+
     return job_id
 
 
 async def get_scrape_result(request_id: str) -> Optional[List[Tuple[str, Optional[str]]]]:
     """Gets the result of a previously queued scraping request."""
-    manager = get_redis_manager()
-    if not manager:
-        _logger.error("Redis manager for scraper not available, cannot get scrape result.")
+    message_broker = get_message_broker()
+    if not message_broker:
+        _logger.error("Redis message broker for scraper not available, cannot get scrape result.")
         return None
 
-    result_data = manager.get_result(request_id)
-    _logger.debug(f"Scraper: get_scrape_result for {request_id}. Raw data from Redis: {result_data}") # DEBUG ADDED
-    if not result_data:
-        if manager.check_key_exists(request_id):
-            _logger.debug(f"Scrape job {request_id} is pending/processing.")
-        else:
-            _logger.warning(f"Scrape job {request_id} not found.")
+    result = message_broker.get_job_status(request_id)
+    _logger.debug(f"Scraper: get_scrape_result for {request_id}. Data from Redis Stream: {result}")
+
+    if not result:
+        _logger.warning(f"Scrape job {request_id} not found in the stream.")
         return None
 
-    status = result_data.get("status")
-    _logger.debug(f"Scraper: Job {request_id} status from Redis: {status}") # DEBUG ADDED
+    status = result.get("status")
+    _logger.debug(f"Scraper: Job {request_id} status: {status}")
+
     if status == "completed":
-        scrape_output = result_data.get("data")
-        if isinstance(scrape_output, list):
-             return scrape_output
-        else:
-             _logger.error(f"Unexpected data format in completed scrape job {request_id}: {type(scrape_output)}")
-             return None
+        try:
+            # Try to extract the data field which might be JSON-encoded
+            scrape_output = result.get("data")
+            if isinstance(scrape_output, str) and (scrape_output.startswith('[') or scrape_output.startswith('{')):
+                scrape_output = json.loads(scrape_output)
+
+            if isinstance(scrape_output, list):
+                return scrape_output
+            else:
+                _logger.error(f"Unexpected data format in completed scrape job {request_id}: {type(scrape_output)}")
+                return None
+        except Exception as e:
+            _logger.error(f"Error parsing scrape result for job {request_id}: {e}")
+            return None
     elif status == "failed":
-         _logger.error(f"Scrape job {request_id} failed: {result_data.get('error')}")
-         return None
+        _logger.error(f"Scrape job {request_id} failed: {result.get('error')}")
+        return None
     else:
-         _logger.debug(f"Scrape job {request_id} status: {status}. Result not ready.")
-         return None
+        _logger.debug(f"Scrape job {request_id} status: {status}. Result not ready.")
+        return None
 
 
 # --- Dedicated Scrape Worker (If using separate worker) ---
 async def process_scrape_queue_worker(
     batch_size: int = 5, sleep_interval: int = 1, max_concurrent: int = 3
 ) -> None:
-    """Worker function to process queued scraping requests (if Redis queuing is used)."""
-    if not redis_manager:
-        _logger.error("Scraper Redis manager not available. Scrape worker cannot start.")
+    """Worker function to process queued scraping requests from Redis Streams."""
+    message_broker = get_message_broker()
+    if not message_broker:
+        _logger.error("Redis message broker not available. Scrape worker cannot start.")
         return
     if not _CRAWL4AI_AVAILABLE:
-         _logger.error("Crawl4AI library not available. Scrape worker cannot start.")
-         return
+        _logger.error("Crawl4AI library not available. Scrape worker cannot start.")
+        return
+
+    # Create consumer group
+    group_name = "scraper-workers"
+    consumer_name = f"scraper-{uuid.uuid4().hex[:8]}"
+    try:
+        message_broker.create_consumer_group(group_name)
+        _logger.info(f"Scraper worker initialized with consumer group: {group_name}, consumer: {consumer_name}")
+    except Exception as e:
+        _logger.warning(f"Error creating consumer group (may already exist): {e}")
 
     active_tasks = set()
+
     while True:
         try:
-            if not redis_manager.is_available():
-                 _logger.error("Scraper worker lost Redis connection. Sleeping...")
-                 await asyncio.sleep(10)
-                 continue
+            # Check for space before consuming more messages
+            available_slots = max_concurrent - len(active_tasks)
 
-            num_to_fetch = min(batch_size, max_concurrent - len(active_tasks))
+            if available_slots > 0:
+                # Consume messages from the stream
+                messages = message_broker.consume_messages(
+                    group_name=group_name,
+                    consumer_name=consumer_name,
+                    count=min(available_slots, batch_size),
+                    block=2000  # Block for 2 seconds max
+                )
 
-            # Wait for space or completed tasks if needed
-            while num_to_fetch <= 0 and active_tasks:
-                 _logger.debug(f"Scraper worker concurrency limit ({max_concurrent}) reached. Waiting...")
-                 done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED, timeout=sleep_interval)
-                 active_tasks = pending
-                 num_to_fetch = min(batch_size, max_concurrent - len(active_tasks))
-                 if not active_tasks and num_to_fetch <=0: # Break if no tasks left and still can't fetch
-                      break
-                 if num_to_fetch > 0: # Break if space becomes available
-                      break
+                if messages:
+                    _logger.info(f"Scraper worker received {len(messages[0][1])} new messages")
 
-            # Fetch new batch if space available
-            batch = []
-            if num_to_fetch > 0:
-                for _ in range(num_to_fetch):
-                    request = redis_manager.get_next_request()
-                    if request:
-                         if isinstance(request, dict):
-                             # Some requests may have direct 'data' key, others might have the data directly
-                             if 'id' in request and 'data' in request:
-                                 batch.append(request)
-                             elif 'job_id' in request:
-                                 job_id = request.get('job_id')
-                                 # Create compatible format
-                                 batch.append({
-                                     'id': job_id,
-                                     'data': request,
-                                     '_original_data': request.get('_original_data')
-                                 })
-                             else:
-                                 _logger.error(f"Invalid item received from scrape queue: {str(request)[:100]}...")
-                                 # Mark job as failed in Redis
-                                 job_id = request.get('id') or request.get('job_id')
-                                 if job_id:
-                                     redis_manager.store_result(job_id, {
-                                         "status": "failed",
-                                         "error": "Invalid job format",
-                                         "updated_at": time.time()
-                                     })
-                                 # Complete the request to remove it from the queue
-                                 if hasattr(redis_manager, 'complete_request') and isinstance(request, dict) and '_original_data' in request:
-                                     redis_manager.complete_request(request, success=False)
-                         else:
-                             _logger.error(f"Invalid item received from scrape queue: {str(request)[:100]}...")
-                             # Just try to complete the request if possible
-                             if hasattr(redis_manager, 'complete_request') and isinstance(request, dict) and '_original_data' in request:
-                                 redis_manager.complete_request(request, success=False)
-                    else: break # Queue empty
+                    # Process each message
+                    for stream_name, stream_messages in messages:
+                        for message_id, message_data in stream_messages:
+                            # Convert message data from possible bytes to dict
+                            job_data = {}
+                            for k, v in message_data.items():
+                                key = k.decode() if isinstance(k, bytes) else k
+                                value = v.decode() if isinstance(v, bytes) else v
+                                job_data[key] = value
 
-            if not batch and not active_tasks:
-                # Queue is empty and no tasks running, sleep longer
+                            # Create a task to process this job
+                            task = asyncio.create_task(
+                                _process_single_scrape_job(
+                                    job_id=job_data.get('job_id'),
+                                    message_id=message_id,
+                                    job_data=job_data,
+                                    message_broker=message_broker,
+                                    group_name=group_name
+                                )
+                            )
+                            active_tasks.add(task)
+                            task.add_done_callback(active_tasks.discard)
+
+            # If we have active tasks or hit our concurrency limit, wait for some to complete
+            if active_tasks:
+                # Wait for at least one task to complete before fetching more
+                done, pending = await asyncio.wait(
+                    active_tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=sleep_interval
+                )
+                active_tasks = pending
+            else:
+                # No active tasks and no new messages, sleep before polling again
                 await asyncio.sleep(sleep_interval)
-                continue
-            elif not batch and active_tasks:
-                 # No new jobs, but tasks are running, wait briefly before checking tasks again
-                 await asyncio.sleep(0.1)
-                 continue
-
-            _logger.info(f"Scrape worker processing batch of {len(batch)} requests.")
-
-            for request in batch:
-                task = asyncio.create_task(_process_single_scrape_job(request, redis_manager))
-                active_tasks.add(task)
-                task.add_done_callback(active_tasks.discard)
 
         except asyncio.CancelledError:
-             _logger.info("Scrape worker main loop cancelled.")
-             break # Exit the loop cleanly on cancellation
+            _logger.info("Scrape worker main loop cancelled.")
+            break
         except Exception as e:
-             _logger.exception(f"Error in scrape worker main loop: {e}")
-             # Avoid busy-looping on persistent errors
-             await asyncio.sleep(sleep_interval * 2)
+            _logger.exception(f"Error in scrape worker main loop: {e}")
+            await asyncio.sleep(sleep_interval * 2)
 
-    # Cleanup after loop exit (e.g., on cancellation)
+    # Clean up before exiting
     _logger.info("Scrape worker loop finished. Waiting for remaining active tasks...")
     if active_tasks:
         try:
@@ -319,32 +329,53 @@ async def process_scrape_queue_worker(
     _logger.info("Scrape worker task cleanup complete.")
 
 
-async def _process_single_scrape_job(request: Dict[str, Any], manager: RedisQueueManager):
-    """Helper coroutine to process one scrape job."""
-    # Fix: Improved job ID extraction and data handling
-    job_id = request.get('id') or request.get('job_id') or str(uuid.uuid4())
-    _logger.debug(f"Scraper Worker: Starting processing for job {job_id}. Request: {request}")
+async def _process_single_scrape_job(job_id: str, message_id: str, job_data: Dict[str, Any],
+                                    message_broker: RedisMessageBroker, group_name: str):
+    """Helper coroutine to process one scrape job from the Redis Stream."""
+    if not job_id:
+        job_id = str(uuid.uuid4())
+        _logger.warning(f"Received job without ID, assigned new ID: {job_id}")
 
-    # Fix: Get job data, handling both wrapped and direct formats
-    if 'data' in request and isinstance(request['data'], dict):
-        job_data = request['data']
-    else:
-        job_data = request  # The request itself might be the data
+    _logger.debug(f"Scraper Worker: Processing job {job_id}. Message ID: {message_id}")
 
-    # Fix: Extract URLs with more flexible handling
+    # Extract URLs
     if isinstance(job_data.get('urls'), list):
         urls = job_data.get('urls')
+    elif isinstance(job_data.get('urls'), str) and job_data.get('urls').startswith('['):
+        # Handle JSON-encoded list
+        try:
+            urls = json.loads(job_data.get('urls'))
+        except:
+            urls = [job_data.get('urls')]
     elif 'urls' in job_data:
-        urls = [job_data['urls']] if isinstance(job_data['urls'], str) else job_data['urls']
+        urls = [job_data.get('urls')]
     else:
         urls = None
 
+    # Extract config
     browser_config_dict = job_data.get('browser_config')
     run_config_dict = job_data.get('run_config')
-    start_time = job_data.get('request_time') or request.get('request_time') or time.time()
+
+    # Convert string JSON to dict if needed
+    if isinstance(browser_config_dict, str) and browser_config_dict.startswith('{'):
+        try:
+            browser_config_dict = json.loads(browser_config_dict)
+        except:
+            browser_config_dict = None
+
+    if isinstance(run_config_dict, str) and run_config_dict.startswith('{'):
+        try:
+            run_config_dict = json.loads(run_config_dict)
+        except:
+            run_config_dict = None
+
+    # Update job status to processing
+    message_broker.track_job_progress(job_id, "processing", {
+        "message": f"Scraping {len(urls) if urls else 0} URLs..."
+    })
 
     scrape_successful = False
-    final_status = "failed" # Default to failed
+    final_status = "failed"  # Default to failed
     error_message = "Unknown processing error"
     scrape_result_data = None
 
@@ -352,26 +383,25 @@ async def _process_single_scrape_job(request: Dict[str, Any], manager: RedisQueu
         if not urls:
             raise ValueError("No URLs found in scrape job data.")
 
-        # Convert dicts back to Pydantic models
+        # Convert dicts to Pydantic models if possible
         browser_config = BrowserConfig(**browser_config_dict) if browser_config_dict else None
         run_config = CrawlerRunConfig(**run_config_dict) if run_config_dict else None
 
-        # Perform the actual scraping
-        manager.store_result(job_id, {"status": "processing", "message": f"Scraping {len(urls)} URLs...", "updated_at": time.time()}, merge=True)
+        # Perform the scraping
         _logger.info(f"Job {job_id}: Starting scrape for {len(urls)} URLs...")
         scrape_result = await scrape_urls(urls, browser_config, run_config)
 
-        # Check if *any* URL succeeded
+        # Check if any URL succeeded
         if scrape_result and any(content is not None for _, content in scrape_result):
             scrape_successful = True
-            final_status = "completed" # <-- Changed from "scraped"
+            final_status = "completed"
             scrape_result_data = scrape_result
             error_message = None
             _logger.info(f"Scrape job {job_id} completed successfully.")
         else:
-             error_message = "Scraping failed for all URLs after retries or returned no content."
-             _logger.error(f"Scrape job {job_id} failed: {error_message}")
-             scrape_result_data = scrape_result
+            error_message = "Scraping failed for all URLs or returned no content."
+            _logger.error(f"Scrape job {job_id} failed: {error_message}")
+            scrape_result_data = scrape_result
 
     except Exception as e:
         _logger.exception(f"Error processing scrape job {job_id}: {e}")
@@ -380,44 +410,26 @@ async def _process_single_scrape_job(request: Dict[str, Any], manager: RedisQueu
         scrape_successful = False
 
     finally:
-        # Build the result using ScrapeJobResult
-        result_obj = ScrapeJobResult(
-            status=final_status,
-            message=None if scrape_successful else error_message,
-            error=None if scrape_successful else error_message,
-            data=scrape_result_data,
-            created_at=request.get('request_time', time.time()),
-            updated_at=time.time()
-        )
-        result_payload = result_obj.model_dump()
-        _logger.debug(f"Scraper Worker: Storing final result for job {job_id}: {result_payload}") # DEBUG ADDED
-        store_success = manager.store_result(job_id, result_payload)
-        if store_success:
-             _logger.debug(f"Updated job {job_id} status to '{final_status}' in Redis.")
-        else:
-             _logger.error(f"CRITICAL: Failed to store final status '{final_status}' for job {job_id} in Redis.")
+        # Update job status with final result
+        message_broker.track_job_progress(job_id, final_status, {
+            "message": "Scraping completed successfully" if scrape_successful else error_message,
+            "error": None if scrape_successful else error_message,
+            "data": scrape_result_data
+        })
 
-        # Complete the request in the processing queue
-        completion_success = manager.complete_request(request, success=scrape_successful)
-        _logger.debug(f"Scraper Worker: Completion status for job {job_id} in processing queue: {completion_success}") # DEBUG ADDED
-        if not completion_success:
-             _logger.warning(f"Failed to properly complete/remove job {job_id} from processing queue.")
+        # Acknowledge the message to mark it as processed
+        message_broker.acknowledge_message(group_name, message_id)
+        _logger.debug(f"Acknowledged message {message_id} for job {job_id}")
+
 
 # --- Cleanup Function ---
-def close_scraper_redis_connections():
-    """Closes the connection pool associated with the scraper's Redis manager."""
-    global redis_manager
-    if redis_manager and hasattr(redis_manager, 'close'):
-        try:
-            _logger.info("Closing scraper Redis manager connection pool...")
-            redis_manager.close()
-            _logger.info("Scraper Redis manager connection pool closed.")
-        except Exception as e:
-            _logger.exception(f"Error closing scraper Redis manager connection pool: {e}")
-    elif redis_manager:
-         _logger.warning("Scraper Redis manager exists but has no 'close' method.")
-    redis_manager = None
+def close_redis_connections():
+    """Closes Redis connections."""
+    global _message_broker
+    _message_broker = None
+    _logger.info("Redis connections for scraper closed.")
 
-# Export get_redis_manager to make sure it's properly available
-__all__ = ['scrape_urls', 'queue_scrape_request', 'get_scrape_result', 'get_redis_manager',
-           'process_scrape_queue_worker', 'close_scraper_redis_connections']
+
+# Export functions to make them properly available
+__all__ = ['scrape_urls', 'queue_scrape_request', 'get_scrape_result', 'get_message_broker',
+           'process_scrape_queue_worker', 'close_redis_connections']

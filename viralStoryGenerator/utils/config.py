@@ -122,7 +122,7 @@ class config:
         PASSWORD: Optional[str] = os.environ.get("REDIS_PASSWORD", None)
 
         # Queue configuration (used by api_worker/queue_worker)
-        QUEUE_NAME: str = os.environ.get("REDIS_QUEUE_NAME", "viralStoryGenerator_jobs")
+        QUEUE_NAME: str = os.environ.get("REDIS_QUEUE_NAME", "api_jobs")
         RESULT_PREFIX: str = os.environ.get("REDIS_RESULT_PREFIX", "vs_result:")
         TTL: int = int(os.environ.get("REDIS_RESULT_TTL", 3600 * 24))
 

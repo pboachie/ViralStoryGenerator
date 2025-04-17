@@ -192,3 +192,7 @@ def close_client():
     else:
         _logger.debug("No ChromaDB client to close")
 
+def get_vector_db_client():
+    """Get or initialize the ChromaDB client."""
+    return get_client()
+
