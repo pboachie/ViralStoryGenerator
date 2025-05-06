@@ -8,6 +8,7 @@ import uuid
 from typing import Dict, Any, Optional, List, Tuple, Union
 
 import redis
+import asyncio
 
 from viralStoryGenerator.utils.redis_manager import RedisMessageBroker
 from viralStoryGenerator.utils.config import config as app_config
@@ -78,7 +79,8 @@ async def queue_scrape_request(
         'urls': [urls] if isinstance(urls, str) else urls,
         'browser_config': browser_config_dict,
         'run_config': run_config_dict,
-        'request_time': time.time()
+        'request_time': time.time(),
+        'message_type': 'scrape_request'
     }
 
     _logger.debug(f"Client: Prepared request payload for job {job_id}")
@@ -155,12 +157,11 @@ async def wait_for_job_result(job_id: str, timeout: int = 300, check_interval: f
 
         if job_status:
             status = job_status.get("status")
-            # If job completed or failed, return the result
             if status in ["completed", "failed"]:
                 return job_status
 
         # Wait before checking again
-        time.sleep(check_interval)
+        await asyncio.sleep(check_interval)
 
     _logger.warning(f"Timeout reached while waiting for job {job_id}")
     return {

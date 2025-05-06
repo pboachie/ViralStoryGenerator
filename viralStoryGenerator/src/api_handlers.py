@@ -60,6 +60,7 @@ def create_story_task(topic: str, sources_folder: Optional[str] = None,
     # Prepare job data for Redis Streams
     task_data_payload = {
         "job_id": task_id,
+        "job_type": "generate_story",
         "topic": topic,
         "sources_folder": sources_folder,
         "voice_id": voice_id,
@@ -92,45 +93,112 @@ def create_story_task(topic: str, sources_folder: Optional[str] = None,
 
 def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
     """
-    Get the status of a task from Redis Streams.
+    Get the status of a task. Checks Redis Streams first, then final storage
+    if the task is marked completed or not found in Redis.
     Returns a dictionary conforming to JobStatusResponse or None if not found.
     """
+    status_source = "unknown"
     try:
-        # Check in Redis Streams
-        try:
-            message_broker = get_message_broker()
-            stream_status = message_broker.get_job_status(task_id)
+        message_broker = get_message_broker()
+        stream_status = message_broker.get_job_status(task_id)
+        final_result_data = {}
 
-            if stream_status:
-                # Convert stream status format to the expected format
-                status_data = {
-                    "status": stream_status.get("status", "pending"),
-                    "job_id": stream_status.get("job_id"),
-                    "message": stream_status.get("message", "Job found in Redis Stream"),
-                    "created_at": stream_status.get("timestamp"),
-                    "updated_at": stream_status.get("timestamp"),
-                    "story_script": stream_status.get("story_script"),
-                    "storyboard": stream_status.get("storyboard"),
-                    "audio_url": stream_status.get("audio_url"),
-                    "sources": stream_status.get("sources"),
-                    "error": stream_status.get("error")
-                }
+        if stream_status:
+            status_source = "redis"
+            _logger.debug(f"Stream status for task {task_id}: {json.dumps(stream_status, indent=2)}")
+            current_status = stream_status.get("status", "pending")
 
-                response = JobStatusResponse(**status_data).model_dump(exclude_none=True)
-                return response
-            else:
-                # Task ID not found in Redis
-                _logger.debug(f"Task ID {task_id} not found in Redis Streams.")
-                return None
+            # If completed according to Redis, try fetching final results from storage
+            if current_status == "completed":
+                try:
+                    final_result_data = storage_manager.get_story_metadata(task_id) or {}
+                    if not final_result_data:
+                         _logger.warning(f"Task {task_id} status is 'completed' in Redis, but final metadata not found/empty in storage.")
+                    else:
+                         _logger.info(f"Fetched final metadata for completed task {task_id} from storage.")
+                except FileNotFoundError:
+                    _logger.warning(f"Task {task_id} status is 'completed' in Redis, but final metadata file not found in storage.")
+                    final_result_data = {"error": "Completed task metadata file not found in storage."}
+                except Exception as storage_err:
+                    _logger.error(f"Error fetching final metadata for completed task {task_id} from storage: {storage_err}")
+                    final_result_data = {"error": f"Failed to fetch final results from storage: {storage_err}"}
 
-        except Exception as e:
-            _logger.warning(f"Error checking Redis Stream for job {task_id}: {e}")
-            return {"status": "error", "message": f"Error retrieving job status: {str(e)}", "task_id": task_id}
+            status_data = {
+                "status": current_status,
+                "job_id": stream_status.get("job_id", task_id),
+                "message": stream_status.get("message", f"Job status from Redis Stream ({current_status})"),
+                "created_at": stream_status.get("created_at") or stream_status.get("timestamp"),
+                "updated_at": stream_status.get("updated_at") or stream_status.get("timestamp"),
+                "error": stream_status.get("error"),
+                "story_script": stream_status.get("story_script") or stream_status.get("result"),
+                "storyboard": stream_status.get("storyboard"),
+                "audio_url": stream_status.get("audio_url"),
+                "sources": stream_status.get("sources"),
+            }
+
+            # Merge/Overwrite with final data if available
+            if final_result_data:
+                status_data["story_script"] = final_result_data.get("story_script", status_data["story_script"])
+                status_data["storyboard"] = final_result_data.get("storyboard", status_data["storyboard"])
+                status_data["audio_url"] = final_result_data.get("audio_url", status_data["audio_url"])
+                status_data["sources"] = final_result_data.get("sources", status_data["sources"])
+                storage_error = final_result_data.get("error")
+                if storage_error:
+                     # Combine Redis error (if any) and storage error
+                     existing_error = status_data.get("error")
+                     combined_error = f"{existing_error}; {storage_error}" if existing_error else storage_error
+                     status_data["error"] = combined_error
+                     status_data["message"] = f"Job status from Redis ({current_status}). Error fetching final results: {storage_error}"
+                elif current_status == "completed":
+                     status_data["message"] = final_result_data.get("message", "Job completed and final results retrieved from storage.") # Update message if completed successfully
+
+                status_data["created_at"] = final_result_data.get("created_at", status_data["created_at"])
+                status_data["updated_at"] = final_result_data.get("updated_at", status_data["updated_at"])
+
+
+            response = JobStatusResponse(**status_data).model_dump(exclude_none=True)
+            return response
+
+        else:
+            # Task ID not found in Redis Streams, check final storage directly
+            status_source = "storage"
+            _logger.debug(f"Task ID {task_id} not found in Redis Streams. Checking final storage.")
+            try:
+                final_result_data = storage_manager.get_story_metadata(task_id)
+                if final_result_data:
+                    _logger.info(f"Task {task_id} not found in Redis, but found completed results in storage.")
+                    status_data = {
+                        "status": final_result_data.get("status", "completed"),
+                        "job_id": task_id,
+                        "message": final_result_data.get("message", "Job status retrieved from final storage (not found in Redis)."),
+                        "story_script": final_result_data.get("story_script"),
+                        "storyboard": final_result_data.get("storyboard"),
+                        "audio_url": final_result_data.get("audio_url"),
+                        "sources": final_result_data.get("sources"),
+                        "error": final_result_data.get("error"),
+                        "created_at": final_result_data.get("created_at"),
+                        "updated_at": final_result_data.get("updated_at"),
+                    }
+                    response = JobStatusResponse(**status_data).model_dump(exclude_none=True)
+                    return response
+                else:
+                    # Not found in Redis or storage
+                     _logger.debug(f"Task ID {task_id} not found in Redis Streams or final storage.")
+                     return None
+            except FileNotFoundError:
+                 _logger.debug(f"Task ID {task_id} metadata file not found in storage (after Redis miss).")
+                 return None
+            except Exception as storage_err:
+                 _logger.error(f"Error checking storage for task {task_id} after Redis miss: {storage_err}")
+                 return {"status": "error", "message": f"Error checking storage for job status: {str(storage_err)}", "task_id": task_id}
 
     except Exception as e:
-        _logger.exception(f"Error retrieving task status for {task_id}: {e}")
-        return {"status": "error", "message": "Failed to retrieve task status.", "task_id": task_id}
-
+        _logger.exception(f"Error retrieving task status for {task_id} (source: {status_source}): {e}")
+        error_response = {"status": "error", "message": f"Failed to retrieve task status: {str(e)}", "task_id": task_id}
+        try:
+            return JobStatusResponse(**error_response).model_dump(exclude_none=True)
+        except Exception:
+            return error_response
 
 # --- Audio Queue Processing (Called periodically or by cleanup task) ---
 def process_audio_queue():

@@ -7,9 +7,6 @@ import time
 import json
 import uuid
 
-import playwright
-from playwright.sync_api import sync_playwright
-
 # Use Crawl4AI library
 try:
     from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
@@ -34,7 +31,7 @@ _message_broker = None
 def get_message_broker() -> Optional[RedisMessageBroker]:
     """Get or initialize Redis message broker for scraping."""
     global _message_broker
-    if _message_broker is not None:
+    if (_message_broker is not None):
         return _message_broker
 
     if not app_config.redis.ENABLED:
@@ -42,8 +39,8 @@ def get_message_broker() -> Optional[RedisMessageBroker]:
 
     try:
         redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
-        _message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="scraper_jobs")
-        _logger.info(f"Initialized Scraper RedisMessageBroker with stream: 'scraper_jobs'")
+        _message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=app_config.redis.SCRAPE_QUEUE_NAME)
+        _logger.info(f"Initialized Scraper RedisMessageBroker with stream: '{app_config.redis.SCRAPE_QUEUE_NAME}'")
 
         # Create the consumer group if it doesn't exist
         try:
@@ -67,6 +64,9 @@ async def scrape_urls(
     Scrapes URLs using Crawl4AI, returning Markdown content.
     Does NOT use Redis; called directly by worker or API.
     """
+    import playwright
+    from playwright.sync_api import sync_playwright
+
     if not _CRAWL4AI_AVAILABLE:
         _logger.error("Cannot scrape URLs: Crawl4AI library is not available.")
         url_list = [urls] if isinstance(urls, str) else urls
@@ -149,7 +149,9 @@ async def queue_scrape_request(
         'browser_config': browser_config_dict,
         'run_config': run_config_dict,
         'request_time': time.time(),
-        'status': 'pending'
+        'status': 'pending',
+        'message_type': 'scrape_request',
+        'job_type': 'scrape'
     }
 
     _logger.debug(f"Scraper: Prepared request payload for job {job_id}")
@@ -261,7 +263,7 @@ async def process_scrape_queue_worker(
             # Check for space before consuming more messages
             available_slots = max_concurrent - len(active_tasks)
 
-            if available_slots > 0:
+            if (available_slots > 0):
                 # Consume messages from the stream
                 messages = message_broker.consume_messages(
                     group_name=group_name,
@@ -352,6 +354,12 @@ async def _process_single_scrape_job(job_id: str, message_id: str, job_data: Dic
     else:
         urls = None
 
+    if not urls:
+        _logger.warning(f"Job {job_id} (Message {message_id}): No URLs found in job data. Skipping.")
+        message_broker.acknowledge_message(group_name, message_id)
+        _logger.debug(f"Acknowledged message {message_id} for job {job_id} due to missing URLs.")
+        return
+
     # Extract config
     browser_config_dict = job_data.get('browser_config')
     run_config_dict = job_data.get('run_config')
@@ -380,9 +388,6 @@ async def _process_single_scrape_job(job_id: str, message_id: str, job_data: Dic
     scrape_result_data = None
 
     try:
-        if not urls:
-            raise ValueError("No URLs found in scrape job data.")
-
         # Convert dicts to Pydantic models if possible
         browser_config = BrowserConfig(**browser_config_dict) if browser_config_dict else None
         run_config = CrawlerRunConfig(**run_config_dict) if run_config_dict else None

@@ -1,15 +1,15 @@
-FROM python:3.10-slim
+FROM python:alpine3.21
 
 WORKDIR /app
 
 COPY requirements.txt .
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apk add --no-cache \
     curl \
     gnupg \
     wget \
     && pip install --no-cache-dir -r requirements.txt \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    && apk del curl gnupg wget
 
 # Copy application code
 COPY . .
@@ -29,4 +29,4 @@ ENV REDIS_ENABLED=True
 EXPOSE 8000
 
 # Default command runs the API server
-CMD ["python", "-m", "viralStoryGenerator", "api", "--host", "0.0.0.0", "--port", "8000"]
+# CMD ["python", "-m", "viralStoryGenerator", "api", "--host", "0.0.0.0", "--port", "8000"]

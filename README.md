@@ -20,15 +20,30 @@ Install the package using Python's setuptools:
 python setup.py install
 ```
 
-Ensure you have the required dependencies installed:
-- `requests`
-- `python-dotenv`
-- `crawl4ai`
-
 You can install these via pip if needed:
 ```bash
 pip install .
 ```
+
+---
+
+## Codebase Structure
+
+The project is organized as follows:
+
+- `viralStoryGenerator/` – Main package directory
+  - `src/` – Core source code
+    - `api.py` – FastAPI application and endpoints
+    - `worker_runner.py` – Unified entry point for running API and worker processes
+    - `api_worker.py`, `queue_worker.py`, `scrape_worker.py` – Worker process scripts
+    - `logger.py` – Logging configuration
+    - `llm.py`, `elevenlabs_tts.py`, `storyboard.py`, etc. – Main features and utilities
+  - `utils/` – Utility modules (config, Redis, storage, etc.)
+  - `models/` – Data models
+  - `prompts/` – Prompt templates for LLM
+- `tests/` – Test suite
+- `docker-compose.yml`, `Dockerfile*` – Containerization and orchestration
+- `README.md`, `requirements.txt`, `setup.py` – Documentation and dependencies
 
 ---
 
@@ -77,7 +92,7 @@ For local development and testing, follow these steps:
 
 1. **Start the API server locally:**
    ```bash
-   python -m viralStoryGenerator api --host localhost --port 8000 --reload
+   python -m viralStoryGenerator.src.worker_runner api --port 8000 --reload
    ```
    The `--reload` flag enables auto-reloading when code changes are detected.
 
@@ -179,6 +194,17 @@ To run the application in a development environment using Docker:
    ```bash
    docker-compose down
    ```
+
+### Worker Commands
+
+- **Scraper Worker:**
+  ```bash
+  python3 -m viralStoryGenerator.src.worker_runner worker --worker-type scrape
+  ```
+- **Queue Worker:**
+  ```bash
+  python3 -m viralStoryGenerator.src.worker_runner worker --worker-type queue
+  ```
 
 ### Production Setup
 For production deployment with scaling and monitoring:

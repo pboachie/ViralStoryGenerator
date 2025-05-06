@@ -2,7 +2,7 @@
 # viralStoryGenerator/models/models.py
 
 from typing import Dict, Any, Optional, List, Union, Tuple
-from pydantic import BaseModel, AnyHttpUrl, Field, field_validator
+from pydantic import BaseModel, AnyHttpUrl, Field, field_validator, RootModel
 from viralStoryGenerator.utils.config import config as app_config
 
 class StoryGenerationRequest(BaseModel):
@@ -10,6 +10,7 @@ class StoryGenerationRequest(BaseModel):
     urls: List[AnyHttpUrl] = Field(..., description="List of URLs to parse for content", max_items=10)
     topic: str = Field(..., description="Topic for the story", min_length=1, max_length=500)
     generate_audio: bool = Field(False, description="Whether to generate audio")
+    include_images: bool = Field(False, description="Whether to generate images for storyboard")
     temperature: Optional[float] = Field(None, description="LLM temperature", ge=0.0, le=1.0)
     chunk_size: Optional[int] = Field(None, description="Word chunk size for splitting sources", ge=50, le=5000)
 
@@ -112,6 +113,59 @@ class ScrapeJobResult(BaseModel):
     data: Optional[List[Tuple[str, Optional[str]]]] = Field(None, description="List of scraped results (url and content)")
     created_at: float = Field(..., description="Timestamp when the job was created")
     updated_at: float = Field(..., description="Timestamp when the job was last updated")
+
+class ClearStalledJobsResponse(BaseModel):
+    message: str
+    claimed_count: int
+    failed_count: int
+    reprocessed_count: int
+
+class SuccessResponse(BaseModel):
+    message: str
+    detail: Optional[str] = None
+
+class FailureResponse(BaseModel):
+    error: str
+    detail: Optional[str] = None
+
+class QueueConsumerDetail(BaseModel):
+    name: str
+    pending: Optional[int]
+    idle: Optional[int]
+
+class QueueConsumerGroup(BaseModel):
+    group_name: str
+    pending: Optional[int]
+    consumers: int
+    consumer_details: List[QueueConsumerDetail]
+
+class QueueRecentMessage(BaseModel):
+    id: str
+    timestamp: str
+    job_id: Optional[str]
+    status: str
+    is_system_message: Optional[bool] = False
+
+class QueueStreamStatus(BaseModel):
+    stream_length: int
+    consumer_groups: List[QueueConsumerGroup]
+    recent_messages: List[QueueRecentMessage]
+
+class AllQueueStatusResponse(RootModel):
+    root: Dict[str, QueueStreamStatus]
+
+class QueueStatusResponse(BaseModel):
+    status: str
+    stream_length: int
+    consumer_groups: List[QueueConsumerGroup]
+    recent_messages: List[QueueRecentMessage]
+
+class SingleQueueStatusResponse(BaseModel):
+    status: str = "available"
+    stream_name: str
+    stream_length: int
+    consumer_groups: List[Dict[str, Any]]
+    recent_messages: List[QueueRecentMessage]
 
 STORYBOARD_RESPONSE_FORMAT = {
     "type": "json_schema",

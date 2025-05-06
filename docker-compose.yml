@@ -56,6 +56,7 @@ services:
       - CORS_ORIGINS=${CORS_ORIGINS}
       - API_KEY_ENABLED=${API_KEY_ENABLED}
       - API_KEY=${API_KEY}
+    command: python -m viralStoryGenerator.src.worker_runner api --port 8000
     networks:
       - viral-network
     restart: unless-stopped
@@ -63,7 +64,7 @@ services:
     cpus: '1.0'
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
-      interval: 15s
+      interval: 15s`
       timeout: 5s
       retries: 3
       start_period: 10s
@@ -90,6 +91,7 @@ services:
       - REDIS_RESULT_PREFIX=${REDIS_RESULT_PREFIX}
       - REDIS_WORKER_BATCH_SIZE=${REDIS_WORKER_BATCH_SIZE}
       - REDIS_WORKER_MAX_CONCURRENT=${REDIS_WORKER_MAX_CONCURRENT}
+    command: python3 -m viralStoryGenerator.src.worker_runner worker --worker-type scrape
     networks:
       - viral-network
     restart: unless-stopped
@@ -103,7 +105,7 @@ services:
   api-worker:
     build:
       context: .
-      dockerfile: Dockerfile.workerapi
+      dockerfile: Dockerfile.worker
     depends_on:
       redis:
         condition: service_healthy
@@ -138,7 +140,7 @@ services:
       - CORS_ORIGINS=${CORS_ORIGINS}
       - API_KEY_ENABLED=${API_KEY_ENABLED}
       - API_KEY=${API_KEY}
-    command: python -m viralStoryGenerator.src.api_worker
+    command: python3 -m viralStoryGenerator.src.worker_runner worker --worker-type queue
     networks:
       - viral-network
     restart: unless-stopped

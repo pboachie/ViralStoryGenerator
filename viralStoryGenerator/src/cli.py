@@ -8,9 +8,10 @@ import json
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
 from viralStoryGenerator.src.logger import logger as _logger
 from viralStoryGenerator.utils.config import config
+from viralStoryGenerator.utils.storage_manager import storage_manager
 
 # Directory where failed audio generations are queued
-AUDIO_QUEUE_DIR = os.environ.get("AUDIO_QUEUE_DIR", "AudioQueue")
+AUDIO_QUEUE_DIR = os.environ.get("AUDIO_QUEUE_DIR", "Output/AudioQueue")
 appconfig = config.config
 
 def _save_story_output(result, topic, voice_id=None):
@@ -18,7 +19,8 @@ def _save_story_output(result, topic, voice_id=None):
     date_str = now.strftime("%Y-%m-%d")
     week_num = now.isocalendar().week
 
-    folder_path = os.path.join("GeneratedStories", f"Week{week_num}")
+    story_base_dir = storage_manager._get_storage_dir("story")
+    folder_path = os.path.join(story_base_dir, f"Week{week_num}")
     os.makedirs(folder_path, exist_ok=True)
 
     # Build text filename
@@ -54,9 +56,9 @@ def _save_story_output(result, topic, voice_id=None):
             api_key=api_key,
             output_mp3_path=mp3_file_path,
             voice_id=voice_id,
-            model_id="eleven_multilingual_v2",
-            stability=0.5,
-            similarity_boost=0.75
+            model_id=appconfig.elevenLabs.DEFAULT_MODEL_ID,
+            stability=appconfig.elevenLabs.DEFAULT_STABILITY,
+            similarity_boost=appconfig.elevenLabs.DEFAULT_SIMILARITY_BOOST
         )
         if success:
             _logger.info(f"Audio TTS saved to {mp3_file_path}")
@@ -68,9 +70,9 @@ def _save_story_output(result, topic, voice_id=None):
                 "story": story_text,
                 "mp3_file_path": mp3_file_path,
                 "voice_id": voice_id,
-                "model_id": "eleven_multilingual_v2",
-                "stability": 0.5,
-                "similarity_boost": 0.75,
+                "model_id": appconfig.elevenLabs.DEFAULT_MODEL_ID,
+                "stability": appconfig.elevenLabs.DEFAULT_STABILITY,
+                "similarity_boost": appconfig.elevenLabs.DEFAULT_SIMILARITY_BOOST,
                 "attempts": 1,
                 "timestamp": datetime.datetime.now().isoformat()
             }
@@ -124,9 +126,9 @@ def process_audio_queue():
                 api_key=api_key,
                 output_mp3_path=metadata["mp3_file_path"],
                 voice_id=metadata.get("voice_id"),
-                model_id=metadata.get("model_id", "eleven_multilingual_v2"),
-                stability=metadata.get("stability", 0.5),
-                similarity_boost=metadata.get("similarity_boost", 0.75)
+                model_id=metadata.get("model_id", appconfig.elevenLabs.DEFAULT_MODEL_ID),
+                stability=metadata.get("stability", appconfig.elevenLabs.DEFAULT_STABILITY),
+                similarity_boost=metadata.get("similarity_boost", appconfig.elevenLabs.DEFAULT_SIMILARITY_BOOST)
             )
             if success:
                 _logger.info(f"Queued audio generated successfully for {metadata.get('mp3_file_path')}. Removing from queue.")

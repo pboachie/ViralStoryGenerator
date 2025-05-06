@@ -18,14 +18,22 @@ from starlette.responses import Response
 import redis
 import time
 import tempfile
-
 import uvicorn
 
-from viralStoryGenerator.models import (
+from viralStoryGenerator.models.models import (
     StoryGenerationRequest,
     JobResponse,
     HealthResponse,
-    JobStatusResponse
+    JobStatusResponse,
+    ClearStalledJobsResponse,
+    SuccessResponse,
+    FailureResponse,
+    AllQueueStatusResponse,
+    QueueStatusResponse,
+    QueueConsumerGroup,
+    QueueConsumerDetail,
+    QueueRecentMessage,
+    SingleQueueStatusResponse
 )
 
 from viralStoryGenerator.utils.health_check import get_service_status
@@ -188,7 +196,6 @@ class RateLimiter:
                     is_allowed = request_count <= limit
 
                     if not is_allowed:
-                        # Calculate Retry-After based on the oldest relevant timestamp
                         oldest_relevant_req = results[4]
                         if oldest_relevant_req:
                              oldest_ts = oldest_relevant_req[0][1]
@@ -218,7 +225,6 @@ class RateLimiter:
             request_count += 1 # Increment count after adding
             retry_after = 0
         else:
-             # Calculate retry_after for local cache
              if self.local_cache[rate_key]:
                  oldest_ts = self.local_cache[rate_key][0]
                  retry_after = int(window - (current_time - oldest_ts) + 1)
@@ -269,9 +275,7 @@ async def rate_limit_middleware(request: Request, call_next):
              response = await call_next(request)
              response.headers["X-RateLimit-Limit"] = str(limit)
              response.headers["X-RateLimit-Remaining"] = str(max(0, limit - current))
-             # X-RateLimit-Reset might be complex to calculate accurately, omitting for simplicity or use retry_after logic if needed
     else:
-        # If rate limiting is disabled, just proceed
         response = await call_next(request)
 
     return response
@@ -290,7 +294,6 @@ async def metrics_logging_middleware(request: Request, call_next):
     except Exception as e:
         _logger.exception(f"Unhandled exception during request: {request.method} {request.url.path}") # Log exception details
         status_code = 500
-        # Re-raise the exception to be caught by the global handler or FastAPI's default
         raise e from None
     finally:
         process_time = time.time() - start_time
@@ -301,16 +304,6 @@ async def metrics_logging_middleware(request: Request, call_next):
         _logger.info(f"{request.client.host} - \"{request.method} {request.url.path} HTTP/{request.scope['http_version']}\" {status_code} {process_time:.4f}s")
 
     return response
-
-
-# Redis queue manager dependency
-def get_message_broker() -> RedisMessageBroker:
-    broker = RedisMessageBroker(
-        redis_url="redis://localhost:6379",
-        stream_name="message_stream",
-    )
-    return broker
-
 
 # Error handler
 @app.exception_handler(Exception)
@@ -463,13 +456,11 @@ async def download_story_file(task_id: str, file_type: str):
     if not relative_file_path:
         raise HTTPException(status_code=404, detail=f"No {file_type} file available for task {task_id}")
 
-    # --- Determine absolute path based on storage provider ---
     filename = os.path.basename(relative_file_path) # Get filename
     if not is_safe_filename(filename):
          _logger.warning(f"Security: Unsafe filename retrieved from task data: {filename}")
          raise HTTPException(status_code=500, detail="Internal error: Invalid filename stored for task.")
 
-    # Define base directory based on file type for local checks
     expected_base_directory = None
     if file_type == "audio":
         expected_base_directory = os.path.abspath(app_config.storage.AUDIO_STORAGE_PATH)
@@ -488,7 +479,6 @@ async def download_story_file(task_id: str, file_type: str):
              _logger.error(f"File not found on local disk: {full_file_path}")
              raise HTTPException(status_code=404, detail="File not found on server")
 
-        # Ensure the resolved path is within the expected directory
         if not is_file_in_directory(full_file_path, expected_base_directory):
              _logger.critical(f"SECURITY BREACH ATTEMPT: Access denied for file outside storage directory: {full_file_path}")
              raise HTTPException(status_code=403, detail="Access denied")
@@ -496,7 +486,6 @@ async def download_story_file(task_id: str, file_type: str):
         _logger.info(f"Serving local file: {full_file_path}")
         return FileResponse(path=full_file_path, media_type=media_type, filename=filename)
     else:
-        # --- Cloud Storage Handling ---
         _logger.info(f"Retrieving file '{filename}' of type '{file_type}' from cloud storage: {app_config.storage.PROVIDER}")
         try:
             file_content = storage_manager.retrieve_file(filename=filename, file_type=file_type)
@@ -508,7 +497,6 @@ async def download_story_file(task_id: str, file_type: str):
             if isinstance(file_content, bytes):
                  return Response(content=file_content, media_type=media_type, headers={"Content-Disposition": f"attachment; filename={filename}"})
             elif hasattr(file_content, 'read'): # Check if it's a file-like object/stream
-                 # Use StreamingResponse for file-like objects
                  return StreamingResponse(file_content, media_type=media_type, headers={"Content-Disposition": f"attachment; filename={filename}"})
             else:
                  _logger.error(f"Unexpected content type from storage manager: {type(file_content)}")
@@ -530,11 +518,9 @@ async def serve_audio_file(filename: str):
         raise HTTPException(status_code=400, detail="Invalid filename format.")
 
     try:
-        # Serve_file might return a path (local) or data/error (cloud)
         serve_info = storage_manager.serve_file(filename, "audio")
 
         if isinstance(serve_info, str) and os.path.exists(serve_info):
-             # Validate path again for safety
              local_base = os.path.abspath(app_config.storage.AUDIO_STORAGE_PATH)
              if not is_file_in_directory(serve_info, local_base):
                   _logger.critical(f"SECURITY BREACH ATTEMPT: Serve path outside allowed dir: {serve_info}")
@@ -545,7 +531,6 @@ async def serve_audio_file(filename: str):
              raise HTTPException(status_code=500, detail="Error serving file from storage.")
         elif serve_info:
              _logger.warning(f"Unexpected return type {type(serve_info)} from storage_manager.serve_file for audio.")
-             # Attempt basic response if possible, otherwise error
              try:
                  return Response(content=serve_info, media_type="audio/mpeg", headers={"Content-Disposition": f"attachment; filename={filename}"})
              except:
@@ -571,7 +556,6 @@ async def stream_audio(filename: str, request: Request):
 
     file_size = None
     try:
-        # --- Get file size---
         if app_config.storage.PROVIDER == "local":
             local_path = os.path.join(app_config.storage.AUDIO_STORAGE_PATH, filename)
             base_dir = os.path.abspath(app_config.storage.AUDIO_STORAGE_PATH)
@@ -579,12 +563,9 @@ async def stream_audio(filename: str, request: Request):
                  raise FileNotFoundError("File not found or access denied")
             file_size = os.path.getsize(local_path)
         else:
-            # Placeholder: retrieve the whole file to get size (inefficient!)
-            # TODO: Implement efficient metadata retrieval in StorageManager
             temp_file_info = storage_manager.serve_file(filename, "audio")
             if isinstance(temp_file_info, str) and os.path.exists(temp_file_info):
                 file_size = os.path.getsize(temp_file_info)
-                # Keep temp_file_info path for streaming later if needed
             else:
                  raise FileNotFoundError("Could not determine file size from storage")
 
@@ -594,7 +575,6 @@ async def stream_audio(filename: str, request: Request):
         _logger.exception(f"Error getting file size for streaming {filename}: {e}")
         raise HTTPException(status_code=500, detail="Error accessing file for streaming.")
 
-    # --- Handle Range Request ---
     start = 0
     end = file_size - 1
     status_code = status.HTTP_200_OK
@@ -616,13 +596,11 @@ async def stream_audio(filename: str, request: Request):
 
         except ValueError as ve:
              _logger.warning(f"Invalid Range header '{range_header}': {ve}")
-             # Return 416 Range Not Satisfiable if range is invalid
              return Response(status_code=status.HTTP_416_RANGE_NOT_SATISFIABLE)
 
 
     content_length = end - start + 1
 
-    # --- Define Streaming Function ---
     async def file_streamer(start_byte: int, length: int):
         chunk_size = 64 * 1024 # 64KB
         bytes_yielded = 0
@@ -638,7 +616,6 @@ async def stream_audio(filename: str, request: Request):
                  _logger.error(f"Streaming error: retrieve_file returned None for range {start_byte}-{start_byte+length-1}")
                  raise IOError("Failed to retrieve file stream chunk")
 
-            # Handle different stream types
             if hasattr(stream, 'read'):
                  while bytes_yielded < length:
                       read_size = min(chunk_size, length - bytes_yielded)
@@ -666,11 +643,9 @@ async def stream_audio(filename: str, request: Request):
 
         except Exception as e:
             _logger.exception(f"Error during audio streaming for {filename}: {e}")
-            # Yield nothing further on error
             yield b''
 
 
-    # --- Prepare and Return Response ---
     headers = {
         "Content-Range": f"bytes {start}-{end}/{file_size}",
         "Accept-Ranges": "bytes",
@@ -758,23 +733,23 @@ async def generate_story_from_urls(
     try:
         # Generate a unique job ID
         job_id = str(uuid.uuid4())
-
-        # Prepare job data matching worker expectations
         job_data = {
             "job_id": job_id,
             "job_type": "generate_story",
-            "urls": json.dumps([str(url) for url in request.urls]),
             "topic": request.topic,
-            "include_images": "true" if request.generate_audio else "false",
+            "urls": json.dumps([str(url) for url in request.urls]),
+            "include_images": request.include_images,
             "temperature": str(request.temperature if request.temperature is not None else app_config.llm.TEMPERATURE),
             "chunk_size": str(request.chunk_size if request.chunk_size is not None else app_config.llm.CHUNK_SIZE),
             "request_time": str(time.time())
         }
 
         redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
-        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
+        # Use the configured queue name from app_config
+        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=app_config.redis.QUEUE_NAME)
 
-        message_broker.ensure_stream_exists("api_jobs")
+        # Ensure the stream exists before publishing
+        message_broker.ensure_stream_exists(app_config.redis.QUEUE_NAME)
 
         try:
             message_id = message_broker.publish_message(job_data)
@@ -852,75 +827,30 @@ queue_router = APIRouter(
     dependencies=[Depends(get_api_key)] # Apply API key auth to all queue endpoints
 )
 
-@queue_router.get("/status")
+@queue_router.get("/status", response_model=QueueStatusResponse)
 async def get_queue_status():
     """
-    Get the current status of the job queue system.
-    Returns metrics like queue length and processing jobs.
+    Get the current status of the job queue system (api_jobs stream).
+    Returns metrics like queue length, groups, and recent job status counts.
     """
     _logger.info("Request received for queue status.")
     try:
         redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
-        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
+        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=app_config.redis.QUEUE_NAME)
+        raw_status = message_broker.get_queue_status()
 
-        # Use Redis client to get stream information
-        redis_client = message_broker.redis
-
-        # Get stream length (number of messages)
-        stream_length = redis_client.xlen("api_jobs")
-
-        # Get consumer group information
-        consumer_info = []
-        try:
-            # Get consumer groups
-            groups = redis_client.xinfo_groups("api_jobs")
-            for group in groups:
-                group_name = group.get(b'name').decode()
-                pending = group.get(b'pending')
-                consumers = redis_client.xinfo_consumers("api_jobs", group_name)
-
-                consumer_info.append({
-                    "group_name": group_name,
-                    "pending": pending,
-                    "consumers": len(consumers),
-                    "consumer_details": [
-                        {
-                            "name": c.get(b'name').decode(),
-                            "pending": c.get(b'pending'),
-                            "idle": c.get(b'idle')
-                        } for c in consumers
-                    ]
-                })
-        except Exception as e:
-            _logger.warning(f"Could not retrieve consumer group info: {e}")
-
-        # Get recent messages (last 10)
-        recent_messages = []
-        try:
-            messages = redis_client.xrevrange("api_jobs", count=10)
-            for message_id, message_data in messages:
-                message_id_str = message_id.decode()
-                message_info = {
-                    "id": message_id_str,
-                    "timestamp": message_id_str.split("-")[0],
-                    "job_id": message_data.get(b"job_id", b"unknown").decode(),
-                    "status": message_data.get(b"status", b"unknown").decode() if b"status" in message_data else "queued"
-                }
-                recent_messages.append(message_info)
-        except Exception as e:
-            _logger.warning(f"Could not retrieve recent messages: {e}")
-
-        return {
-            "status": "available",
-            "stream_length": stream_length,
-            "consumer_groups": consumer_info,
-            "recent_messages": recent_messages
-        }
+        mapped_status = QueueStatusResponse(
+            status=raw_status.get("status", "available"),
+            stream_length=raw_status.get("stream_length", 0),
+            consumer_groups=raw_status.get("consumer_groups", []),
+            recent_messages=raw_status.get("recent_messages", [])
+        )
+        return mapped_status
     except Exception as e:
         _logger.exception(f"Error getting queue status: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get queue status: {str(e)}")
 
-@queue_router.post("/clear-stalled")
+@queue_router.post("/clear-stalled", response_model=ClearStalledJobsResponse)
 async def clear_stalled_jobs(max_age_seconds: int = 600): # Default: older than 10 minutes
     """
     Clear potentially stalled jobs from the stream's consumer groups.
@@ -943,7 +873,10 @@ async def clear_stalled_jobs(max_age_seconds: int = 600): # Default: older than 
         reprocessed_count = 0
 
         for group in groups:
-            group_name = group.get(b'name').decode()
+            name_bytes = group.get(b'name')
+            if name_bytes is None:
+                continue
+            group_name = name_bytes.decode()
             # Get pending messages for this group
             pending_info = redis_client.xpending_range(
                 "api_jobs",
@@ -958,10 +891,8 @@ async def clear_stalled_jobs(max_age_seconds: int = 600): # Default: older than 
                 consumer = item.get(b'consumer').decode()
                 idle_time = item.get(b'idle')
 
-                # If message has been idle longer than max_age_seconds
                 if idle_time > max_age_seconds * 1000:  # Redis uses milliseconds
                     try:
-                        # Claim the message
                         claimed = redis_client.xclaim(
                             "api_jobs",
                             group_name,
@@ -972,16 +903,12 @@ async def clear_stalled_jobs(max_age_seconds: int = 600): # Default: older than 
 
                         if claimed:
                             claimed_count += 1
-                            # Get the claimed message data
                             for msg_id, msg_data in claimed:
                                 try:
-                                    # Get job_id from the message
                                     job_id = msg_data.get(b'job_id', b'unknown').decode()
 
-                                    # Update status to failed due to stalling
                                     error_message = f"Job stalled: no progress for {idle_time/1000} seconds"
 
-                                    # Add a new message to the stream indicating failure
                                     message_broker.publish_message({
                                         "job_id": job_id,
                                         "status": "failed",
@@ -994,7 +921,6 @@ async def clear_stalled_jobs(max_age_seconds: int = 600): # Default: older than 
                                 except Exception as msg_e:
                                     _logger.error(f"Error processing stalled message {message_id}: {msg_e}")
 
-                            # Acknowledge the message to remove it from pending
                             redis_client.xack("api_jobs", group_name, message_id)
 
                     except Exception as claim_e:
@@ -1011,7 +937,7 @@ async def clear_stalled_jobs(max_age_seconds: int = 600): # Default: older than 
         _logger.exception(f"Error clearing stalled jobs: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to clear stalled jobs: {str(e)}")
 
-@queue_router.delete("/purge")
+@queue_router.delete("/purge", response_model=SuccessResponse, responses={400: {"model": FailureResponse}, 500: {"model": FailureResponse}})
 async def purge_queue(confirmation: str):
     """
     PURGE ALL jobs from the Redis Stream.
@@ -1037,16 +963,15 @@ async def purge_queue(confirmation: str):
         message_broker.ensure_stream_exists("api_jobs")
 
         _logger.critical(f"Queue system purged. Stream 'api_jobs' deleted: {bool(stream_deleted)}. Stream recreated.")
-        return {
-            "message": f"Queue system purged successfully.",
-            "stream_deleted": bool(stream_deleted),
-            "stream_recreated": True
-        }
+        return SuccessResponse(
+            message=f"Queue system purged successfully.",
+            detail=f"Stream 'api_jobs' deleted: {bool(stream_deleted)}. Stream recreated."
+        )
     except Exception as e:
         _logger.exception(f"Error purging queue: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to purge queue: {str(e)}")
 
-@queue_router.post("/job/{job_id}/retry")
+@queue_router.post("/job/{job_id}/retry", response_model=SuccessResponse, responses={400: {"model": FailureResponse}, 404: {"model": FailureResponse}, 500: {"model": FailureResponse}})
 async def retry_failed_job(job_id: str, background_tasks: BackgroundTasks):
     """
     Retry a FAILED job by re-queuing a new message to the stream.
@@ -1069,41 +994,34 @@ async def retry_failed_job(job_id: str, background_tasks: BackgroundTasks):
         if current_status != "failed":
             raise HTTPException(status_code=400, detail=f"Only 'failed' jobs can be retried. Current status: '{current_status}'")
 
-        # Reconstruct the job information based on the stored data
-        # This would typically include original request information
         original_urls = job_status.get("urls", [])
         original_topic = job_status.get("topic", "Unknown Topic")
         include_images = job_status.get("include_images", "false")
         temperature = job_status.get("temperature", str(app_config.llm.TEMPERATURE))
         chunk_size = job_status.get("chunk_size", str(app_config.llm.CHUNK_SIZE))
 
-        # Create new job ID for the retry
         new_job_id = str(uuid.uuid4())
 
-        # Prepare job data for Redis Streams - ensure all values are strings and include job_type
         new_job_payload = {
             "job_id": new_job_id,
-            "job_type": "generate_story",  # Add explicit job_type to make processing easier
-            "urls": original_urls if isinstance(original_urls, str) else json.dumps(original_urls),
+            "job_type": "generate_story",
+            "urls": original_urls if isinstance(original_urls, str) else json.dumps([str(url) for url in original_urls]),
             "topic": original_topic,
             "include_images": include_images if isinstance(include_images, str) else str(include_images).lower(),
             "temperature": temperature if isinstance(temperature, str) else str(temperature),
             "chunk_size": chunk_size if isinstance(chunk_size, str) else str(chunk_size),
-            "retry_of": job_id,  # Reference original job ID
+            "retry_of": job_id,
             "request_time": str(time.time())
         }
 
-        # Ensure the stream exists
         message_broker.ensure_stream_exists("api_jobs")
 
-        # Publish the retry message to the stream
         message_id = message_broker.publish_message(new_job_payload)
 
         if not message_id:
             _logger.error(f"Failed to re-queue job {job_id} for retry.")
             raise HTTPException(status_code=500, detail="Failed to queue job for retry.")
 
-        # Also update status for the original job to indicate it's being retried
         message_broker.publish_message({
             "job_id": job_id,
             "status": "retried",
@@ -1112,11 +1030,10 @@ async def retry_failed_job(job_id: str, background_tasks: BackgroundTasks):
         })
 
         _logger.info(f"Job {job_id} successfully retried as new job {new_job_id}.")
-        return {
-            "message": f"Job {job_id} has been retried as new job {new_job_id}.",
-            "original_job_id": job_id,
-            "new_job_id": new_job_id
-        }
+        return SuccessResponse(
+            message=f"Job {job_id} has been retried as new job {new_job_id}.",
+            detail=f"original_job_id: {job_id}, new_job_id: {new_job_id}"
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -1124,17 +1041,113 @@ async def retry_failed_job(job_id: str, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"Internal server error retrying job.")
 
 
-# Include the routers in the main app
+@queue_router.get("/all-status", response_model=AllQueueStatusResponse)
+async def get_all_queue_status():
+    """
+    Get the status of all Redis streams (queues) dynamically.
+    Returns metrics for each stream found in Redis.
+    """
+    _logger.info("Request received for all queue statuses.")
+    try:
+        redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
+        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
+        redis_client = message_broker.redis
+
+        stream_keys = [k.decode() if isinstance(k, bytes) else k for k in redis_client.keys() if redis_client.type(k) == b'stream']
+        all_status = {}
+        for stream in stream_keys:
+            stream_info = {}
+            try:
+                stream_info['stream_length'] = redis_client.xlen(stream)
+                consumer_info = []
+                try:
+                    groups = redis_client.xinfo_groups(stream)
+                    for group in groups:
+                        name_bytes = group.get(b'name')
+                        if name_bytes is None:
+                            continue
+                        group_name = name_bytes.decode()
+                        pending = group.get(b'pending')
+                        consumers = redis_client.xinfo_consumers(stream, group_name)
+                        consumer_info.append({
+                            "group_name": group_name,
+                            "pending": pending,
+                            "consumers": len(consumers),
+                            "consumer_details": [
+                                {
+                                    "name": c.get(b'name').decode(),
+                                    "pending": c.get(b'pending'),
+                                    "idle": c.get(b'idle')
+                                } for c in consumers
+                            ]
+                        })
+                except Exception as e:
+                    _logger.warning(f"Could not retrieve consumer group info for {stream}: {e}")
+                stream_info['consumer_groups'] = consumer_info
+                recent_messages = []
+                try:
+                    messages = redis_client.xrevrange(stream, count=10)
+                    for message_id, message_data in messages:
+                        message_id_str = message_id.decode()
+                        is_system = any(
+                            (k.decode() if isinstance(k, bytes) else k) in ("initialized", "purged")
+                            for k in message_data.keys()
+                        )
+                        decoded_data = {
+                            k.decode() if isinstance(k, bytes) else k:
+                            v.decode() if isinstance(v, bytes) else v
+                            for k, v in message_data.items()
+                        }
+                        message_info = QueueRecentMessage(
+                            id=message_id_str,
+                            timestamp=decoded_data.get("timestamp", message_id_str.split("-")[0]),
+                            job_id=decoded_data.get("job_id"),
+                            status=decoded_data.get("status", "queued"),
+                            is_system_message=is_system
+                        )
+                        recent_messages.append(message_info)
+                except Exception as e:
+                    _logger.warning(f"Could not retrieve recent messages for {stream}: {e}")
+                stream_info['recent_messages'] = recent_messages
+            except Exception as e:
+                _logger.warning(f"Error getting info for stream {stream}: {e}")
+            all_status[stream] = stream_info
+        return all_status
+    except Exception as e:
+        _logger.exception(f"Error getting all queue statuses: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get all queue statuses: {str(e)}")
+
+        recent_messages = []
+        try:
+            raw_messages = redis_client.xrevrange("api_jobs", count=10)
+            for msg_id_bytes, msg_data_bytes in raw_messages:
+                msg_id = msg_id_bytes.decode() if isinstance(msg_id_bytes, bytes) else msg_id_bytes
+                msg_data = {
+                    k.decode() if isinstance(k, bytes) else k:
+                    v.decode() if isinstance(v, bytes) else v
+                    for k, v in msg_data_bytes.items()
+                }
+
+                is_system = any(k in ("initialized", "purged") for k in msg_data.keys())
+                recent_messages.append(QueueRecentMessage(
+                    id=msg_id,
+                    timestamp=msg_data.get("timestamp", msg_id.split("-")[0]),
+                    job_id=msg_data.get("job_id"),
+                    status=status,
+                    is_system_message=is_system
+                ))
+        except Exception as e:
+            _logger.warning(f"Could not retrieve recent messages for {app_config.redis.QUEUE_NAME}: {e}")
+
+
 app.include_router(router, prefix="/api")
 app.include_router(queue_router, prefix="/api")
 
-# Ensure the directories exist
 os.makedirs(app_config.storage.AUDIO_STORAGE_PATH, exist_ok=True)
 os.makedirs(app_config.storage.STORY_STORAGE_PATH, exist_ok=True)
 os.makedirs(app_config.storage.STORYBOARD_STORAGE_PATH, exist_ok=True)
-app.mount("/static", StaticFiles(directory=app_config.storage.LOCAL_STORAGE_PATH), name="static") # Keep if direct static serving is desired alongside API endpoints
+app.mount("/static", StaticFiles(directory=app_config.storage.LOCAL_STORAGE_PATH), name="static")
 
-# --- Root Endpoint ---
 @app.get("/", include_in_schema=False)
 async def root():
     """Root endpoint providing basic app info and links"""
@@ -1147,7 +1160,6 @@ async def root():
         "health_url": "/api/health"
     }
 
-# --- Uvicorn Runner (for direct execution) ---
 def start_api_server(host: str = "0.0.0.0", port: int = 8000, workers: int = 1, reload: bool = False, log_level: str = "info"):
     """Start the FastAPI server with uvicorn"""
     _logger.info(f"Attempting to start API server on {host}:{port} with {workers} worker(s)")
@@ -1161,16 +1173,13 @@ def start_api_server(host: str = "0.0.0.0", port: int = 8000, workers: int = 1, 
         workers=workers if not reload else 1,
         reload=reload,
         log_level=log_level.lower(),
-        # Add SSL config if enabled
         ssl_keyfile=app_config.http.SSL_KEY_FILE if app_config.http.SSL_ENABLED else None,
         ssl_certfile=app_config.http.SSL_CERT_FILE if app_config.http.SSL_ENABLED else None,
     )
 
 if __name__ == "__main__":
-     # This allows running the API directly using `python -m viralStoryGenerator.src.api`
      host = app_config.http.HOST
      port = app_config.http.PORT
      workers = app_config.http.WORKERS
      log_level = app_config.LOG_LEVEL
-     # Note: Reload is typically False for direct execution, controlled by external runner usually
      start_api_server(host=host, port=port, workers=workers, reload=False, log_level=log_level)

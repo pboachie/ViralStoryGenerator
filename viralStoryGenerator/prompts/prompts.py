@@ -182,6 +182,35 @@ CEO knew about security flaws? #TechScandal #DataLeak #CorporateDrama
 Generate the corrected version now.
 """.strip()
 
+def get_clean_markdown_prompt(raw_markdown: str) -> str:
+    """
+    Creates a prompt for the LLM to clean raw markdown content.
+
+    Args:
+        raw_markdown: The raw markdown string scraped from a webpage.
+
+    Returns:
+        A formatted user prompt string.
+    """
+    return f"""Analyze the following raw markdown text scraped from a webpage. Your goal is to extract *only* the main article content, discarding all extraneous elements like headers, footers, navigation, ads, sidebars, related links, share buttons, comment sections, author bios (unless clearly part of the article flow), cookie notices, and other boilerplate.
+
+**Instructions:**
+1.  **Identify Core Content:** Focus solely on the primary text of the article, blog post, or main story.
+2.  **Eliminate Clutter:** Be aggressive in removing navigation menus, site branding, advertisement placeholders or text, lists of related articles, social media sharing prompts/links, comment forms/sections, and website footers.
+3.  **Preserve Formatting:** Maintain the original markdown formatting (e.g., `##` headings, `*` or `-` lists, `**bold**`, `*italic*`, `> blockquotes`, ```code blocks```) ONLY for the extracted core content. Do *not* add formatting that wasn't there.
+4.  **Link Handling:** Keep hyperlinks (`[text](url)`) that are embedded within the main article sentences. Remove lists of links, navigational links, and links that are clearly promotional or external boilerplate.
+5.  **Output Requirements:** Produce *only* the cleaned markdown text. Do NOT include any introductory phrases ("Here is the cleaned text:"), concluding remarks ("I hope this helps!"), explanations, summaries, or apologies. Do NOT wrap the output in markdown code fences (```) unless the content itself *is* a code block.
+6.  **Empty Content:** If the input appears to contain no discernible main article content after removing the clutter, return an empty string.
+7.  **Be Precise:** Accuracy is key. Ensure only the essential article remains, presented in clean markdown.
+
+**Raw Markdown Input:**
+<RAW_MARKDOWN_START>
+{raw_markdown}
+<RAW_MARKDOWN_END>
+
+**Cleaned Markdown Output:**
+"""
+
 def get_storyboard_prompt(story):
     return f"""
 ## Role

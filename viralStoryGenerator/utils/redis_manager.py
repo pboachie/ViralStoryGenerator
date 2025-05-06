@@ -27,16 +27,27 @@ class RedisMessageBroker:
 
     def publish_message(self, message: Dict[str, Any]) -> str:
         """
-        Publish a message to the Redis stream.
-
-        Args:
-            message: Dictionary containing message data
-
-        Returns:
-            str: ID of the published message
+        Publish a message to the Redis stream. Serializes complex types and None correctly.
         """
+        safe_message = {}
+        for k, v in message.items():
+            if v is None:
+                safe_message[k] = json.dumps(None)
+            elif isinstance(v, bool):
+                safe_message[k] = str(v)
+            elif isinstance(v, (dict, list)):
+                try:
+                    safe_message[k] = json.dumps(v)
+                except TypeError:
+                     _logger.warning(f"Could not JSON serialize field '{k}' for stream '{self.stream_name}'. Storing as string representation.")
+                     safe_message[k] = str(v)
+            elif not isinstance(v, (str, int, float, bytes)):
+                 _logger.debug(f"Converting non-basic type {type(v)} to string for field '{k}' in stream '{self.stream_name}'.")
+                 safe_message[k] = str(v)
+            else:
+                safe_message[k] = v
         try:
-            return self.redis.xadd(self.stream_name, message)
+            return self.redis.xadd(self.stream_name, safe_message)
         except Exception as e:
             _logger.error(f"Failed to publish message to stream {self.stream_name}: {e}")
             return None
@@ -69,8 +80,26 @@ class RedisMessageBroker:
         Returns:
             List of messages
         """
-        messages = self.redis.xreadgroup(group_name, consumer_name, {self.stream_name: '>'}, count=count, block=block)
-        return messages
+        try:
+            messages = self.redis.xreadgroup(group_name, consumer_name, {self.stream_name: '>'}, count=count, block=block)
+            return messages
+        except redis.exceptions.ResponseError as e:
+            if "NOGROUP" in str(e):
+                _logger.warning(f"NOGROUP error for stream '{self.stream_name}' or group '{group_name}'. Attempting to recreate...")
+                try:
+                    self.ensure_stream_exists(self.stream_name)
+                    self.create_consumer_group(group_name)
+                    _logger.info(f"Successfully ensured stream '{self.stream_name}' and group '{group_name}' exist. Retrying consume.")
+                    messages = self.redis.xreadgroup(group_name, consumer_name, {self.stream_name: '>'}, count=count, block=block)
+                    return messages
+                except Exception as creation_e:
+                    _logger.error(f"Failed to recreate stream/group or retry consume after NOGROUP error: {creation_e}")
+                    raise e
+            else:
+                raise e
+        except Exception as e:
+             _logger.error(f"Unexpected error consuming messages from group {group_name}: {e}")
+             raise e
 
     def acknowledge_message(self, group_name: str, message_id: str) -> None:
         """
@@ -110,11 +139,15 @@ class RedisMessageBroker:
                 for key, value in details.items():
                     try:
                         if value is None:
-                            message[key] = ""
+                            message[key] = json.dumps(None)
                         elif isinstance(value, (dict, list)):
                             message[key] = json.dumps(value)
                         else:
-                            message[key] = str(value)
+                            if not isinstance(value, (str, int, float, bytes)):
+                                _logger.warning(f"Storing non-standard type for field '{key}' ({type(value)}) as string for job {job_id}.")
+                                message[key] = str(value)
+                            else:
+                                message[key] = value
                     except Exception as e:
                         _logger.warning(f"Could not serialize job detail {key}: {e}")
                         message[key] = str(value) if value is not None else ""
@@ -137,14 +170,7 @@ class RedisMessageBroker:
 
     def get_job_status(self, job_id: str, limit: int = 100) -> Optional[Dict[str, Any]]:
         """
-        Retrieve the latest status of a job from the stream.
-
-        Args:
-            job_id: ID of the job
-            limit: Maximum number of messages to check
-
-        Returns:
-            Dictionary containing job status or None if not found
+        Retrieve the latest status of a job from the stream. Deserializes complex types and None correctly.
         """
         try:
             messages = self.redis.xrevrange(self.stream_name, count=limit)
@@ -154,22 +180,22 @@ class RedisMessageBroker:
                     msg_job_id = msg_job_id.decode()
 
                 if msg_job_id == job_id:
-                    # Convert bytes to strings in the result
                     result = {}
                     for key, value in message_data.items():
                         key_str = key.decode() if isinstance(key, bytes) else key
                         value_str = value.decode() if isinstance(value, bytes) else value
 
-                        # Try to parse JSON fields
-                        if isinstance(value_str, str) and (value_str.startswith('{') or value_str.startswith('[')):
+                        if value_str == 'null':
+                            result[key_str] = None
+                        elif isinstance(value_str, str) and (value_str.startswith('{') or value_str.startswith('[')):
                             try:
                                 result[key_str] = json.loads(value_str)
-                            except:
+                            except json.JSONDecodeError:
+                                _logger.debug(f"Could not JSON decode field '{key_str}' for job {job_id}. Keeping as string.")
                                 result[key_str] = value_str
                         else:
                             result[key_str] = value_str
 
-                    # Add the message ID
                     result["message_id"] = message_id.decode() if isinstance(message_id, bytes) else message_id
                     return result
         except Exception as e:

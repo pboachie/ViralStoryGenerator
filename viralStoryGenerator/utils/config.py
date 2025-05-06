@@ -27,13 +27,22 @@ class config:
         API_KEY: Optional[str] = os.environ.get("ELEVENLABS_API_KEY")
         VOICE_ID: Optional[str] = os.environ.get("ELEVENLABS_VOICE_ID")
         ENABLED: bool = os.environ.get("ENABLE_AUDIO_GENERATION", "True").lower() in ["true", "1", "yes"]
+        DEFAULT_MODEL_ID: str = os.environ.get("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
+        DEFAULT_STABILITY: float = float(os.environ.get("ELEVENLABS_STABILITY", 0.5))
+        DEFAULT_SIMILARITY_BOOST: float = float(os.environ.get("ELEVENLABS_SIMILARITY_BOOST", 0.75))
+
     class llm:
-        CHUNK_SIZE: int = int(os.environ.get("LLM_CHUNK_SIZE", 1000))
+        CHUNK_SIZE: int = int(os.environ.get("LLM_CHUNK_SIZE", 5000))
         ENDPOINT: Optional[str] = os.environ.get("LLM_ENDPOINT")
-        MODEL: Optional[str] = os.environ.get("LLM_MODEL")
+        MODEL: Optional[str] = os.environ.get("LLM_MODEL") # Default model
+        MODEL_MULTI: Optional[str] = os.environ.get("LLM_MODEL_MULTI", MODEL)
+        MODEL_SMALL: Optional[str] = os.environ.get("LLM_MODEL_SMALL", MODEL)
+        MODEL_LARGE: Optional[str] = os.environ.get("LLM_MODEL_LARGE", MODEL)
         SHOW_THINKING: bool = os.environ.get("LLM_SHOW_THINKING", "True").lower() in ["true", "1", "yes"]
-        TEMPERATURE: float = float(os.environ.get("LLM_TEMPERATURE", 0.7))
-        MAX_TOKENS: int = int(os.environ.get("LLM_MAX_TOKENS", 4096)) # 4096 is the default for GPT-3.5-turbo
+        TEMPERATURE: float = float(os.environ.get("LLM_TEMPERATURE", 0.95))
+        MAX_TOKENS: int = int(os.environ.get("LLM_MAX_TOKENS", 32768)) # 4096 is the default for GPT-3.5-turbo
+        CLEANING_MAX_PROMPT_CHARS: int = int(os.environ.get("LLM_CLEANING_MAX_PROMPT_CHARS", 20000))
+        CLEANING_MAX_OUTPUT_TOKENS: int = int(os.environ.get("LLM_CLEANING_MAX_OUTPUT_TOKENS", 32768))
 
     class openAI:
         API_KEY: Optional[str] = os.environ.get("OPENAI_API_KEY") # Used for DALL-E
@@ -91,6 +100,7 @@ class config:
         AUDIO_STORAGE_PATH: str = os.path.abspath(os.environ.get("AUDIO_STORAGE_PATH", os.path.join(LOCAL_STORAGE_PATH, "audio")))
         STORY_STORAGE_PATH: str = os.path.abspath(os.environ.get("STORY_STORAGE_PATH", os.path.join(LOCAL_STORAGE_PATH, "stories")))
         STORYBOARD_STORAGE_PATH: str = os.path.abspath(os.environ.get("STORYBOARD_STORAGE_PATH", os.path.join(LOCAL_STORAGE_PATH, "storyboards")))
+        METADATA_STORAGE_PATH: str = os.path.abspath(os.environ.get("METADATA_STORAGE_PATH", os.path.join(LOCAL_STORAGE_PATH, "metadata")))
 
         # File retention policy (in days, 0 or negative = keep forever)
         FILE_RETENTION_DAYS: int = int(os.environ.get("FILE_RETENTION_DAYS", 30))
@@ -125,12 +135,14 @@ class config:
         QUEUE_NAME: str = os.environ.get("REDIS_QUEUE_NAME", "api_jobs")
         RESULT_PREFIX: str = os.environ.get("REDIS_RESULT_PREFIX", "vs_result:")
         TTL: int = int(os.environ.get("REDIS_RESULT_TTL", 3600 * 24))
+        SCRAPE_QUEUE_NAME: str = os.environ.get("REDIS_SCRAPE_QUEUE_NAME", "scraper_jobs")
+
+        API_WORKER_GROUP_NAME: str = os.environ.get("REDIS_API_WORKER_GROUP_NAME", "api-workers")
 
         # Worker configuration (used by worker process)
         WORKER_BATCH_SIZE: int = int(os.environ.get("REDIS_WORKER_BATCH_SIZE", 5))
         WORKER_SLEEP_INTERVAL: int = int(os.environ.get("REDIS_WORKER_SLEEP_INTERVAL", 1))
         WORKER_MAX_CONCURRENT: int = int(os.environ.get("REDIS_WORKER_MAX_CONCURRENT", 3))
-
 
     class monitoring:
         # Prometheus monitoring settings
@@ -166,6 +178,9 @@ class config:
         RELEVANT_CHUNKS_COUNT: int = int(os.environ.get("RAG_RELEVANT_CHUNKS_COUNT", 5))
         CHUNK_SIZE: int = int(os.environ.get("RAG_CHUNK_SIZE", 500)) # Chunks for RAG can often be smaller
         CHUNK_OVERLAP: int = int(os.environ.get("RAG_CHUNK_OVERLAP", 50))
+
+    class storyboard:
+        WORD_PER_MINUTE_RATE: int = int(os.environ.get("STORYBOARD_WPM", 150))
 
 
 # --- Configuration Validation ---
@@ -213,7 +228,13 @@ def validate_config_on_startup(cfg: config):
 
 
     if not cfg.llm.ENDPOINT or not cfg.llm.MODEL:
-        _logger.critical("LLM_ENDPOINT or LLM_MODEL is not configured. Story generation will likely fail.")
+        _logger.critical("LLM_ENDPOINT or the default LLM_MODEL is not configured. Core functionality might fail.")
+    if not cfg.llm.MODEL_MULTI:
+        _logger.warning("LLM_MODEL_MULTI is not explicitly configured. Falling back to default LLM_MODEL.")
+    if not cfg.llm.MODEL_SMALL:
+        _logger.warning("LLM_MODEL_SMALL is not explicitly configured. Falling back to default LLM_MODEL.")
+    if not cfg.llm.MODEL_LARGE:
+        _logger.warning("LLM_MODEL_LARGE is not explicitly configured. Falling back to default LLM_MODEL.")
 
     if cfg.openAI.API_KEY is None:
          _logger.critical("OPENAI_API_KEY is not configured. DALL-E image generation for storyboards will fail.")
@@ -241,6 +262,7 @@ def validate_config_on_startup(cfg: config):
             "AUDIO_STORAGE_PATH": cfg.storage.AUDIO_STORAGE_PATH,
             "STORY_STORAGE_PATH": cfg.storage.STORY_STORAGE_PATH,
             "STORYBOARD_STORAGE_PATH": cfg.storage.STORYBOARD_STORAGE_PATH,
+            "METADATA_STORAGE_PATH": cfg.storage.METADATA_STORAGE_PATH,
         }
         for name, path in paths_to_check.items():
             if not path.startswith(local_base):

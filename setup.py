@@ -14,7 +14,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="viralStoryGenerator",
-    version="0.1.2",
+    version="0.1.3",
     description="Generate short story scripts via a local LLM endpoint.",
     packages=find_packages(include=["viralStoryGenerator", "viralStoryGenerator.*"]),
     package_data={
@@ -53,7 +53,8 @@ setup(
         "langchain-community>=0.2.7",
         "autoawq==0.2.6",
         "autoawq-kernels==0.0.7",
-        "torchaudio>=2.2.0"
+        "torchaudio>=2.2.0",
+        "tenacity>=8.2.3"
     ],
     python_requires=">=3.7",
     entry_points={
