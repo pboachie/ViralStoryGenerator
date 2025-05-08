@@ -86,8 +86,8 @@ class JobStatusResponse(BaseModel):
     audio_url: Optional[str] = Field(None, description="URL to the generated audio file if completed")
     sources: Optional[List[str]] = Field(None, description="Sources used to generate the story")
     error: Optional[str] = Field(None, description="Error message if failed")
-    created_at: Optional[float] = Field(None, description="Timestamp when job was created")
-    updated_at: Optional[float] = Field(None, description="Timestamp when job was last updated")
+    created_at: Optional[str] = Field(None, description="Timestamp when job was created")
+    updated_at: Optional[str] = Field(None, description="Timestamp when job was last updated")
 
 class StoryboardScene(BaseModel):
     scene_number: int = Field(..., description="Scene number")
@@ -181,12 +181,12 @@ STORYBOARD_RESPONSE_FORMAT = {
                         "type": "object",
                         "properties": {
                             "scene_number": {"type": "integer"},
-                            "narration_text": {"type": "string"},
+                            "scene_start_marker": {"type": "string", "description": "The exact first 5-10 words of the scene text."},
                             "image_prompt": {"type": "string"},
                             "duration": {"type": "number"},
                             "start_time": {"type": "number"}
                         },
-                        "required": ["scene_number", "narration_text", "image_prompt", "duration", "start_time"]
+                        "required": ["scene_number", "scene_start_marker", "image_prompt", "duration", "start_time"]
                     }
                 }
             },

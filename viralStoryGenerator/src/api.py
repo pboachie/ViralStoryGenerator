@@ -786,9 +786,8 @@ async def get_job_status(job_id: str):
         raise HTTPException(status_code=400, detail="Invalid job ID format")
 
     try:
-        # Connect to Redis directly
         redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
-        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
+        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=API_QUEUE_NAME)
 
         # Get job status from the Redis Stream
         job_status = message_broker.get_job_status(job_id)
@@ -797,21 +796,102 @@ async def get_job_status(job_id: str):
             _logger.warning(f"Job ID not found in Redis Stream: {job_id}")
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
 
-        # Format the response
-        result_data = {
-            "job_id": job_id,
-            "status": job_status.get("status", "pending"),
-            "timestamp": job_status.get("timestamp", ""),
-            "message": job_status.get("message", "")
-        }
+        if "job_id" not in job_status:
+             job_status["job_id"] = job_id
 
-        # Include additional fields if present
-        for key in ["result", "error", "storyboard", "processing_time"]:
-            if key in job_status:
-                result_data[key] = job_status[key]
+        if job_status.get("status") == "completed":
+            _logger.debug(f"Job {job_id} is completed. Attempting to load content from storage.")
+            try:
+                # --- Story Script ---
+                if ref := job_status.pop("story_script_ref", None):
+                    filename = os.path.basename(ref)
+                    _logger.debug(f"Retrieving story script: {filename}")
+                    content = storage_manager.retrieve_file(filename=filename, file_type="story")
+                    if content:
+                        if isinstance(content, bytes):
+                            job_status["story_script"] = content.decode('utf-8')
+                        elif hasattr(content, 'read'):
+                            try:
+                                job_status["story_script"] = content.read().decode('utf-8')
+                            finally:
+                                if hasattr(content, 'close'):
+                                    content.close()
+                        else:
+                            job_status["story_script"] = str(content)
+                    else:
+                         _logger.warning(f"Story script file not found via ref {ref} for job {job_id}")
 
-        _logger.debug(f"Result found for job {job_id}, status: {result_data.get('status')}")
-        return JobStatusResponse(**result_data)
+                # --- Storyboard ---
+                if ref := job_status.pop("storyboard_ref", None):
+                    filename = os.path.basename(ref)
+                    _logger.debug(f"Retrieving storyboard: {filename}")
+                    content = storage_manager.retrieve_file(filename=filename, file_type="storyboard")
+                    if content:
+                        try:
+                            if isinstance(content, bytes):
+                                json_content = content.decode('utf-8')
+                            elif hasattr(content, 'read'):
+                                try:
+                                    json_content = content.read().decode('utf-8')
+                                finally:
+                                    if hasattr(content, 'close'):
+                                        content.close()
+                            else:
+                                json_content = str(content)
+                            job_status["storyboard"] = json.loads(json_content)
+                        except json.JSONDecodeError as json_e:
+                            _logger.error(f"Failed to parse storyboard JSON for job {job_id}: {json_e}")
+                        except Exception as e:
+                             _logger.error(f"Error processing storyboard content for job {job_id}: {e}")
+                    else:
+                         _logger.warning(f"Storyboard file not found via ref {ref} for job {job_id}")
+
+                # --- Audio URL ---
+                if ref := job_status.pop("audio_ref", None):
+                     filename = os.path.basename(ref)
+                     job_status["audio_url"] = f"/api/stories/{job_id}/download/audio" # todo: potentially /api/audio/{filename}
+                     _logger.debug(f"Constructed audio URL: {job_status['audio_url']}")
+                else:
+                     job_status["audio_url"] = None
+
+
+                # --- Sources (from Metadata) ---
+                if ref := job_status.pop("metadata_ref", None):
+                    try:
+                        metadata_content = storage_manager.retrieve_file_content_as_json(
+                            filename=ref,
+                            file_type="metadata"
+                        )
+                        if metadata_content and isinstance(metadata_content, dict) and "sources" in metadata_content:
+                            job_status["sources"] = metadata_content["sources"]
+                            _logger.debug(f"Successfully loaded sources for job {job_id} from metadata file: {ref}")
+                        else:
+                            job_status["sources"] = None
+                            _logger.warning(f"Metadata file {ref} for job {job_id} loaded, but 'sources' key missing, not a dict, or content is null. Content: {str(metadata_content)[:200]}")
+                    except FileNotFoundError:
+                        job_status["sources"] = None
+                        _logger.warning(f"Metadata file {ref} not found for job {job_id}.")
+                    except Exception as e:
+                        job_status["sources"] = None
+                        _logger.error(f"Failed to load or parse sources from metadata_ref {ref} for job {job_id}: {e}", exc_info=True)
+                else:
+                    job_status["sources"] = None
+                    _logger.debug(f"No metadata_ref found in job status for job {job_id}, 'sources' will be null.")
+
+            except Exception as load_e:
+                 _logger.error(f"Error loading content from storage for completed job {job_id}: {load_e}", exc_info=True)
+                 if "sources" not in job_status: job_status["sources"] = None
+                 if "story_script" not in job_status: job_status["story_script"] = None
+                 if "storyboard" not in job_status: job_status["storyboard"] = None
+                 if "audio_url" not in job_status: job_status["audio_url"] = None
+
+
+        _logger.debug(f"Final status data being passed to model for job {job_id}: {job_status}")
+        try:
+            return JobStatusResponse(**job_status)
+        except Exception as model_e:
+             _logger.error(f"Error creating JobStatusResponse model for job {job_id}: {model_e}. Raw status after potential enrichment: {job_status}")
+             raise HTTPException(status_code=500, detail="Internal server error processing job status.")
 
     except HTTPException:
         raise

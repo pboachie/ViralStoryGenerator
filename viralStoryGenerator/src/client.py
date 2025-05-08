@@ -104,7 +104,7 @@ async def queue_scrape_request(
 
     if wait_for_result:
         result = await wait_for_job_result(job_id, timeout=timeout, stream_name="scraper_jobs")
-        _logger.debug(f"Scraper: Wait result for {job_id}: {result}")
+        # _logger.debug(f"Scraper: Wait result for {job_id}: {result}")
 
         if result and result.get("status") == "completed":
             _logger.info(f"Received result for scrape request {job_id}.")

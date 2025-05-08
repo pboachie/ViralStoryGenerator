@@ -14,11 +14,7 @@ from typing import Dict
 from ..utils.config import config as app_config
 from ..utils.redis_manager import RedisMessageBroker
 from viralStoryGenerator.src.logger import logger as _logger
-try:
-    from .api_worker import process_api_job
-except ImportError:
-    _logger.critical("Could not import 'process_api_job' from 'api_worker'. Ensure api_worker.py exists and contains the processing function.")
-    process_api_job = None
+from ..utils.api_job_processor import process_api_job
 
 _message_broker = None
 
@@ -34,10 +30,6 @@ def handle_shutdown(sig, frame):
 def preload_components():
     """Preload and initialize key components at startup."""
     global _message_broker
-
-    if not process_api_job:
-        _logger.critical("API job processing function not available. Worker cannot start.")
-        sys.exit(1)
 
     redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
     _message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=app_config.redis.QUEUE_NAME) # Use QUEUE_NAME
@@ -90,7 +82,7 @@ async def process_single_api_job(job_data_raw: Dict[bytes, bytes], message_id: s
 
         _logger.info(f"Processing API job {job_id} (Type: {job_type or 'Unknown'}). Message ID: {message_id}")
 
-        await process_api_job(job_data, consumer_name, group_name)
+        await process_api_job(job_data, consumer_name, group_name, message_broker)
 
     except Exception as e:
         _logger.exception(f"Error processing API job {job_id or message_id}: {e}")
@@ -177,10 +169,14 @@ async def run_api_job_consumer(consumer_name: str):
                     job_type = job_data_temp.get("job_type")
                     if job_type != "generate_story":
                         if job_type is None or job_type in ["pending", "processing", "completed", "failed", "initialized", "purged"]:
-                             _logger.debug(f"Skipping non-actionable message {message_id} (Type: {job_type}).")
+                            #  _logger.debug(f"Skipping non-actionable message {message_id} (Type: {job_type}).")
+                            pass
                         else:
                              _logger.warning(f"Skipping message {message_id} with unexpected job_type: {job_type}.")
-                        message_broker.acknowledge_message(group_name, message_id)
+                        try:
+                            message_broker.acknowledge_message(group_name, message_id)
+                        except Exception as ack_e:
+                            _logger.error(f"Failed to acknowledge message {message_id}: {ack_e}")
                         continue
                     # --- End Job Type Filtering ---
 

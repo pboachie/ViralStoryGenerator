@@ -179,10 +179,10 @@ async def queue_scrape_request(
 
         while (time.time() - start_time) < timeout:
             result = message_broker.get_job_status(job_id)
-            _logger.debug(f"Scraper: Wait result for {job_id}: {result}")
+            # _logger.debug(f"Scraper: Polling for job {job_id}. Result from get_job_status: {result}")
 
             if result and result.get("status") in ["completed", "failed"]:
-                _logger.info(f"Received result for scrape request {job_id}.")
+                _logger.info(f"Received final status '{result.get('status')}' for scrape request {job_id}.")
                 return job_id if result.get("status") == "completed" else None
 
             # Wait before checking again
@@ -202,7 +202,7 @@ async def get_scrape_result(request_id: str) -> Optional[List[Tuple[str, Optiona
         return None
 
     result = message_broker.get_job_status(request_id)
-    _logger.debug(f"Scraper: get_scrape_result for {request_id}. Data from Redis Stream: {result}")
+    # _logger.debug(f"Scraper: get_scrape_result for {request_id}. Data from Redis Stream: {result}")
 
     if not result:
         _logger.warning(f"Scrape job {request_id} not found in the stream.")

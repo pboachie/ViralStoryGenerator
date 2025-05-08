@@ -83,7 +83,7 @@ def _pre_process_markdown(markdown: str) -> str:
     _logger.debug("Applying markdown pre-processing rules...")
     processed = markdown
 
-    processed = re.sub(r'!\[.*?\]\(data:image/(?:gif|png|jpeg|webp);base64.*?\)\s*', '', processed) # More robust image removal
+    processed = re.sub(r'!\[.*?\]\(data:image/(?:gif|png|jpeg|webp);base64.*?\)\s*', '', processed) # Image removal
     processed = re.sub(r'\[\s*\]\(\s*\)\s*', '', processed) # Empty links
     processed = re.sub(r'\[[^]]*?\]\(#\)\s*', '', processed) # Links to '#'
     processed = re.sub(r'\[image:\s*.*?\]', '', processed, flags=re.IGNORECASE) # Image placeholders
@@ -216,10 +216,10 @@ def _generate_cleaning_prompt(markdown_to_clean: str, max_chars: int = 20000) ->
         markdown_to_clean = truncated_markdown + "\n... [Content Truncated Due To Length]"
         _logger.warning(f"Truncated markdown length: {len(markdown_to_clean)}")
 
-    prompt = get_clean_markdown_prompt()
+    prompt = get_clean_markdown_prompt(markdown_to_clean)
     return prompt
 
-def clean_markdown_with_llm(raw_markdown: str, temperature: float = 0.1) -> Optional[str]:
+def clean_markdown_with_llm(raw_markdown: str, temperature: float = 0.95) -> Optional[str]:
     """
     Uses pre-processing and an LLM to clean raw markdown scraped from the web.
     Aims to remove boilerplate, ads, navigation, etc., and format as a clean article.
@@ -274,7 +274,6 @@ def clean_markdown_with_llm(raw_markdown: str, temperature: float = 0.1) -> Opti
     max_tokens_for_cleaning = appconfig.llm.CLEANING_MAX_OUTPUT_TOKENS
     request_timeout = appconfig.httpOptions.TIMEOUT
 
-    # 4. Call LLM with Retry Logic (via _make_llm_request)
     response_json: Optional[Dict[str, Any]] = None
     try:
         response = _make_llm_request(
@@ -433,16 +432,17 @@ def _extract_chain_of_thought(text: str) -> Tuple[str, str]:
     _logger.debug("No chain-of-thought block found.")
     return text, ""
 
-def process_with_llm(topic: str, relevant_content: str, temperature: float, model: str) -> str:
+def process_with_llm(topic: str, temperature: float, model: str, system_prompt: str, user_prompt: str) -> str:
     """
     Process the given topic and relevant content using the specified LLM model to generate a story script.
     This version is used by the api_worker with RAG.
 
     Args:
         topic: The topic for the story.
-        relevant_content: Relevant content snippets retrieved via RAG.
         temperature: The temperature setting for the LLM.
         model: The name of the LLM model to use.
+        system_prompt: The system prompt for the LLM.
+        user_prompt: The user prompt for the LLM.
 
     Returns:
         The generated story script (potentially including description, separated by markers).
@@ -466,8 +466,6 @@ def process_with_llm(topic: str, relevant_content: str, temperature: float, mode
          raise ValueError("LLM Endpoint not configured")
 
     # Prepare messages for the LLM API using the RAG-aware prompt
-    system_prompt = get_system_instructions()
-    user_prompt = get_user_prompt(topic, relevant_content)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt}
