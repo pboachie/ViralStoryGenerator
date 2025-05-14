@@ -2,6 +2,7 @@
 Queue Worker for processing main generation jobs from the Redis queue (api_jobs).
 Run this script separately to start a background worker process.
 """
+import viralStoryGenerator.src.logger
 import asyncio
 import signal
 import sys
@@ -11,10 +12,13 @@ import uuid
 import time
 from typing import Dict
 
+
 from ..utils.config import config as app_config
 from ..utils.redis_manager import RedisMessageBroker
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from ..utils.api_job_processor import process_api_job
+
+_logger = logging.getLogger(__name__)
 
 _message_broker = None
 
@@ -130,7 +134,7 @@ async def run_api_job_consumer(consumer_name: str):
         try:
             # Fetch new messages
             available_slots = max_concurrent - len(active_tasks)
-            if available_slots <= 0:
+            if (available_slots <= 0):
                 await asyncio.sleep(0.1)
                 continue
 
@@ -237,6 +241,14 @@ async def handle_async_shutdown(sig):
 
 def main():
     """Entry point for the worker process."""
+    log_level = getattr(logging, app_config.LOG_LEVEL, logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        stream=sys.stdout
+    )
+    _logger.info(f"Logging configured with level: {logging.getLevelName(log_level)}")
+
     if os.name == 'nt': # Windows
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 

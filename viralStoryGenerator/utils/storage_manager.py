@@ -14,8 +14,11 @@ from urllib.parse import urljoin, urlparse
 
 # Import config first
 from viralStoryGenerator.utils.config import config as appconfig
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.utils.security import is_safe_filename, is_file_in_directory
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 # Cloud SDKs are optional dependencies
 try:
@@ -78,6 +81,7 @@ class StorageManager:
             "story": appconfig.storage.STORY_STORAGE_PATH,
             "storyboard": appconfig.storage.STORYBOARD_STORAGE_PATH,
             "metadata": appconfig.storage.METADATA_STORAGE_PATH,
+            "screenshot": appconfig.storage.SCREENSHOT_STORAGE_PATH,
         }
         storage_dir = path_map.get(file_type)
         if not storage_dir:
@@ -108,6 +112,7 @@ class StorageManager:
                 appconfig.storage.STORY_STORAGE_PATH,
                 appconfig.storage.STORYBOARD_STORAGE_PATH,
                 appconfig.storage.METADATA_STORAGE_PATH,
+                appconfig.storage.SCREENSHOT_STORAGE_PATH,
             ]
             for path in paths_to_create:
                  os.makedirs(path, exist_ok=True)
@@ -224,6 +229,8 @@ class StorageManager:
             return ".json"
         elif file_type == "metadata":
             return ".json"
+        elif file_type == "screenshot":
+            return ".png"
         else:
             return "" # Default to no extension if unknown
 
@@ -633,12 +640,12 @@ class StorageManager:
         cutoff_dt = datetime.datetime.fromtimestamp(cutoff_timestamp, tz=datetime.timezone.utc)
         _logger.info(f"Starting storage cleanup. Provider: {self.provider}. Deleting files older than {retention_days} days (before {cutoff_dt.isoformat()}).")
 
-        file_types_to_clean = ["audio", "story", "storyboard", "metadata"]
+        file_types_to_clean = ["audio", "story", "storyboard", "metadata", "screenshot"]
 
         try:
             if self.provider == "local":
                 # Iterate through configured storage directories
-                for file_type in ["audio", "story", "storyboard", "metadata"]:
+                for file_type in file_types_to_clean:
                     storage_dir = self._get_storage_dir(file_type)
                     _logger.debug(f"Checking local directory for cleanup: {storage_dir}")
                     if not os.path.isdir(storage_dir): continue
@@ -665,7 +672,8 @@ class StorageManager:
             elif self.provider == "s3":
                  if not self.s3_client: return 0
                  bucket = appconfig.storage.S3_BUCKET_NAME
-                 for prefix in ["audio/", "story/", "storyboard/", "metadata/"]:
+                 for prefix_base in file_types_to_clean:
+                     prefix = f"{prefix_base}/"
                      _logger.debug(f"Checking S3 prefix for cleanup: {prefix}")
                      paginator = self.s3_client.get_paginator('list_objects_v2')
                      pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
@@ -695,7 +703,8 @@ class StorageManager:
                  if not self.azure_blob_service_client: return 0
                  container_name = appconfig.storage.AZURE_CONTAINER_NAME
                  container_client = self.azure_blob_service_client.get_container_client(container_name)
-                 for prefix in ["audio/", "story/", "storyboard/", "metadata/"]:
+                 for prefix_base in file_types_to_clean:
+                     prefix = f"{prefix_base}/"
                      _logger.debug(f"Checking Azure prefix for cleanup: {prefix}")
                      blob_list = container_client.list_blobs(name_starts_with=prefix)
                      blobs_to_delete = []

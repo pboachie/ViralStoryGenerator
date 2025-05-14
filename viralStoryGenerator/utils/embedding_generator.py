@@ -5,7 +5,10 @@ from typing import Optional
 from chromadb.utils import embedding_functions
 
 from viralStoryGenerator.utils.config import config as app_config
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 _embedding_function = None
 
@@ -18,7 +21,8 @@ def get_embedding_function():
         try:
             # ChromaDB's helper function simplifies using sentence-transformers
             _embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name=model_name
+                model_name=model_name,
+                device=app_config.rag.DEVICE
             )
             # Test the function
             _embedding_function(["test"])

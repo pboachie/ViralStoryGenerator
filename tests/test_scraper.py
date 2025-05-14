@@ -5,7 +5,10 @@ import asyncio
 import sys
 import time
 from viralStoryGenerator.utils.crawl4ai_scraper import queue_scrape_request, get_scrape_result, get_redis_manager
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
+
+_logger = logging.getLogger(__name__)
+import viralStoryGenerator.src.logger
 
 async def test_scraper():
     """Test the scraper functionality directly"""

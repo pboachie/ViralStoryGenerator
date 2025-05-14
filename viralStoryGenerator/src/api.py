@@ -40,7 +40,7 @@ from viralStoryGenerator.utils.health_check import get_service_status
 from viralStoryGenerator.utils.redis_manager import RedisMessageBroker
 from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.utils.storage_manager import storage_manager
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.utils.security import (
     is_safe_filename,
     is_file_in_directory,
@@ -54,6 +54,8 @@ from viralStoryGenerator.src.api_handlers import (
     get_task_status
 )
 
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 app_start_time = time.time()
 router = APIRouter()
@@ -731,6 +733,10 @@ async def generate_story_from_urls(
     """
     _logger.info(f"Received request to generate story from URLs for topic: '{request.topic}'")
     try:
+        if not app_config.storyboard.ENABLE_STORYBOARD_GENERATION:
+            _logger.info("Storyboard generation is disabled in the configuration.")
+            request.include_images = False
+
         # Generate a unique job ID
         job_id = str(uuid.uuid4())
         job_data = {
@@ -773,7 +779,6 @@ async def generate_story_from_urls(
     except Exception as e:
         _logger.exception(f"Error queueing job for topic '{request.topic}': {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error queueing job.")
-
 
 @router.get("/status/{job_id}", response_model=JobStatusResponse, tags=["Job Management"], dependencies=[Depends(get_api_key)])
 async def get_job_status(job_id: str):
@@ -1218,6 +1223,25 @@ async def get_all_queue_status():
                 ))
         except Exception as e:
             _logger.warning(f"Could not retrieve recent messages for {app_config.redis.QUEUE_NAME}: {e}")
+
+
+@router.post("/config/storyboard", tags=["Configuration"])
+async def toggle_storyboard_generation(enabled: bool):
+    """Toggle storyboard generation dynamically."""
+    app_config.set_storyboard_generation(enabled)
+    return {"message": f"Storyboard generation {'enabled' if enabled else 'disabled'} successfully."}
+
+@router.post("/config/image-generation", tags=["Configuration"])
+async def toggle_image_generation(enabled: bool):
+    """API endpoint to toggle image generation."""
+    app_config.set_image_generation(enabled)
+    return {"message": "Image generation updated", "enabled": enabled}
+
+@router.post("/config/audio-generation", tags=["Configuration"])
+async def toggle_audio_generation(enabled: bool):
+    """API endpoint to toggle audio generation."""
+    app_config.set_audio_generation(enabled)
+    return {"message": "Audio generation updated", "enabled": enabled}
 
 
 app.include_router(router, prefix="/api")

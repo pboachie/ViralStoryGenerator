@@ -16,6 +16,8 @@ import shutil
 import datetime
 from typing import Dict, Any, Optional
 
+import viralStoryGenerator.src.logger
+
 from viralStoryGenerator.models import (
     JobStatusResponse
 )
@@ -24,12 +26,15 @@ from viralStoryGenerator.utils.crawl4ai_scraper import get_scrape_result, queue_
 from viralStoryGenerator.utils.config import config as app_config
 from viralStoryGenerator.src.llm import process_with_llm, clean_markdown_with_llm
 from viralStoryGenerator.src.storyboard import generate_storyboard
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.utils.text_processing import split_text_into_chunks
 from viralStoryGenerator.utils.vector_db_manager import get_vector_db_client
 from viralStoryGenerator.utils.storage_manager import storage_manager
 from viralStoryGenerator.prompts.prompts import get_system_instructions, get_user_prompt
 from viralStoryGenerator.utils.api_job_processor import process_api_job
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 # Constants
 API_QUEUE_NAME = app_config.redis.QUEUE_NAME

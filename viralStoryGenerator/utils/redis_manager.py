@@ -8,8 +8,11 @@ from redis.exceptions import ConnectionError, TimeoutError, RedisError
 from typing import Dict, Any, Optional, List, Union
 import uuid
 
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.utils.config import config as app_config
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 class RedisMessageBroker:
     """A Redis-based message broker using Redis Streams."""
@@ -29,6 +32,7 @@ class RedisMessageBroker:
         """
         Publish a message to the Redis stream. Serializes complex types and None correctly.
         """
+        _logger.debug(f"RedisMessageBroker: Attempting to publish to stream '{self.stream_name}'. Initial message keys: {list(message.keys())}")
         safe_message = {}
         for k, v in message.items():
             if v is None:
@@ -39,18 +43,32 @@ class RedisMessageBroker:
                 try:
                     safe_message[k] = json.dumps(v)
                 except TypeError:
-                     _logger.warning(f"Could not JSON serialize field '{k}' for stream '{self.stream_name}'. Storing as string representation.")
-                     safe_message[k] = str(v)
+                    _logger.warning(f"Could not JSON serialize field '{k}' for stream '{self.stream_name}'. Storing as string representation.")
+                    safe_message[k] = str(v)
             elif not isinstance(v, (str, int, float, bytes)):
-                 _logger.debug(f"Converting non-basic type {type(v)} to string for field '{k}' in stream '{self.stream_name}'.")
-                 safe_message[k] = str(v)
+                _logger.debug(f"Converting non-basic type {type(v)} to string for field '{k}' in stream '{self.stream_name}'.")
+                safe_message[k] = str(v)
             else:
                 safe_message[k] = v
+
+        _logger.debug(f"RedisMessageBroker: Prepared safe_message for stream '{self.stream_name}'. Keys: {list(safe_message.keys())}")
         try:
-            return self.redis.xadd(self.stream_name, safe_message)
+            _logger.debug(f"RedisMessageBroker: Executing redis.xadd for stream '{self.stream_name}'...")
+            message_id = self.redis.xadd(self.stream_name, safe_message)
+            _logger.debug(f"RedisMessageBroker: Successfully published message to stream '{self.stream_name}'. Message ID: {message_id}")
+            return message_id
+        except ConnectionError as ce:
+            _logger.error(f"RedisMessageBroker: ConnectionError publishing to stream {self.stream_name}: {ce}")
+            raise
+        except TimeoutError as te:
+            _logger.error(f"RedisMessageBroker: TimeoutError publishing to stream {self.stream_name}: {te}")
+            raise # Re-raise
+        except RedisError as re:
+            _logger.error(f"RedisMessageBroker: RedisError publishing to stream {self.stream_name}: {re}")
+            raise # Re-raise
         except Exception as e:
-            _logger.error(f"Failed to publish message to stream {self.stream_name}: {e}")
-            return None
+            _logger.error(f"RedisMessageBroker: Unexpected error publishing message to stream {self.stream_name}: {e}")
+            raise
 
     def create_consumer_group(self, group_name: str) -> None:
         """

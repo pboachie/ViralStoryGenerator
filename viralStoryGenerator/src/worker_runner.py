@@ -4,6 +4,7 @@ Unified worker runner script.
 Launches the specified worker type (api, queue, or scrape) based on command-line arguments.
 """
 
+import viralStoryGenerator.src.logger
 import argparse
 import sys
 import os
@@ -11,8 +12,10 @@ import uvicorn
 import logging
 import importlib
 
+
 from viralStoryGenerator.utils.config import config as app_config
-from viralStoryGenerator.src.logger import logger as _logger
+
+_logger = logging.getLogger(__name__)
 
 try:
     from watchfiles import run_process
@@ -42,9 +45,10 @@ def run_api_server(args, uvicorn_extra_args=None):
     uvicorn_error_logger = logging.getLogger("uvicorn.error")
     uvicorn_error_logger.setLevel(log_level)
 
-
     _logger.info(f"Starting API server on {args.host}:{args.port} (Reload: {args.reload})")
     _logger.info(f"API Documentation available at http://{args.host}:{args.port}/docs")
+
+    project_package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     uvicorn_args = dict(
         host=args.host,
@@ -56,7 +60,9 @@ def run_api_server(args, uvicorn_extra_args=None):
     # Remove None values
     uvicorn_args = {k: v for k, v in uvicorn_args.items() if v is not None}
 
-    reload_dirs = [os.path.dirname(os.path.abspath(__file__))] if args.reload else []
+    reload_dirs_list = [project_package_dir] if args.reload else []
+    if args.reload:
+        _logger.info(f"[RELOAD] API server watching {project_package_dir} for changes...")
 
     if uvicorn_extra_args:
         cmd = [sys.executable, "-m", "uvicorn"]
@@ -69,14 +75,14 @@ def run_api_server(args, uvicorn_extra_args=None):
             else:
                 cmd.append(f"--{k.replace('_', '-')}")
                 cmd.append(str(v))
-        for d in reload_dirs:
+        for d in reload_dirs_list:
             cmd.append("--reload-dir")
             cmd.append(d)
         cmd += uvicorn_extra_args
         cmd.append("viralStoryGenerator.src.api:app")
         os.execvp(cmd[0], cmd)
     else:
-        uvicorn.run("viralStoryGenerator.src.api:app", reload_dirs=reload_dirs if args.reload else None, **uvicorn_args)
+        uvicorn.run("viralStoryGenerator.src.api:app", reload_dirs=reload_dirs_list if args.reload else None, **uvicorn_args)
 
 def main():
     parser = argparse.ArgumentParser(description="Run a specific ViralStoryGenerator worker or the API server.")
@@ -123,10 +129,10 @@ def main():
                 else:
                     _logger.error(f"Unknown worker type: {worker_type}")
                     sys.exit(1)
-                watch_dir = os.path.join(os.path.dirname(__file__))
-                _logger.info(f"[RELOAD] Watching {watch_dir} for changes...")
+                project_package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                _logger.info(f"[RELOAD] Worker watching {project_package_dir} for changes...")
                 from functools import partial
-                run_process(watch_dir, target=partial(worker_entry, module_path))
+                run_process(project_package_dir, target=partial(worker_entry, module_path))
             else:
                 if worker_type == "queue":
                     from viralStoryGenerator.src.queue_worker import main as queue_main

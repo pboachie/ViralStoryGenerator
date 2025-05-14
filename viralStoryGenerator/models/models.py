@@ -2,8 +2,38 @@
 # viralStoryGenerator/models/models.py
 
 from typing import Dict, Any, Optional, List, Union, Tuple
-from pydantic import BaseModel, AnyHttpUrl, Field, field_validator, RootModel
+from pydantic import BaseModel, AnyHttpUrl, Field, HttpUrl, field_validator, RootModel
 from viralStoryGenerator.utils.config import config as app_config
+
+
+class URLMetadata(BaseModel):
+    url: Union[AnyHttpUrl, str]
+    final_url: Optional[Union[AnyHttpUrl, str]] = None
+    status: str = "pending"  # e.g., pending, success, error
+    markdown_content: Optional[str] = None
+    html_content: Optional[str] = None
+    raw_html_snippet: Optional[str] = None #
+    title: Optional[str] = None
+    description: Optional[str] = None
+    metadata_payload: Optional[Dict[str, Any]] = Field(default=None, alias="metadata")
+    error: Optional[str] = None
+    processing_time_seconds: Optional[float] = None
+    screenshot_path: Optional[str] = None
+    screenshot_url: Optional[AnyHttpUrl] = None
+    screenshot_base64: Optional[str] = None
+    pdf_path: Optional[str] = None
+    pdf_url: Optional[AnyHttpUrl] = None
+    mhtml_path: Optional[str] = None
+    mhtml_url: Optional[AnyHttpUrl] = None
+    job_id: Optional[str] = None
+    dispatch_task_id: Optional[str] = None
+    dispatch_memory_usage: Optional[Any] = None
+    dispatch_duration_seconds: Optional[float] = None
+    all_meta_tags: Optional[Dict[str, str]] = None
+    image_url: Optional[AnyHttpUrl] = None
+
+    class Config:
+        populate_by_name = True # Allows using alias "metadata" for "metadata_payload"
 
 class StoryGenerationRequest(BaseModel):
     """Request model for generating a story from URLs"""

@@ -4,7 +4,10 @@
 import re
 from typing import List
 
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 def split_text_into_chunks(text: str, max_chunk_size: int) -> List[str]:
     """

@@ -6,11 +6,14 @@ import re
 import time
 from typing import Tuple, Dict, Optional, List, Any
 
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, wait_fixed
 
 from viralStoryGenerator.prompts.prompts import get_system_instructions, get_user_prompt, get_fix_prompt, get_clean_markdown_prompt
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.utils.config import config as appconfig
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 STORY_PATTERN = re.compile(r"(?s)### Story Script:\s*(.*?)\n### Video Description:")
 DESC_PATTERN = re.compile(r"### Video Description:\s*(.*)$")
@@ -76,67 +79,257 @@ def _make_llm_request(endpoint: str, model: str, messages: List[Dict[str, str]],
     _logger.debug(f"LLM request successful (Status: {response.status_code})")
     return response
 
+@retry(wait=wait_fixed(1), stop=stop_after_attempt(2), retry=retry_if_exception_type(requests.exceptions.RequestException), after=lambda retry_state: _logger.warning(f"Retrying LLM request (attempt {retry_state.attempt_number}) after error: {retry_state.outcome.exception()}"))
+def _make_llm_request(
+    messages: List[Dict[str, str]],
+    model_name: str,
+    temperature: float,
+    max_tokens: int,
+    llm_api_endpoint: str,
+    stream_response: bool = False,
+    timeout: int = 120
+) -> requests.Response:
+    _logger.debug(f"Original model name received: {model_name}")
+
+    if not isinstance(llm_api_endpoint, str):
+        _logger.warning(f"llm_api_endpoint was not a string (type: {type(llm_api_endpoint)}, value: {llm_api_endpoint}). Converting to string.")
+        llm_api_endpoint = str(llm_api_endpoint)
+
+    cleaned_model_name = model_name
+    if isinstance(model_name, str) and "#" in model_name:
+        cleaned_model_name = model_name.split("#")[0].strip()
+        _logger.debug(f"Cleaned model name to: {cleaned_model_name}")
+
+    effective_llm_api_endpoint = llm_api_endpoint
+    if not llm_api_endpoint.endswith("/v1/chat/completions") and llm_api_endpoint.endswith("/"):
+        effective_llm_api_endpoint = llm_api_endpoint.rstrip("/")
+
+    _logger.debug(f"Sending request to LLM: {effective_llm_api_endpoint}, Model: {cleaned_model_name}, Temp: {temperature}, MaxTokens: {max_tokens}, Timeout: {timeout}")
+
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "model": cleaned_model_name,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": stream_response
+    }
+    try:
+        response = requests.post(
+            effective_llm_api_endpoint,
+            headers=headers,
+            json=payload,
+            timeout=timeout
+        )
+        response.raise_for_status()
+        _logger.debug(f"LLM request successful (Status: {response.status_code})")
+        return response
+    except requests.exceptions.RequestException as e:
+        _logger.error(f"LLM request to {effective_llm_api_endpoint} failed: {e}", exc_info=True)
+        raise
+
 def _pre_process_markdown(markdown: str) -> str:
     """
-    Applies deterministic pre-processing rules to remove obvious clutter before LLM.
+    Applies deterministic pre-processing rules to remove obvious clutter,
+    focusing on extracting the main article content from news-like sources.
     """
-    _logger.debug("Applying markdown pre-processing rules...")
+    _logger.debug("Applying improved markdown pre-processing rules...")
     processed = markdown
 
-    processed = re.sub(r'!\[.*?\]\(data:image/(?:gif|png|jpeg|webp);base64.*?\)\s*', '', processed) # Image removal
-    processed = re.sub(r'\[\s*\]\(\s*\)\s*', '', processed) # Empty links
-    processed = re.sub(r'\[[^]]*?\]\(#\)\s*', '', processed) # Links to '#'
-    processed = re.sub(r'\[image:\s*.*?\]', '', processed, flags=re.IGNORECASE) # Image placeholders
+    # 1. Remove all image tags and their immediate captions/credits on the same line
+    # Handles: ![alt](url) Caption Credit/Agency
+    # Handles: ![alt](data:image/...)
+    # Also removes lines that are *just* image URLs, which can happen after bad conversions
+    processed = re.sub(r'^\s*https?://(?:media\.com|i\.ytimg\.com).*?(?:\.jpg|\.png|\.gif|\.webp)?\s*$', '', processed, flags=re.MULTILINE | re.IGNORECASE)
+    processed = re.sub(r'!\[.*?\]\((?:data:image|https?://)[^)]*?\)\s*(?:[^\n]*)', '', processed)
+    # Handles: [image: placeholder text]
+    processed = re.sub(r'\[image:\s*.*?\]', '', processed, flags=re.IGNORECASE)
 
-    # Remove potential leftover script/style tags and HTML comments
+
+    # 2. Remove empty links and links to '#'
+    processed = re.sub(r'\[\s*\]\(\s*\)\s*', '', processed)
+    processed = re.sub(r'\[[^]]*?\]\(#\)\s*', '', processed) # Links to '#'
+    processed = re.sub(r'\[\s*([^]]*?)\s*\]\((https?://[^)]*?\s*)\)\s*', r'\1 \2', processed) # Keep text and URL if link is alone
+
+
+    # 3. Remove potential leftover script/style tags and HTML comments
     processed = re.sub(r'<script.*?</script>', '', processed, flags=re.DOTALL | re.IGNORECASE)
     processed = re.sub(r'<style.*?</style>', '', processed, flags=re.DOTALL | re.IGNORECASE)
     processed = re.sub(r'<!--.*?-->', '', processed, flags=re.DOTALL)
 
+    # 4. Normalize whitespace and remove excessive newlines early
+    lines = processed.splitlines()
+    # Strip leading/trailing whitespace from each line
+    lines = [line.strip() for line in lines]
+    # Filter out empty lines created by previous steps
+    lines = [line for line in lines if line]
+    processed = "\n".join(lines)
     # Remove excessive newlines (more than 2 consecutive)
     processed = re.sub(r'\n{3,}', '\n\n', processed)
 
-    # Normalize whitespace at start/end of lines
-    lines = processed.splitlines()
-    processed = "\n".join(line.strip() for line in lines)
 
-    # Remove common boilerplate lines/phrases (case-insensitive)
-    common_boilerplate_patterns = [
-        r"^\s*advertisement\s*$",
-        r"^\s*share this(?: article)?\s*$",
-        r"^\s*(?:click to )?print\s*$",
-        r"^\s*(?:click to )?email\s*$",
-        r"^\s*related posts:?\s*$",
-        r"^\s*comments\s*$",
-        r"^\s*navigation menu\s*$",
-        r"^\s*skip to content\s*$",
-        r"^\s*log in\s* / \s*register\s*$",
-        r"^\s*follow us on.*",
-        r"^\s*subscribe to our newsletter.*",
-        r"^\s*posted in.*",
-        r"^\s*tags:.*",
-        r"^\s*leave a reply.*",
-        r"^\s*your email address will not be published.*",
-        r"^\s*required fields are marked.*"
+    # 5. Remove specific news/blog clutter patterns (line-based removal)
+    clutter_line_patterns = [
+        # Timestamps and relative times (e.g., "22 hr 16 min ago", "9:48 p.m. PDT, May 6, 2025")
+        re.compile(r'^\s*(?:\d{1,2}\s+(?:hr|hrs|min|mins|sec|secs)\s+ago)\s*$', re.IGNORECASE),
+        re.compile(r'^\s*(?:\d{1,2}:\d{2}\s*(?:[ap]\.?m\.?)?\s*(?:[A-Z]{2,4})?(?:,\s+\w+\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s+\d{4})?)?)\s*$', re.IGNORECASE), # PDT, EST etc.
+        # "Link Copied!"
+        re.compile(r'^\s*Link Copied!\s*$', re.IGNORECASE),
+        # Standalone image credits (e.g., "Punit Paranjpe/AFP/Getty Images", "Manish Swarup/AP")
+        # This one is tricky because it can match actual names if not specific enough.
+        # Focus on patterns ending with known agencies or /File.
+        re.compile(r'^\s*(?:[A-Z][A-Za-z\s.’-]+(?:,\s*[A-Z][A-Za-z\s.’-]+)*\s*/\s*)?(?:AFP|AP|Reuters|Getty Images|File|EPA|EFE|Shutterstock|Hindustan Times|Press Trust of India|ANI)(?:/(?:Getty Images|AP|AFP|Reuters))?\s*$', re.IGNORECASE),
+        re.compile(r'^\s*[A-Z][a-z\s]+[A-Z][a-z]+(?:/[A-Z]+)?(?:/Getty Images)?\s*$', re.IGNORECASE), # Slightly more generic for "Name Name/Agency"
+        re.compile(r'^\s*Image credit:.*$', re.IGNORECASE),
+        re.compile(r'^\s*Photo by.*$', re.IGNORECASE),
+        re.compile(r'^\s*Source:\s*(?:Reuters|AP|AFP|Getty Images|AP Photo|Bloomberg|X|FlightRadar24\.com)\s*$', re.IGNORECASE), # Line that is just "Source: XYZ"
+        re.compile(r'^\s*\d{2}:\d{2}\s+-\s+Source:\s+\[.*?\]\(.*?\)\s*$', re.IGNORECASE), # For "02:09 - Source: [Test](...)"
+
+        # Update notices
+        re.compile(r'^\s*_(This post has been updated.*?)_\s*$', re.IGNORECASE),
+        re.compile(r'^\s*Correction: This post has been updated.*?$', re.IGNORECASE),
+        re.compile(r'^\s*Editor’s Note:.*$', re.IGNORECASE),
+        re.compile(r'^\s*This story has been updated to reflect.*$', re.IGNORECASE),
+
+        # Common boilerplate lines/phrases
+        re.compile(r"^\s*advertisement\s*$", re.IGNORECASE),
+        re.compile(r"^\s*share this(?: article| story| post)?\s*$", re.IGNORECASE),
+        re.compile(r"^\s*(?:click to )?print\s*$", re.IGNORECASE),
+        re.compile(r"^\s*(?:click to )?email\s*$", re.IGNORECASE),
+        re.compile(r"^\s*related posts:?\s*$", re.IGNORECASE),
+        re.compile(r"^\s*comments\s*$", re.IGNORECASE),
+        re.compile(r"^\s*navigation menu\s*$", re.IGNORECASE),
+        re.compile(r"^\s*skip to content\s*$", re.IGNORECASE),
+        re.compile(r"^\s*log in\s*/\s*register\s*$", re.IGNORECASE),
+        re.compile(r"^\s*follow us on.*", re.IGNORECASE),
+        re.compile(r"^\s*subscribe to our newsletter.*", re.IGNORECASE),
+        re.compile(r"^\s*posted in.*", re.IGNORECASE),
+        re.compile(r"^\s*tags:.*", re.IGNORECASE),
+        re.compile(r"^\s*leave a reply.*", re.IGNORECASE),
+        re.compile(r"^\s*your email address will not be published.*", re.IGNORECASE),
+        re.compile(r"^\s*required fields are marked.*", re.IGNORECASE),
+        re.compile(r"^\s*Ad Feedback\s*$", re.IGNORECASE),
+        re.compile(r"^\s*Subscribe\s*$", re.IGNORECASE),
+        re.compile(r"^\s*Sign in\s*$", re.IGNORECASE),
+        re.compile(r"^\s*My Account\s*$", re.IGNORECASE),
+
+        # Orphaned image context (often bolded)
+        re.compile(r'^\s*\*\*(?:Before|After) the strikes on .*?:\s*$', re.IGNORECASE),
+        re.compile(r'^\s*\*\*(?:After) the strikes, taken on .*?:\s*$', re.IGNORECASE),
+        re.compile(r'^\s*Photo:\s*.*$', re.IGNORECASE), # Lines starting with Photo:
+
+        # "Here's what we know" type intros for summaries
+        re.compile(r'^\s*_(?:Here’s|Here is) what we know(?: so far)?:?_\s*$', re.IGNORECASE),
+        re.compile(r'^\s*_(?:Here’s|Here is) the latest(?: on what we know)?:?_\s*$', re.IGNORECASE),
+        re.compile(r'^\s*_(?:Here’s|Here is) where things stand:?_\s*$', re.IGNORECASE),
+        re.compile(r'^\s*_(?:Here’s|Here is) a quick recap:?_\s*$', re.IGNORECASE),
+        re.compile(r'^\s*_(?:Here’s|Here is) what you need to know:?_\s*$', re.IGNORECASE),
+
+        re.compile(r'^\s*\*\s+\[\s*(?:Settings|Newsletters|Topics you follow|Sign out)\s*\]\(.*?\)\s*$', re.IGNORECASE),
+        re.compile(r'^\s*For privacy options, please see our privacy policy:.*?$', re.IGNORECASE),
+        re.compile(r'^\s*### Cookie List\s*$', re.IGNORECASE),
+        re.compile(r'^\s*Back Button\s*$', re.IGNORECASE), # From cookie consent
+        re.compile(r'^\s*Search Icon\s*Filter Icon\s*Clear\s*$', re.IGNORECASE),
+        re.compile(r'^\s*checkbox label label\s*$', re.IGNORECASE), # From cookie consent
+        re.compile(r'^\s*Apply Cancel\s*$', re.IGNORECASE), # From cookie consent
+        re.compile(r'^\s*Consent Leg\.Interest\s*$', re.IGNORECASE), # From cookie consent
+        re.compile(r'^\s*Close\s*$', re.IGNORECASE), # From cookie consent
+        re.compile(r'^\s*\[!\[Powered by Onetrust\]\(.*?\)\]\(https?://www.onetrust.com/products/cookie-consent/\)\s*$', re.IGNORECASE), # Onetrust logo
+        re.compile(r'^\s*\[\s*\]\((?:https?://(?:facebook|twitter|instagram|tiktok|linkedin)\.com/.*?)\s*"Visit us on .*?"\)\s*$', re.IGNORECASE), # Social media icons
+
+        # Lines that are just URLs (often remnants)
+        re.compile(r'^\s*(https?://[^\s]+)\s*$', re.IGNORECASE), # If a line is ONLY a URL
+
+        # Lines that are likely just noise from HTML conversion or short non-content markers
+        re.compile(r"^\s*[-_*]{3,}\s*$"),  # Horizontal rules
+        re.compile(r"^\s*•\s*$"), # Stray bullets
+        # re.compile(r"^\s*([A-Z]{2,5})\s*$", re.IGNORECASE), # Very short ALL CAPS words - careful with this one
     ]
+
+    # State variable for summary removal
+    in_summary_list = False
+    temp_cleaned_lines = []
+
     lines = processed.splitlines()
-    cleaned_lines = []
-    for line in lines:
-        is_boilerplate = False
-        for pattern in common_boilerplate_patterns:
-            if re.match(pattern, line.strip(), re.IGNORECASE):
-                is_boilerplate = True
+    for line_idx, line in enumerate(lines):
+        line_stripped = line.strip()
+        if not line_stripped:
+            if not temp_cleaned_lines or temp_cleaned_lines[-1] != "": # Avoid multiple blank lines
+                 temp_cleaned_lines.append("")
+            continue
+
+        is_clutter = False
+        for pattern in clutter_line_patterns:
+            if pattern.fullmatch(line_stripped):
+                is_clutter = True
+                _logger.debug(f"Removing line due to pattern '{pattern.pattern}': {line_stripped[:100]}")
+                # If this was a summary intro, set state for next lines
+                if "_Here’s what we know" in pattern.pattern or "_Here is what we know" in pattern.pattern:
+                    in_summary_list = True
                 break
-        if not is_boilerplate:
-            cleaned_lines.append(line)
+        if is_clutter:
+            continue
+
+        # Logic for removing list items if we are in a "Here's what we know" summary
+        if in_summary_list:
+            if line_stripped.startswith(("* ", "- ", "• ")) or re.match(r"^\d+\.\s+", line_stripped):
+                # Check if this list item looks like a question (often valuable)
+                if '?' in line_stripped and len(line_stripped) > 30:
+                    temp_cleaned_lines.append(line) # Keep question-like list items
+                    _logger.debug(f"Keeping summary list item (question): {line_stripped[:100]}")
+                else:
+                    _logger.debug(f"Removing summary list item: {line_stripped[:100]}")
+                    continue # Skip this summary list item
+            else:
+                # No longer in a list format, or it's a heading, so assume summary ended
+                in_summary_list = False
+                if line_stripped.startswith("##"): # if it's a new heading, keep it and reset
+                     temp_cleaned_lines.append(line)
+                     continue
+
+        temp_cleaned_lines.append(line)
+
+    # Filter out multiple consecutive blank lines that might have been created
+    cleaned_lines = []
+    for i, l in enumerate(temp_cleaned_lines):
+        if l == "" and i > 0 and temp_cleaned_lines[i-1] == "":
+            continue
+        cleaned_lines.append(l)
+
     processed = "\n".join(cleaned_lines)
 
-    # Trim leading/trailing whitespace again after modifications
+
+    # 6. Normalize whitespace again and trim overall
+    processed = re.sub(r'\n{3,}', '\n\n', processed) # Consolidate newlines
+    lines = processed.splitlines()
+    processed = "\n".join(line.strip() for line in lines if line.strip()) # Strip and remove empty lines
     processed = processed.strip()
 
-    _logger.debug(f"Pre-processing complete. Length changed from {len(markdown)} to {len(processed)}")
-    return processed
+    # 7. Remove any remaining list items that might be navigation if they are very short
+    # This is more aggressive and might need adjustment - applied AFTER main cleaning
+    lines = processed.splitlines()
+    potentially_cleaned_lines = []
+    for line in lines:
+        is_short_nav_item = False
+        # Matches lines like "* Item" or "- Item" or "1. Item" where Item is short
+        if re.match(r"^\s*[-*]\s+[\w\s.&']{1,25}\s*$", line) or \
+           re.match(r"^\s*\d+\.\s+[\w\s.&']{1,25}\s*$", line):
+            # Check if it's a common section header that we want to keep, or contains a verb
+            is_content_like = any(kw in line.lower() for kw in ['introduction', 'conclusion', 'summary', 'overview', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december']) or re.search(r'\b(is|are|was|were|has|have|had|do|does|did|will|can|could|may|might|must|should|would)\b', line.lower())
+            if not is_content_like and len(line.split()) < 5 : # if it has few words and no verb/keyword
+                _logger.debug(f"Removing potential short list item/nav: {line[:100]}")
+                is_short_nav_item = True
 
+        if not is_short_nav_item:
+            potentially_cleaned_lines.append(line)
+
+    processed = "\n".join(potentially_cleaned_lines)
+    processed = re.sub(r'\n{3,}', '\n\n', processed) # Clean newlines again
+    processed = processed.strip()
+
+
+    _logger.debug(f"Pre-processing complete. Original length {len(markdown)}, Processed length {len(processed)}")
+    return processed
 
 def _post_process_llm_output(llm_output: str) -> str:
     """
@@ -249,11 +442,14 @@ def clean_markdown_with_llm(raw_markdown: str, temperature: float = 0.95) -> Opt
 
     # 2. Pre-processing (Deterministic Cleaning)
     pre_processed_markdown = _pre_process_markdown(raw_markdown)
-    if not pre_processed_markdown:
-        _logger.warning("Markdown content is empty after pre-processing. Skipping LLM call.")
-        return ""
-    if len(pre_processed_markdown) < 50:
-        _logger.warning(f"Markdown content is very short ({len(pre_processed_markdown)} chars) after pre-processing. Skipping LLM call and returning pre-processed content.")
+    _logger.debug(f"Pre-processed markdown length: {len(pre_processed_markdown)}")
+
+    if not pre_processed_markdown.strip():
+        _logger.info("Markdown content is empty after pre-processing. Skipping LLM cleaning.")
+        return pre_processed_markdown
+
+    if len(pre_processed_markdown) < appconfig.llm.MIN_MARKDOWN_LENGTH_FOR_LLM_CLEANING:
+        _logger.info(f"Markdown content (length: {len(pre_processed_markdown)}) is shorter than minimum ({appconfig.llm.MIN_MARKDOWN_LENGTH_FOR_LLM_CLEANING}) for LLM cleaning. Returning pre-processed content.")
         return pre_processed_markdown
 
     # 3. Prepare LLM Request
@@ -277,12 +473,12 @@ def clean_markdown_with_llm(raw_markdown: str, temperature: float = 0.95) -> Opt
     response_json: Optional[Dict[str, Any]] = None
     try:
         response = _make_llm_request(
-            appconfig.llm.ENDPOINT,
-            appconfig.llm.MODEL_SMALL,
-            messages,
-            cleaning_temperature,
-            max_tokens_for_cleaning,
-            request_timeout
+            messages=messages,
+            model_name=appconfig.llm.MODEL_SMALL,
+            temperature=cleaning_temperature,
+            max_tokens=max_tokens_for_cleaning,
+            llm_api_endpoint=appconfig.llm.ENDPOINT,
+            timeout=request_timeout
         )
         response_json = response.json()
 
@@ -338,7 +534,14 @@ def _reformat_text(raw_text: str, endpoint: str, model: str, temperature: float)
         {"role": "user", "content": get_fix_prompt(raw_text)}
     ]
     try:
-        response = _make_llm_request(endpoint, model, messages, temperature, appconfig.llm.MAX_TOKENS, appconfig.httpOptions.TIMEOUT)
+        response = _make_llm_request(
+            messages=messages,
+            model_name=model,
+            temperature=temperature,
+            max_tokens=appconfig.llm.MAX_TOKENS,
+            llm_api_endpoint=endpoint,
+            timeout=appconfig.httpOptions.TIMEOUT
+        )
         response_json = response.json()
 
         if not response_json or "choices" not in response_json or not response_json["choices"]:
@@ -473,14 +676,13 @@ def process_with_llm(topic: str, temperature: float, model: str, system_prompt: 
 
     response_json: Optional[Dict[str, Any]] = None
     try:
-        # Use the robust request function with the specified model
         response = _make_llm_request(
-            appconfig.llm.ENDPOINT,
-            model,
-            messages,
-            temperature,
-            appconfig.llm.MAX_TOKENS,
-            appconfig.httpOptions.TIMEOUT
+            messages=messages,
+            model_name=model,
+            temperature=temperature,
+            max_tokens=appconfig.llm.MAX_TOKENS,
+            llm_api_endpoint=appconfig.llm.ENDPOINT,
+            timeout=appconfig.httpOptions.TIMEOUT
         )
         response_json = response.json()
 

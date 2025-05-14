@@ -6,7 +6,10 @@ import chromadb
 from chromadb.config import Settings
 
 from viralStoryGenerator.utils.config import config as app_config
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 _client = None
 _embedding_function = None

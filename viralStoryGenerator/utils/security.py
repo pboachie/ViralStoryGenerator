@@ -6,8 +6,11 @@ import uuid
 import hmac
 from typing import Optional, List
 
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.utils.config import config as app_config
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 def is_safe_filename(filename: str) -> bool:
     """

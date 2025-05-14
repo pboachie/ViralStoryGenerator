@@ -2,8 +2,10 @@
 
 from typing import List, Optional
 
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 _logger.debug("Source cleanser module loaded (RAG implementation active).")
 
 

@@ -8,13 +8,17 @@ import uvicorn
 import time
 import sys
 from fastapi.staticfiles import StaticFiles
+import logging
 
 from viralStoryGenerator.utils.config import app_config, validate_config_on_startup, ConfigError
-from viralStoryGenerator.src.logger import logger as _logger, log_startup
+from viralStoryGenerator.src.logger import log_startup
 from viralStoryGenerator.src.api import app as api_router
 from viralStoryGenerator.utils.scheduled_cleanup import cleanup_task
 from viralStoryGenerator.utils.storage_manager import storage_manager
 from viralStoryGenerator.src.api_handlers import process_audio_queue
+
+
+_logger = logging.getLogger(__name__)
 
 # --- Configuration Validation ---
 try:

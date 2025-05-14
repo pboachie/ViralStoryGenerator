@@ -12,11 +12,14 @@ from viralStoryGenerator.models import (
     StoryGenerationResult,
     JobStatusResponse
 )
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.utils.config import config as appconfig
 from viralStoryGenerator.utils.redis_manager import RedisMessageBroker
 from viralStoryGenerator.utils.storage_manager import storage_manager
 from viralStoryGenerator.utils.security import is_file_in_directory, validate_path_component, sanitize_for_filename
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 def get_message_broker() -> RedisMessageBroker:
     """Get Redis message broker for API handlers"""
@@ -48,33 +51,41 @@ def create_story_task(topic: str, sources_folder: Optional[str] = None,
     API handler logic to create a new story generation task.
     Validates inputs and queues the task via Redis Streams.
     """
+    if not appconfig.storyboard.ENABLE_STORYBOARD_GENERATION:
+        _logger.info("Storyboard generation is disabled in the configuration.")
+        include_storyboard = False
+    else:
+        include_storyboard = True
+
+    if not appconfig.ENABLE_IMAGE_GENERATION:
+        _logger.info("Image generation is disabled. Skipping related tasks.")
+        include_storyboard = False
+
+    if not appconfig.ENABLE_AUDIO_GENERATION:
+        _logger.info("Audio generation is disabled. Skipping related tasks.")
+
     # Generate a unique task ID
     task_id = str(uuid.uuid4())
 
-    # Basic task info for immediate response
     task_response = StoryTask(
         task_id=task_id,
         topic=topic
     ).to_dict()
 
-    # Prepare job data for Redis Streams
     task_data_payload = {
         "job_id": task_id,
         "job_type": "generate_story",
         "topic": topic,
         "sources_folder": sources_folder,
         "voice_id": voice_id,
+        "include_storyboard": include_storyboard,
         "request_time": time.time()
     }
 
-    # Use Redis Streams to publish the task
     try:
         message_broker = get_message_broker()
-
-        # Ensure the stream exists
         message_broker.ensure_stream_exists("api_jobs")
 
-        # Publish the message to the stream
         message_id = message_broker.publish_message(task_data_payload)
         success = message_id is not None
     except Exception as e:
@@ -89,7 +100,6 @@ def create_story_task(topic: str, sources_folder: Optional[str] = None,
         raise RuntimeError("Failed to add task to Redis Stream.")
 
     return task_response
-
 
 def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
     """

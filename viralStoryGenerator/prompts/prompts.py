@@ -115,7 +115,7 @@ def get_system_instructions():
 def get_user_prompt(topic: str, relevant_chunks: str) -> str:
     """Generates the user prompt for the LLM, using relevant chunks from RAG."""
     # If no relevant chunks were found, provide a basic prompt
-    if not relevant_chunks or relevant_chunks.isspace():
+    if not relevant_chunks or all((not chunk or str(chunk).isspace()) for chunk in relevant_chunks):
         print("No relevant chunks found. Generating prompt based on topic alone.")
         relevant_chunks_section = "No specific context snippets were retrieved. Please generate the story based on the topic alone."
     else:

@@ -3,8 +3,11 @@
 from dotenv import load_dotenv
 import os
 import sys
-from typing import List, Optional, Union
-from viralStoryGenerator.src.logger import logger as _logger
+from typing import List, Optional, Union, Tuple, Dict, Any
+import logging
+import torch
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -22,6 +25,9 @@ class config:
     VERSION: str = os.environ.get("APP_VERSION", "0.1.2")
     APP_TITLE: str = os.environ.get("APP_TITLE", "Viral Story Generator API")
     APP_DESCRIPTION: str = os.environ.get("APP_DESCRIPTION", "API for generating viral stories from web content")
+
+    ENABLE_IMAGE_GENERATION: bool = os.environ.get("ENABLE_IMAGE_GENERATION", "True").lower() in ["true", "1", "yes"]
+    ENABLE_AUDIO_GENERATION: bool = os.environ.get("ENABLE_AUDIO_GENERATION", "True").lower() in ["true", "1", "yes"]
 
     class elevenLabs:
         API_KEY: Optional[str] = os.environ.get("ELEVENLABS_API_KEY")
@@ -43,6 +49,7 @@ class config:
         MAX_TOKENS: int = int(os.environ.get("LLM_MAX_TOKENS", 32768)) # 4096 is the default for GPT-3.5-turbo
         CLEANING_MAX_PROMPT_CHARS: int = int(os.environ.get("LLM_CLEANING_MAX_PROMPT_CHARS", 20000))
         CLEANING_MAX_OUTPUT_TOKENS: int = int(os.environ.get("LLM_CLEANING_MAX_OUTPUT_TOKENS", 32768))
+        MIN_MARKDOWN_LENGTH_FOR_LLM_CLEANING: int = int(os.environ.get("LLM_MIN_CLEANING_LENGTH", 200))
 
     class openAI:
         API_KEY: Optional[str] = os.environ.get("OPENAI_API_KEY") # Used for DALL-E
@@ -101,6 +108,7 @@ class config:
         STORY_STORAGE_PATH: str = os.path.abspath(os.environ.get("STORY_STORAGE_PATH", os.path.join(LOCAL_STORAGE_PATH, "stories")))
         STORYBOARD_STORAGE_PATH: str = os.path.abspath(os.environ.get("STORYBOARD_STORAGE_PATH", os.path.join(LOCAL_STORAGE_PATH, "storyboards")))
         METADATA_STORAGE_PATH: str = os.path.abspath(os.environ.get("METADATA_STORAGE_PATH", os.path.join(LOCAL_STORAGE_PATH, "metadata")))
+        SCREENSHOT_STORAGE_PATH: str = os.path.abspath(os.environ.get("SCREENSHOT_STORAGE_PATH", os.path.join(LOCAL_STORAGE_PATH, "screenshots")))
 
         # File retention policy (in days, 0 or negative = keep forever)
         FILE_RETENTION_DAYS: int = int(os.environ.get("FILE_RETENTION_DAYS", 30))
@@ -178,9 +186,75 @@ class config:
         RELEVANT_CHUNKS_COUNT: int = int(os.environ.get("RAG_RELEVANT_CHUNKS_COUNT", 5))
         CHUNK_SIZE: int = int(os.environ.get("RAG_CHUNK_SIZE", 500)) # Chunks for RAG can often be smaller
         CHUNK_OVERLAP: int = int(os.environ.get("RAG_CHUNK_OVERLAP", 50))
+        DEVICE: str = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     class storyboard:
         WORD_PER_MINUTE_RATE: int = int(os.environ.get("STORYBOARD_WPM", 150))
+        ENABLE_STORYBOARD_GENERATION: bool = os.environ.get("ENABLE_STORYBOARD_GENERATION", "True").lower() in ["true", "1", "yes"]
+
+    class scraper:
+        # Content extraction
+        BM25_THRESHOLD: float = float(os.environ.get("SCRAPER_BM25_THRESHOLD", 1.2))
+        PRUNING_THRESHOLD: float = float(os.environ.get("SCRAPER_PRUNING_THRESHOLD", 0.48))
+        PRUNING_THRESHOLD_TYPE: str = os.environ.get("SCRAPER_PRUNING_THRESHOLD_TYPE", "fixed") # "fixed" or "percentile"
+        MD_IGNORE_LINKS: bool = os.environ.get("SCRAPER_MD_IGNORE_LINKS", "True").lower() in ["true", "1", "yes"]
+        CHECK_ROBOTS_TXT: bool = os.environ.get("SCRAPER_CHECK_ROBOTS_TXT", "True").lower() in ["true", "1", "yes"]
+        ARUN_MANY_TIMEOUT: float = float(os.environ.get("SCRAPER_ARUN_MANY_TIMEOUT", 60.0))
+
+        # Rate Limiter for Dispatchers
+        _rl_base_delay_str = os.environ.get("SCRAPER_RL_BASE_DELAY", "1.0,3.0")
+        try:
+            RL_BASE_DELAY: Tuple[float, float] = tuple(map(float, _rl_base_delay_str.split(','))) # type: ignore
+            if len(RL_BASE_DELAY) != 2:
+                RL_BASE_DELAY = (1.0, 3.0)
+                _logger.warning(f"SCRAPER_RL_BASE_DELAY format error. Defaulting to {RL_BASE_DELAY}. Expected 'min,max'.")
+        except ValueError:
+            RL_BASE_DELAY = (1.0, 3.0)
+            _logger.warning(f"SCRAPER_RL_BASE_DELAY value error. Defaulting to {RL_BASE_DELAY}. Expected numeric values.")
+
+        RL_MAX_DELAY: float = float(os.environ.get("SCRAPER_RL_MAX_DELAY", 60.0))
+        RL_MAX_RETRIES: int = int(os.environ.get("SCRAPER_RL_MAX_RETRIES", 3))
+        _rl_codes_str = os.environ.get("SCRAPER_RL_CODES", "429,503")
+        RL_CODES: List[int] = [int(code.strip()) for code in _rl_codes_str.split(',') if code.strip().isdigit()]
+
+        # Crawler Monitor for Dispatchers
+        MONITOR_ENABLED: bool = os.environ.get("SCRAPER_MONITOR_ENABLED", "False").lower() in ["true", "1", "yes"]
+        MONITOR_MAX_ROWS: int = int(os.environ.get("SCRAPER_MONITOR_MAX_ROWS", 10))
+        MONITOR_DISPLAY_MODE: str = os.environ.get("SCRAPER_MONITOR_DISPLAY_MODE", "AGGREGATED") # DETAILED or AGGREGATED
+
+        # Semaphore Dispatcher
+        DISP_SEMA_MAX_PERMIT: int = int(os.environ.get("SCRAPER_DISP_SEMA_MAX_PERMIT", 10))
+
+        # MemoryAdaptive Dispatcher
+        DISP_MEM_THRESHOLD: float = float(os.environ.get("SCRAPER_DISP_MEM_THRESHOLD", 85.0))
+        DISP_MEM_INTERVAL: float = float(os.environ.get("SCRAPER_DISP_MEM_INTERVAL", 1.0))
+        DISP_MEM_MAX_PERMIT: int = int(os.environ.get("SCRAPER_DISP_MEM_MAX_PERMIT", 5))
+        DISP_MEM_WAIT_TIMEOUT: float = float(os.environ.get("SCRAPER_DISP_MEM_WAIT_TIMEOUT", 300.0))
+
+        # Scraper Worker Specific (distinct from general Redis worker settings)
+        WORKER_MAX_CONCURRENT_JOBS: int = int(os.environ.get("SCRAPER_WORKER_MAX_CONCURRENT_JOBS", 2))
+        WORKER_SHUTDOWN_TIMEOUT: int = int(os.environ.get("SCRAPER_WORKER_SHUTDOWN_TIMEOUT", 30))
+
+    @staticmethod
+    def set_storyboard_generation(enabled: bool):
+        """Dynamically update the storyboard generation setting."""
+        config.storyboard.ENABLE_STORYBOARD_GENERATION = enabled
+        _logger.info(f"Storyboard generation set to {'enabled' if enabled else 'disabled'}.")
+
+    @classmethod
+    def set_storyboard_generation(cls, enabled: bool):
+        """Dynamically update storyboard generation setting."""
+        cls.storyboard.ENABLE_STORYBOARD_GENERATION = enabled
+
+    @classmethod
+    def set_image_generation(cls, enabled: bool):
+        """Dynamically update image generation setting."""
+        cls.openAI.ENABLED = enabled
+
+    @classmethod
+    def set_audio_generation(cls, enabled: bool):
+        """Dynamically update audio generation setting."""
+        cls.elevenLabs.ENABLED = enabled
 
 
 # --- Configuration Validation ---

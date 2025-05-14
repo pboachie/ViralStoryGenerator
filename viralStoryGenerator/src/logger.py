@@ -58,8 +58,17 @@ class ColorFormatter(logging.Formatter):
         if hasattr(record, 'environment'):
             env = record.environment.lower()
             if self.use_colors:
-                color = self.COLORS.get(env, self.COLORS['default_env'])
-                record.msg = f"{color}[{env.upper()}]{self.COLORS['RESET']} {message}"
+                color_code = self.COLORS.get(env, self.COLORS['default_env'])
+                formatted_message = f"{color_code}[{env.upper()}]{self.COLORS['RESET']} {message}"
+            else:
+                formatted_message = f"[{env.upper()}] {message}"
+        else:
+            formatted_message = message
+
+        original_msg = record.msg
+        if formatted_message is not message:
+            record.msg = formatted_message
+
 
         # Add color to the levelname if supported
         if self.use_colors:
@@ -71,84 +80,72 @@ class ColorFormatter(logging.Formatter):
 
         # Restore original values
         record.levelname = levelname
-        record.msg = message
+        record.msg = original_msg
 
         return result
 
-# Create a custom logger adapter to handle environment logging
-class EnvironmentLoggerAdapter(logging.LoggerAdapter):
-    def __init__(self, logger, environment=None):
-        super().__init__(logger, extra={})
-        self.environment = environment or os.environ.get("ENVIRONMENT", "development").lower()
+class EnvironmentFilter(logging.Filter):
+    def __init__(self, default_environment=None):
+        super().__init__()
+        self.default_environment = default_environment or os.environ.get("ENVIRONMENT", "development").lower()
 
-    def process(self, msg, kwargs):
-        kwargs.setdefault('extra', {})
-        kwargs['extra']['environment'] = self.environment
-        return msg, kwargs
+    def filter(self, record):
+        if not hasattr(record, 'environment'):
+            record.environment = self.default_environment
+        return True
 
-# Create a logger
-logger_base = logging.getLogger(__name__)
-log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+base_app_logger = logging.getLogger("viralStoryGenerator")
 
-# Set logging level based on environment variable
-if log_level == "DEBUG":
-    logger_base.setLevel(logging.DEBUG)
-elif log_level == "INFO":
-    logger_base.setLevel(logging.INFO)
-elif log_level == "WARNING":
-    logger_base.setLevel(logging.WARNING)
-elif log_level == "ERROR":
-    logger_base.setLevel(logging.ERROR)
-elif log_level == "CRITICAL":
-    logger_base.setLevel(logging.CRITICAL)
+log_level_str = os.environ.get("LOG_LEVEL", "INFO").upper()
+numeric_log_level = getattr(logging, log_level_str, logging.INFO)
+base_app_logger.setLevel(numeric_log_level)
+
+if not base_app_logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.DEBUG)
+
+    plain_formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d - %(funcName)s()] - %(message)s')
+    color_formatter_instance = ColorFormatter('%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d - %(funcName)s()] - %(message)s', use_colors=None)
+
+    use_colors_env = os.environ.get("USE_COLOR_LOGS", "auto").lower()
+    if use_colors_env == "auto":
+        ch.setFormatter(color_formatter_instance)
+    elif use_colors_env in ("yes", "true", "1"):
+        ch.setFormatter(ColorFormatter('%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d - %(funcName)s()] - %(message)s', use_colors=True))
+    else:
+        ch.setFormatter(plain_formatter)
+
+    base_app_logger.addHandler(ch)
+
+    # Create a file handler for production environment
+    if os.environ.get("ENVIRONMENT") == "production":
+        fh = logging.FileHandler('app.log')
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(plain_formatter)
+        base_app_logger.addHandler(fh)
+
+    env_filter = EnvironmentFilter()
+    base_app_logger.addFilter(env_filter)
+
+    base_app_logger.propagate = False
+    _module_logger_internal = logging.getLogger(__name__)
+    _module_logger_internal.debug(f"Logger '{base_app_logger.name}' configured by {__name__}.")
 else:
-    logger_base.setLevel(logging.DEBUG)  # Default to DEBUG if LOG_LEVEL is not recognized
+    _module_logger_internal = logging.getLogger(__name__)
+    _module_logger_internal.debug(f"Logger '{base_app_logger.name}' already has handlers. Skipping reconfiguration by {__name__}.")
 
-# Create a console handler
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
 
-# Create formatters
-# Plain formatter for environments that don't support colors
-plain_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# Color formatter for terminals that support it
-color_formatter = ColorFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-# Determine which formatter to use
-use_colors = os.environ.get("USE_COLOR_LOGS", "auto").lower()
-if use_colors == "auto":
-    ch.setFormatter(color_formatter)
-elif use_colors in ("yes", "true", "1"):
-    # Force color even if terminal doesn't seem to support it
-    ch.setFormatter(ColorFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', use_colors=True))
-else:
-    # Explicitly disable colors
-    ch.setFormatter(plain_formatter)
-
-# Add console handler to logger
-logger_base.addHandler(ch)
-
-# Create a file handler for production environment
-if os.environ.get("ENVIRONMENT") == "production":
-    fh = logging.FileHandler('app.log')
-    fh.setLevel(logging.INFO)
-    # Always use plain formatting in log files
-    fh.setFormatter(plain_formatter)
-    logger_base.addHandler(fh)
-
-# Prevent duplicate logs by disabling propagation to the root logger
-logger_base.propagate = False
-
-# Create an environment-aware logger
-logger = EnvironmentLoggerAdapter(logger_base)
+_module_logger = logging.getLogger(__name__)
 
 def log_startup(environment: str = None, version: str = None, storage_provider: str = None):
     """Log application startup information with environment highlighting"""
-    env = environment or os.environ.get("ENVIRONMENT", "development").lower()
+    env_to_log = environment or os.environ.get("ENVIRONMENT", "development").lower()
     ver = version or os.environ.get("APP_VERSION", "0.1.2")
     storage = storage_provider or os.environ.get("STORAGE_PROVIDER", "local")
 
-    logger.debug("Startup event triggered.", extra={'environment': env})
-    logger.info(f"Starting Viral Story Generator API v{ver}", extra={'environment': env})
-    logger.info(f"Environment: {env}", extra={'environment': env})
-    logger.info(f"Storage provider: {storage}", extra={'environment': env})
+    _module_logger.debug("Startup event triggered.", extra={'environment': env_to_log})
+    _module_logger.info(f"Starting Viral Story Generator API v{ver}", extra={'environment': env_to_log})
+    _module_logger.info(f"Environment for startup: {env_to_log}", extra={'environment': env_to_log}) # Message clarifies if different from default
+    _module_logger.info(f"Storage provider: {storage}", extra={'environment': env_to_log})
+
+# Other modules should use 'import logging; _logger = logging.getLogger(__name__)'

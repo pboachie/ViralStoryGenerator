@@ -13,10 +13,13 @@ import asyncio
 
 # Use dependencies from the application context
 from viralStoryGenerator.utils.config import config as app_config
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.models import ServiceStatusDetail
 
-#TODO:  Store the application start time (consider moving to a central app state if needed)
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
+
+#todo:  Store the application start time (consider moving to a central app state if needed)
 APP_START_TIME = time.time()
 APP_USER_AGENT = f"{app_config.APP_TITLE}/{app_config.VERSION}"
 

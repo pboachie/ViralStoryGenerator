@@ -12,12 +12,15 @@ from typing import Dict, Any, Optional, List
 
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
 from viralStoryGenerator.prompts.prompts import get_storyboard_prompt
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.utils.config import config as appconfig
 from viralStoryGenerator.utils.security import is_safe_filename
 from viralStoryGenerator.models.models import STORYBOARD_RESPONSE_FORMAT
-from viralStoryGenerator.src.llm import THINK_PATTERN
+from viralStoryGenerator.src.llm import _extract_chain_of_thought
 from viralStoryGenerator.utils.storage_manager import storage_manager
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 APP_USER_AGENT = f"{appconfig.APP_TITLE}/{appconfig.VERSION}"
 
@@ -102,7 +105,9 @@ def generate_storyboard_structure(story: str, llm_endpoint: str, temperature: fl
 
         raw_content = response_data["choices"][0]["message"]["content"]
 
-        cleaned_content = re.sub(THINK_PATTERN, "", raw_content).strip()
+        cleaned_content, thinking = _extract_chain_of_thought(raw_content)
+        _logger.debug(f"Extracted thinking block: {thinking[:100]}...")
+
         json_match = re.search(r'\{.*\}', cleaned_content, re.DOTALL)
         if json_match:
             cleaned_content = json_match.group(0)
@@ -244,6 +249,11 @@ def generate_storyboard(story: str, topic: str, task_id: str, llm_endpoint: str,
     Returns:
         The complete storyboard data dictionary if successful, None otherwise.
     """
+
+    if not appconfig.storyboard.ENABLE_STORYBOARD_GENERATION:
+        _logger.info(f"Storyboard generation is disabled for task: '{task_id}'. Skipping storyboard generation.")
+        return None
+
     _logger.info(f"Starting storyboard generation for task: '{task_id}' (Topic: '{topic}') using marker-based splitting.")
 
     storyboard_data = generate_storyboard_structure(story, llm_endpoint, temperature)
@@ -275,6 +285,14 @@ def generate_storyboard(story: str, topic: str, task_id: str, llm_endpoint: str,
     elevenlabs_api_key = appconfig.elevenLabs.API_KEY
     image_generation_enabled = appconfig.openAI.ENABLED
     audio_generation_enabled = appconfig.elevenLabs.ENABLED
+
+    if not appconfig.ENABLE_IMAGE_GENERATION:
+        _logger.info("Image generation is disabled. Skipping image generation for storyboard.")
+        image_generation_enabled = False
+
+    if not appconfig.ENABLE_AUDIO_GENERATION:
+        _logger.info("Audio generation is disabled. Skipping audio generation for storyboard.")
+        audio_generation_enabled = False
 
     cumulative_time = 0.0
     combined_narration_texts = []

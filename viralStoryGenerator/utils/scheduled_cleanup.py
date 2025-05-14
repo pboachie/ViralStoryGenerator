@@ -4,14 +4,16 @@
 import time
 from typing import Any, Dict, Optional
 import schedule
-import threading # Still used if running schedule in background thread
+import threading
 import os
-from datetime import datetime, timezone # Use timezone
+from datetime import datetime, timezone
 
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.utils.config import config as appconfig
-# Import storage manager instance directly
 from viralStoryGenerator.utils.storage_manager import storage_manager
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 class ScheduledCleanupTask:
     """Runs storage_manager.cleanup_old_files periodically."""

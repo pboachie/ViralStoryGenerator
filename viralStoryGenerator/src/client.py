@@ -12,7 +12,10 @@ import asyncio
 
 from viralStoryGenerator.utils.redis_manager import RedisMessageBroker
 from viralStoryGenerator.utils.config import config as app_config
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 # Redis message broker for communication
 def get_api_message_broker() -> RedisMessageBroker:

@@ -9,8 +9,11 @@ import uuid
 import tempfile
 from typing import Dict, Any, Optional, Union
 
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.utils.config import config as appconfig
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 DEFAULT_VOICE_ID = appconfig.elevenLabs.VOICE_ID or "JZ3e95uoTACVf6tXaaEi"
 DEFAULT_MODEL_ID = "eleven_multilingual_v2"

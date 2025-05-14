@@ -6,9 +6,12 @@ import datetime
 import json
 
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.utils.config import config
 from viralStoryGenerator.utils.storage_manager import storage_manager
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 # Directory where failed audio generations are queued
 AUDIO_QUEUE_DIR = os.environ.get("AUDIO_QUEUE_DIR", "Output/AudioQueue")
