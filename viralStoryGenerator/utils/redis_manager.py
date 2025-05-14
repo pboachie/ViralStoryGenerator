@@ -1,414 +1,449 @@
-#!/usr/bin/env python
 # viralStoryGenerator/utils/redis_manager.py
+"""Redis message broker for job processing and status tracking using Redis Streams."""
 
 import json
 import time
 import redis
-from typing import Dict, Any, Optional, List
+from redis.exceptions import ConnectionError, TimeoutError, RedisError
+from typing import Dict, Any, Optional, List, Union
 import uuid
 
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.utils.config import config as app_config
 
-class RedisManager:
-    """Redis manager for handling task queuing and state management"""
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
-    def __init__(self, host=None, port=None, db=None, password=None, queue_name=None, result_prefix=None, ttl=None):
-        """Initialize Redis connection"""
-        # Default to values from config if parameters aren't provided
-        self.host = host or app_config.redis.HOST
-        self.port = port or app_config.redis.PORT
-        self.db = db or app_config.redis.DB
-        self.password = password or app_config.redis.PASSWORD
-        self.queue_name = queue_name or app_config.redis.QUEUE_NAME
-        self.result_prefix = result_prefix or app_config.redis.RESULT_PREFIX
-        self.ttl = ttl or app_config.redis.TTL
+class RedisMessageBroker:
+    """A Redis-based message broker using Redis Streams."""
 
-        if not app_config.redis.ENABLED:
-            _logger.warning("Redis is disabled in config. Task queuing will not work properly.")
-            self.client = None
-            return
-
-        try:
-            self.client = redis.Redis(
-                host=self.host,
-                port=self.port,
-                db=self.db,
-                password=self.password,
-                decode_responses=True
-            )
-            self.client.ping()  # Test connection
-            _logger.info(f"Connected to Redis at {self.host}:{self.port}")
-
-        except redis.exceptions.ConnectionError as e:
-            _logger.error(f"Failed to connect to Redis: {str(e)}")
-            self.client = None
-
-    def is_available(self) -> bool:
-        """Check if Redis is available"""
-        if not self.client:
-            return False
-        try:
-            self.client.ping()
-            return True
-        except:
-            return False
-
-    def enqueue_task(self, task_data: Dict[str, Any]) -> bool:
+    def __init__(self, redis_url: str, stream_name: str):
         """
-        Enqueue a task for processing
+        Initialize a Redis message broker using Redis Streams.
 
         Args:
-            task_data: Dictionary with task data
-
-        Returns:
-            bool: Success status
+            redis_url: Redis connection URL (redis://host:port/db)
+            stream_name: Name of the Redis Stream to use
         """
-        if not self.client:
-            return False
+        self.redis = redis.StrictRedis.from_url(redis_url)
+        self.stream_name = stream_name
 
+    def publish_message(self, message: Dict[str, Any]) -> str:
+        """
+        Publish a message to the Redis stream. Serializes complex types and None correctly.
+        """
+        _logger.debug(f"RedisMessageBroker: Attempting to publish to stream '{self.stream_name}'. Initial message keys: {list(message.keys())}")
+        safe_message = {}
+        for k, v in message.items():
+            if v is None:
+                safe_message[k] = json.dumps(None)
+            elif isinstance(v, bool):
+                safe_message[k] = str(v)
+            elif isinstance(v, (dict, list)):
+                try:
+                    safe_message[k] = json.dumps(v)
+                except TypeError:
+                    _logger.warning(f"Could not JSON serialize field '{k}' for stream '{self.stream_name}'. Storing as string representation.")
+                    safe_message[k] = str(v)
+            elif not isinstance(v, (str, int, float, bytes)):
+                _logger.debug(f"Converting non-basic type {type(v)} to string for field '{k}' in stream '{self.stream_name}'.")
+                safe_message[k] = str(v)
+            else:
+                safe_message[k] = v
+
+        _logger.debug(f"RedisMessageBroker: Prepared safe_message for stream '{self.stream_name}'. Keys: {list(safe_message.keys())}")
         try:
-            task_id = task_data.get("task_id")
-            if not task_id:
-                task_id = str(uuid.uuid4())
-                task_data["task_id"] = task_id
-
-            # Store initial task status
-            self.update_task_status(task_id, "pending")
-
-            # Add to processing queue
-            self.client.lpush(self.queue_name, json.dumps(task_data))
-            _logger.debug(f"Task {task_id} added to queue")
-            return True
+            _logger.debug(f"RedisMessageBroker: Executing redis.xadd for stream '{self.stream_name}'...")
+            message_id = self.redis.xadd(self.stream_name, safe_message)
+            _logger.debug(f"RedisMessageBroker: Successfully published message to stream '{self.stream_name}'. Message ID: {message_id}")
+            return message_id
+        except ConnectionError as ce:
+            _logger.error(f"RedisMessageBroker: ConnectionError publishing to stream {self.stream_name}: {ce}")
+            raise
+        except TimeoutError as te:
+            _logger.error(f"RedisMessageBroker: TimeoutError publishing to stream {self.stream_name}: {te}")
+            raise # Re-raise
+        except RedisError as re:
+            _logger.error(f"RedisMessageBroker: RedisError publishing to stream {self.stream_name}: {re}")
+            raise # Re-raise
         except Exception as e:
-            _logger.error(f"Failed to enqueue task: {str(e)}")
-            return False
+            _logger.error(f"RedisMessageBroker: Unexpected error publishing message to stream {self.stream_name}: {e}")
+            raise
 
-    def dequeue_task(self) -> Optional[Dict[str, Any]]:
+    def create_consumer_group(self, group_name: str) -> None:
         """
-        Dequeue a task for processing
+        Create a consumer group for the Redis stream.
+
+        Args:
+            group_name: Name of the consumer group
+        """
+        try:
+            self.redis.xgroup_create(self.stream_name, group_name, id='0', mkstream=True)
+        except redis.exceptions.ResponseError as e:
+            if "BUSYGROUP" in str(e):
+                pass  # Group already exists
+            else:
+                raise
+
+    def consume_messages(self, group_name: str, consumer_name: str, count: int = 1, block: int = 5000) -> List[Dict[str, Any]]:
+        """
+        Consume messages from the Redis stream.
+
+        Args:
+            group_name: Name of the consumer group
+            consumer_name: Name of the consumer
+            count: Maximum number of messages to retrieve
+            block: Time to block waiting for messages in milliseconds
 
         Returns:
-            Dict or None: Task data if available
+            List of messages
         """
-        if not self.client:
-            return None
-
         try:
-            # Pop task with blocking wait for specified timeout
-            result = self.client.brpop(self.queue_name, timeout=1)
+            messages = self.redis.xreadgroup(group_name, consumer_name, {self.stream_name: '>'}, count=count, block=block)
+            return messages
+        except redis.exceptions.ResponseError as e:
+            if "NOGROUP" in str(e):
+                _logger.warning(f"NOGROUP error for stream '{self.stream_name}' or group '{group_name}'. Attempting to recreate...")
+                try:
+                    self.ensure_stream_exists(self.stream_name)
+                    self.create_consumer_group(group_name)
+                    _logger.info(f"Successfully ensured stream '{self.stream_name}' and group '{group_name}' exist. Retrying consume.")
+                    messages = self.redis.xreadgroup(group_name, consumer_name, {self.stream_name: '>'}, count=count, block=block)
+                    return messages
+                except Exception as creation_e:
+                    _logger.error(f"Failed to recreate stream/group or retry consume after NOGROUP error: {creation_e}")
+                    raise e
+            else:
+                raise e
+        except Exception as e:
+             _logger.error(f"Unexpected error consuming messages from group {group_name}: {e}")
+             raise e
+
+    def acknowledge_message(self, group_name: str, message_id: str) -> None:
+        """
+        Acknowledge a message in the Redis stream.
+
+        Args:
+            group_name: Name of the consumer group
+            message_id: ID of the message to acknowledge
+        """
+        self.redis.xack(self.stream_name, group_name, message_id)
+
+    def pending_messages(self, group_name: str) -> List[Dict[str, Any]]:
+        """
+        Get pending messages for a consumer group.
+
+        Args:
+            group_name: Name of the consumer group
+
+        Returns:
+            List of pending messages
+        """
+        return self.redis.xpending(self.stream_name, group_name)
+
+    def track_job_progress(self, job_id: str, status: str, details: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Track the progress of a job by updating its status in the stream.
+
+        Args:
+            job_id: ID of the job
+            status: Status of the job (e.g., "pending", "processing", "completed", "failed")
+            details: Additional details about the job status
+        """
+        try:
+            message = {"job_id": job_id, "status": status, "timestamp": str(time.time())}
+
+            if details:
+                for key, value in details.items():
+                    try:
+                        if value is None:
+                            message[key] = json.dumps(None)
+                        elif isinstance(value, (dict, list)):
+                            message[key] = json.dumps(value)
+                        else:
+                            if not isinstance(value, (str, int, float, bytes)):
+                                _logger.warning(f"Storing non-standard type for field '{key}' ({type(value)}) as string for job {job_id}.")
+                                message[key] = str(value)
+                            else:
+                                message[key] = value
+                    except Exception as e:
+                        _logger.warning(f"Could not serialize job detail {key}: {e}")
+                        message[key] = str(value) if value is not None else ""
+
+            result = self.publish_message(message)
             if not result:
-                return None
-
-            _, task_data_str = result
-            task_data = json.loads(task_data_str)
-            return task_data
+                _logger.error(f"Failed to publish status update for job {job_id}")
         except Exception as e:
-            _logger.error(f"Failed to dequeue task: {str(e)}")
-            return None
-
-    def update_task_status(self, task_id: str, status: str) -> bool:
-        """
-        Update the status of a task
-
-        Args:
-            task_id: Task identifier
-            status: New status value
-
-        Returns:
-            bool: Success status
-        """
-        if not self.client:
-            return False
-
-        try:
-            status_key = f"{self.result_prefix}{task_id}"
-            # Get existing data if any
-            existing_data = self.client.get(status_key)
-            if existing_data:
-                data = json.loads(existing_data)
-                data["status"] = status
-                data["updated_at"] = time.time()
-            else:
-                data = {
-                    "task_id": task_id,
-                    "status": status,
-                    "created_at": time.time(),
-                    "updated_at": time.time()
+            _logger.error(f"Error tracking job progress for {job_id}: {e}")
+            try:
+                minimal_message = {
+                    "job_id": str(job_id),
+                    "status": str(status),
+                    "timestamp": str(time.time()),
+                    "error": "Failed to publish complete status update"
                 }
+                self.publish_message(minimal_message)
+            except Exception as inner_e:
+                _logger.error(f"Critical failure publishing minimal status for job {job_id}: {inner_e}")
 
-            # Save back to Redis
-            self.client.setex(status_key, self.ttl, json.dumps(data))
-            return True
-        except Exception as e:
-            _logger.error(f"Failed to update task status: {str(e)}")
-            return False
-
-    def update_task_result(self, task_id: str, result_data: Dict[str, Any]) -> bool:
+    def get_job_status(self, job_id: str, limit: int = 100) -> Optional[Dict[str, Any]]:
         """
-        Update task with result data
+        Retrieve the latest status of a job from the stream. Deserializes complex types and None correctly.
+        """
+        try:
+            messages = self.redis.xrevrange(self.stream_name, count=limit)
+            for message_id, message_data in messages:
+                msg_job_id = message_data.get(b"job_id") or message_data.get("job_id")
+                if isinstance(msg_job_id, bytes):
+                    msg_job_id = msg_job_id.decode()
+
+                if msg_job_id == job_id:
+                    result = {}
+                    for key, value in message_data.items():
+                        key_str = key.decode() if isinstance(key, bytes) else key
+                        value_str = value.decode() if isinstance(value, bytes) else value
+
+                        if value_str == 'null':
+                            result[key_str] = None
+                        elif isinstance(value_str, str) and (value_str.startswith('{') or value_str.startswith('[')):
+                            try:
+                                result[key_str] = json.loads(value_str)
+                            except json.JSONDecodeError:
+                                _logger.debug(f"Could not JSON decode field '{key_str}' for job {job_id}. Keeping as string.")
+                                result[key_str] = value_str
+                        else:
+                            result[key_str] = value_str
+
+                    result["message_id"] = message_id.decode() if isinstance(message_id, bytes) else message_id
+                    return result
+        except Exception as e:
+            _logger.error(f"Error retrieving job status for {job_id}: {e}")
+        return None
+
+    def get_job_history(self, job_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Retrieve the full history of a job from the stream.
 
         Args:
-            task_id: Task identifier
-            result_data: Result data to store
+            job_id: ID of the job
+            limit: Maximum number of messages to check
 
         Returns:
-            bool: Success status
+            List of job status updates in chronological order
         """
-        if not self.client:
-            return False
-
         try:
-            status_key = f"{self.result_prefix}{task_id}"
-            # Ensure status is completed
-            result_data["status"] = "completed"
-            result_data["updated_at"] = time.time()
+            all_messages = self.redis.xrange(self.stream_name, count=limit)
+            job_messages = []
 
-            # Save to Redis
-            self.client.setex(status_key, self.ttl, json.dumps(result_data))
-            return True
+            for message_id, message_data in all_messages:
+                msg_job_id = message_data.get(b"job_id") or message_data.get("job_id")
+                if isinstance(msg_job_id, bytes):
+                    msg_job_id = msg_job_id.decode()
+
+                if msg_job_id == job_id:
+                    # Convert bytes to strings in the result
+                    result = {}
+                    for key, value in message_data.items():
+                        key_str = key.decode() if isinstance(key, bytes) else key
+                        value_str = value.decode() if isinstance(value, bytes) else value
+
+                        # Try to parse JSON fields
+                        if isinstance(value_str, str) and (value_str.startswith('{') or value_str.startswith('[')):
+                            try:
+                                result[key_str] = json.loads(value_str)
+                            except:
+                                result[key_str] = value_str
+                        else:
+                            result[key_str] = value_str
+
+                    # Add the message ID and timestamp
+                    result["message_id"] = message_id.decode() if isinstance(message_id, bytes) else message_id
+                    result["timestamp"] = float(result.get("timestamp", 0))
+                    job_messages.append(result)
+
+            # Sort by timestamp
+            job_messages.sort(key=lambda x: x.get("timestamp", 0))
+            return job_messages
+
         except Exception as e:
-            _logger.error(f"Failed to update task result: {str(e)}")
-            return False
+            _logger.error(f"Error retrieving job history for {job_id}: {e}")
+        return []
 
-    def update_task_error(self, task_id: str, error_message: str) -> bool:
+    def get_queue_status(self) -> Dict[str, Any]:
         """
-        Update task with error information
-
-        Args:
-            task_id: Task identifier
-            error_message: Error message
+        Get the current status of the stream.
 
         Returns:
-            bool: Success status
+            Dictionary containing stream status information
         """
-        if not self.client:
-            return False
-
         try:
-            status_key = f"{self.result_prefix}{task_id}"
-            # Get existing data if any
-            existing_data = self.client.get(status_key)
-            if existing_data:
-                data = json.loads(existing_data)
-                data["status"] = "failed"
-                data["error"] = error_message
-                data["updated_at"] = time.time()
-            else:
-                data = {
-                    "task_id": task_id,
-                    "status": "failed",
-                    "error": error_message,
-                    "created_at": time.time(),
-                    "updated_at": time.time()
-                }
+            # Get stream information
+            stream_info = self.redis.xinfo_stream(self.stream_name)
 
-            # Save back to Redis
-            self.client.setex(status_key, self.ttl, json.dumps(data))
-            return True
-        except Exception as e:
-            _logger.error(f"Failed to update task error: {str(e)}")
-            return False
+            # Convert bytes to strings
+            info = {k.decode() if isinstance(k, bytes) else k:
+                   v.decode() if isinstance(v, bytes) else v
+                   for k, v in stream_info.items()}
 
-    def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get the current status of a task
+            # Get recent messages for analysis
+            messages = self.redis.xrevrange(self.stream_name, count=100)
+            recent_jobs = set()
+            job_statuses = {}
 
-        Args:
-            task_id: Task identifier
+            for _, message_data in messages:
+                job_id = message_data.get(b"job_id")
+                status = message_data.get(b"status")
 
-        Returns:
-            Dict or None: Task status information
-        """
-        if not self.client:
-            return None
+                if job_id and status:
+                    job_id = job_id.decode() if isinstance(job_id, bytes) else job_id
+                    status = status.decode() if isinstance(status, bytes) else status
 
-        try:
-            status_key = f"{self.result_prefix}{task_id}"
-            result = self.client.get(status_key)
-            if result:
-                return json.loads(result)
-            return None
-        except Exception as e:
-            _logger.error(f"Failed to get task status: {str(e)}")
-            return None
+                    recent_jobs.add(job_id)
+                    job_statuses[job_id] = status
 
-    def get_queue_length(self) -> int:
-        """
-        Get the current length of the task queue
+            # Count job statuses
+            status_counts = {}
+            for status in job_statuses.values():
+                status_counts[status] = status_counts.get(status, 0) + 1
 
-        Returns:
-            int: Number of tasks in queue
-        """
-        if not self.client:
-            return 0
-
-        try:
-            return self.client.llen(self.queue_name)
-        except Exception as e:
-            _logger.error(f"Failed to get queue length: {str(e)}")
-            return 0
-
-    def get_result(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve the result of a completed task.
-
-        Args:
-            task_id: Task identifier
-
-        Returns:
-            Dict or None: Task result information if available
-        """
-        if not self.client:
-            return None
-
-        try:
-            status_key = f"{self.result_prefix}{task_id}"
-            result = self.client.get(status_key)
-            if result:
-                return json.loads(result)
-            return None
-        except Exception as e:
-            _logger.error(f"Failed to get task result: {str(e)}")
-            return None
-
-    def check_key_exists(self, job_id: str) -> bool:
-        """
-        Check if any key exists for the given job ID.
-        Used to determine if a job exists but hasn't completed yet.
-
-        Args:
-            job_id: Job ID to check for existence
-
-        Returns:
-            bool: True if any key with this job ID exists, False otherwise
-        """
-        if not self.client:
-            return False
-
-        try:
-            # Create the specific result key pattern to check
-            key = f"{self.result_prefix}{job_id}"
-            return bool(self.client.exists(key))
-        except Exception as e:
-            _logger.error(f"Error checking key existence: {str(e)}")
-            return False
-
-    def add_request(self, request_data: Dict[str, Any]) -> bool:
-        """
-        Add a request to the queue
-
-        Args:
-            request_data: Dictionary with request data
-
-        Returns:
-            bool: Success status
-        """
-        if not self.client:
-            return False
-
-        try:
-            # Get job ID
-            job_id = request_data.get("id")
-            if not job_id:
-                job_id = str(uuid.uuid4())
-                request_data["id"] = job_id
-
-            # Add to queue
-            self.client.lpush(self.queue_name, json.dumps(request_data))
-
-            # Initialize status
-            status_key = f"{self.result_prefix}{job_id}"
-            self.client.setex(
-                status_key,
-                self.ttl,
-                json.dumps({
-                    "status": "pending",
-                    "message": "Job queued, waiting to start processing",
-                    "created_at": time.time()
-                })
-            )
-
-            return True
-        except Exception as e:
-            _logger.error(f"Failed to add request: {str(e)}")
-            return False
-
-    def store_result(self, job_id: str, result_data: Dict[str, Any]) -> bool:
-        """
-        Store result data for a job
-
-        Args:
-            job_id: Job ID
-            result_data: Result data to store
-
-        Returns:
-            bool: Success status
-        """
-        if not self.client:
-            return False
-
-        try:
-            # Create result key
-            status_key = f"{self.result_prefix}{job_id}"
-
-            # Add timestamp
-            if "created_at" not in result_data:
-                result_data["created_at"] = time.time()
-            result_data["updated_at"] = time.time()
-
-            # Store in Redis
-            self.client.setex(
-                status_key,
-                self.ttl,
-                json.dumps(result_data)
-            )
-
-            return True
-        except Exception as e:
-            _logger.error(f"Failed to store result: {str(e)}")
-            return False
-
-    def wait_for_result(self, job_id: str, timeout: int = 300, check_interval: float = 0.5) -> Optional[Dict[str, Any]]:
-        """
-        Wait for a job result with timeout.
-
-        Args:
-            job_id: The job ID to wait for
-            timeout: Maximum time to wait in seconds (default 300 seconds/5 minutes)
-            check_interval: How often to check for results in seconds (default 0.5 seconds)
-
-        Returns:
-            Dict or None: Result data if job completed successfully within timeout, None otherwise
-        """
-        if not self.client:
-            return None
-
-        try:
-            start_time = time.time()
-            status_key = f"{self.result_prefix}{job_id}"
-
-            while (time.time() - start_time) < timeout:
-                # Check if result exists
-                result_data = self.client.get(status_key)
-                if result_data:
-                    result = json.loads(result_data)
-                    status = result.get("status")
-
-                    # If job completed or failed, return the result
-                    if status in ["completed", "failed"]:
-                        return result
-
-                # Wait before checking again
-                time.sleep(check_interval)
-
-            # Timeout reached
-            _logger.warning(f"Timeout reached while waiting for job {job_id}")
             return {
-                "status": "failed",
-                "error": f"Timeout reached waiting for job result after {timeout} seconds",
-                "job_id": job_id
+                "stream_name": self.stream_name,
+                "length": info.get("length", 0),
+                "groups": info.get("groups", 0),
+                "last_generated_id": info.get("last-generated-id", "0-0"),
+                "recent_jobs_count": len(recent_jobs),
+                "status_counts": status_counts
             }
+
         except Exception as e:
-            _logger.error(f"Error waiting for job result: {str(e)}")
-            return None
+            _logger.error(f"Error getting queue status: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def clear_stalled_jobs(self, group_name: str, consumer_name: str = None, max_idle_time: int = 600000) -> Dict[str, int]:
+        """
+        Clear stalled jobs from the pending entries list.
+
+        Args:
+            group_name: Name of the consumer group
+            consumer_name: Optional consumer name to filter by
+            max_idle_time: Maximum idle time in milliseconds
+
+        Returns:
+            Dictionary with counts of cleared jobs
+        """
+        try:
+            # Get pending entries information
+            pending_info = self.redis.xpending_range(
+                self.stream_name,
+                group_name,
+                min='-',
+                max='+',
+                count=100,
+                consumername=consumer_name
+            )
+
+            claimed = 0
+            failed = 0
+
+            for entry in pending_info:
+                message_id = entry.get('message_id')
+                idle_time = entry.get('idle')
+
+                if idle_time > max_idle_time:
+                    try:
+                        # Claim the message and mark it as processed
+                        self.redis.xclaim(
+                            self.stream_name,
+                            group_name,
+                            "cleanup-worker",
+                            min_idle_time=idle_time,
+                            message_ids=[message_id]
+                        )
+
+                        # Acknowledge the message to remove from PEL
+                        self.redis.xack(self.stream_name, group_name, message_id)
+                        claimed += 1
+
+                        # Get the message data and publish a failure status
+                        messages = self.redis.xrange(self.stream_name, start=message_id, end=message_id)
+                        if messages:
+                            _, message_data = messages[0]
+                            job_id = message_data.get(b"job_id")
+
+                            if job_id:
+                                job_id = job_id.decode() if isinstance(job_id, bytes) else job_id
+                                self.track_job_progress(
+                                    job_id,
+                                    "failed",
+                                    {"error": f"Job stalled and cleared after {max_idle_time/1000} seconds"}
+                                )
+                                failed += 1
+
+                    except Exception as e:
+                        _logger.error(f"Error handling stalled message {message_id}: {e}")
+
+            return {"claimed": claimed, "failed": failed}
+
+        except Exception as e:
+            _logger.error(f"Error clearing stalled jobs: {e}")
+            return {"claimed": 0, "failed": 0, "error": str(e)}
+
+    def purge_stream(self) -> bool:
+        """
+        Purge the entire stream. This is a destructive operation.
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Delete the stream
+            self.redis.delete(self.stream_name)
+
+            # Recreate an empty stream
+            self.redis.xadd(self.stream_name, {"purged": "true"})
+
+            return True
+        except Exception as e:
+            _logger.error(f"Error purging stream {self.stream_name}: {e}")
+            return False
+
+    def ensure_stream_exists(self, stream_name: str) -> bool:
+        """
+        Ensure the Redis stream exists and is of the correct type.
+
+        Args:
+            stream_name: Name of the stream to ensure
+
+        Returns:
+            bool: True if stream exists or was created, False on error
+        """
+        try:
+            stream_type = self.redis.type(stream_name)
+
+            if stream_type != b'stream' and stream_type != 'stream':
+                self.redis.delete(stream_name)  # Delete the key if it exists with the wrong type
+                self.redis.xadd(stream_name, {"initialized": "true"})  # Initialize the stream
+                _logger.info(f"Created new stream: {stream_name}")
+            elif self.redis.xlen(stream_name) == 0:
+                # Only add initialization message if the stream is completely empty (no messages)
+                # This should happen very rarely
+                self.redis.xadd(stream_name, {"initialized": "true"})
+                _logger.info(f"Added initialization message to empty stream: {stream_name}")
+
+            # Check if a consumer group exists before creating one
+            try:
+                # Try to get info about consumer groups - will fail if none exist
+                self.redis.xinfo_groups(stream_name)
+            except redis.exceptions.ResponseError:
+                # No consumer groups exist, create default one
+                try:
+                    self.redis.xgroup_create(stream_name, "default-group", id="0", mkstream=True)
+                    _logger.info(f"Created default consumer group for stream: {stream_name}")
+                except redis.exceptions.ResponseError as e:
+                    if "BUSYGROUP" not in str(e):
+                        _logger.warning(f"Could not create consumer group: {e}")
+
+            return True
+        except Exception as e:
+            _logger.error(f"Failed to ensure stream {stream_name} exists: {e}")
+            return False

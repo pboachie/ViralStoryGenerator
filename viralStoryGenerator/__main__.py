@@ -1,7 +1,10 @@
 #!/usr/bin/env python
 import sys
 from viralStoryGenerator.main import main
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
+
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
     # Check for subcommands (api, worker, etc.)

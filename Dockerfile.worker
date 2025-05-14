@@ -1,22 +1,56 @@
-FROM python:3.10-slim
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
-
-# Install dependencies first for better caching
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
 
-# Install the package in development mode
-RUN pip install -e .
+# Install system dependencies for playwright and build tools
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        python3-dev \
+        libxml2-dev \
+        libxslt-dev \
+        curl \
+        wget \
+        gnupg \
+        # Playwright specific dependencies for Debian:
+        libnss3 \
+        libnspr4 \
+        libdbus-1-3 \
+        libatk1.0-0 \
+        libatk-bridge2.0-0 \
+        libcups2 \
+        libdrm2 \
+        libexpat1 \
+        libgbm1 \
+        libasound2 \
+        libatspi2.0-0 \
+        libx11-6 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxext6 \
+        libxfixes3 \
+        libxrandr2 \
+        libxkbcommon0 \
+        libpango-1.0-0 \
+        libcairo2 \
+        libgdk-pixbuf2.0-0 && \
+    pip install --no-cache-dir -e . && \
+    playwright install --with-deps && \
+    apt-get purge -y --auto-remove \
+        build-essential \
+        python3-dev \
+        libxml2-dev \
+        libxslt-dev \
+        curl \
+        wget \
+        gnupg && \
+    rm -rf /var/lib/apt/lists/*
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
-ENV REDIS_HOST=redis
-ENV REDIS_PORT=6379
-ENV REDIS_ENABLED=True
 
 # Command to run the worker
-CMD ["python", "-m", "viralStoryGenerator.bin.start_queue_worker"]
+CMD ["python3", "-m", "viralStoryGenerator.src.worker_runner", "worker", "--worker-type", "scrape"]

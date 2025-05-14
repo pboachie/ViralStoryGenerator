@@ -1,8 +1,11 @@
+# docker-compose.yml
+
 services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      # Remove in production
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
     restart: unless-stopped
@@ -21,51 +24,124 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     depends_on:
       redis:
         condition: service_healthy
     environment:
-      - REDIS_HOST=${REDIS_HOST}
-      - REDIS_PORT=${REDIS_PORT}
-      - REDIS_ENABLED=${REDIS_ENABLED}
-      - LOG_LEVEL=${LOG_LEVEL}
-      - ENVIRONMENT=${ENVIRONMENT}
-      - API_QUEUE_NAME=${API_QUEUE_NAME}
-      - API_RESULT_PREFIX=${API_RESULT_PREFIX}
-      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
-      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID}
+      # General
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - APP_VERSION=${APP_VERSION}
+      - APP_TITLE=${APP_TITLE}
+      - APP_DESCRIPTION=${APP_DESCRIPTION}
+      - BASE_URL=${BASE_URL}
+
+      # Redis
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_ENABLED=${REDIS_ENABLED:-True}
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - REDIS_QUEUE_NAME=${REDIS_QUEUE_NAME:-api_jobs}
+      - REDIS_RESULT_PREFIX=${REDIS_RESULT_PREFIX:-api_jobs_result:}
+      - REDIS_SCRAPE_QUEUE_NAME=${REDIS_SCRAPE_QUEUE_NAME:-scraper_jobs}
+      - REDIS_SCRAPE_RESULT_PREFIX=${REDIS_SCRAPE_RESULT_PREFIX:-scraper_jobs_result:}
+      - REDIS_RESULT_TTL=${REDIS_RESULT_TTL:-3600}
+
+      # LLM Configuration
       - LLM_ENDPOINT=${LLM_ENDPOINT}
       - LLM_MODEL=${LLM_MODEL}
-      - LLM_TEMPERATURE=${LLM_TEMPERATURE}
-      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS}
-      - STORAGE_PROVIDER=${STORAGE_PROVIDER}
-      - LOCAL_STORAGE_PATH=${LOCAL_STORAGE_PATH}
-      - AUDIO_STORAGE_PATH=${AUDIO_STORAGE_PATH}
-      - STORY_STORAGE_PATH=${STORY_STORAGE_PATH}
-      - STORYBOARD_STORAGE_PATH=${STORYBOARD_STORAGE_PATH}
-      - FILE_RETENTION_DAYS=${FILE_RETENTION_DAYS}
-      - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS}
-      - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED}
-      - RATE_LIMIT_REQUESTS=${RATE_LIMIT_REQUESTS}
-      - RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW}
-      - CORS_ORIGINS=${CORS_ORIGINS}
-      - API_KEY_ENABLED=${API_KEY_ENABLED}
+      - LLM_MODEL_MULTI=${LLM_MODEL_MULTI}
+      - LLM_MODEL_SMALL=${LLM_MODEL_SMALL}
+      - LLM_MODEL_LARGE=${LLM_MODEL_LARGE}
+      - LLM_CHUNK_SIZE=${LLM_CHUNK_SIZE:-5000}
+      - LLM_SHOW_THINKING=${LLM_SHOW_THINKING:-False}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.7}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-32768}
+      - LLM_CLEANING_MAX_PROMPT_CHARS=${LLM_CLEANING_MAX_PROMPT_CHARS:-500000}
+      - LLM_CLEANING_MAX_OUTPUT_TOKENS=${LLM_CLEANING_MAX_OUTPUT_TOKENS:-32768}
+      - LLM_MIN_CLEANING_LENGTH=${LLM_MIN_CLEANING_LENGTH:-200}
+
+      # ElevenLabs API Configuration
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID}
+      - ENABLE_AUDIO_GENERATION=${ENABLE_AUDIO_GENERATION:-False}
+      - ELEVENLABS_MODEL_ID=${ELEVENLABS_MODEL_ID:-eleven_multilingual_v2}
+      - ELEVENLABS_STABILITY=${ELEVENLABS_STABILITY:-0.5}
+      - ELEVENLABS_SIMILARITY_BOOST=${ELEVENLABS_SIMILARITY_BOOST:-0.75}
+
+      # OpenAI Configuration
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ENABLE_IMAGE_GENERATION=${ENABLE_IMAGE_GENERATION:-False}
+
+      # Storage
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER:-local}
+      - LOCAL_STORAGE_PATH=${LOCAL_STORAGE_PATH:-/app/storage}
+      - AUDIO_STORAGE_PATH=${AUDIO_STORAGE_PATH:-/app/storage/audio}
+      - STORY_STORAGE_PATH=${STORY_STORAGE_PATH:-/app/storage/stories}
+      - STORYBOARD_STORAGE_PATH=${STORYBOARD_STORAGE_PATH:-/app/storage/storyboards}
+      - SCREENSHOT_STORAGE_PATH=${SCREENSHOT_STORAGE_PATH:-/app/storage/screenshots}
+      - FILE_RETENTION_DAYS=${FILE_RETENTION_DAYS:-30}
+      - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS:-24}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - S3_REGION=${S3_REGION}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL}
+      - AZURE_ACCOUNT_NAME=${AZURE_ACCOUNT_NAME}
+      - AZURE_ACCOUNT_KEY=${AZURE_ACCOUNT_KEY}
+      - AZURE_CONTAINER_NAME=${AZURE_CONTAINER_NAME}
+
+      # HTTP API Options & Security
+      - HTTP_TIMEOUT=${HTTP_TIMEOUT:-120}
+      - API_KEY_ENABLED=${API_KEY_ENABLED:-False}
       - API_KEY=${API_KEY}
+      - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-True}
+      - RATE_LIMIT_REQUESTS=${RATE_LIMIT_REQUESTS:-100}
+      - RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW:-60}
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      - MAX_UPLOAD_SIZE_MB=${MAX_UPLOAD_SIZE_MB:-50}
+      - MAX_REQUEST_SIZE_MB=${MAX_REQUEST_SIZE_MB:-10}
+      - VOICE_ID_PATTERN=${VOICE_ID_PATTERN}
+      - SANITIZE_MAX_LENGTH=${SANITIZE_MAX_LENGTH:-1000}
+      - DANGEROUS_CHARS=${DANGEROUS_CHARS}
+      - ALLOWED_FILE_TYPES=${ALLOWED_FILE_TYPES}
+      - SOURCE_MATERIALS_PATH=${SOURCE_MATERIALS_PATH:-/app/data/sources}
+
+      # RAG Configuration
+      - RAG_ENABLED=${RAG_ENABLED:-True}
+      - RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - RAG_VECTOR_DB_PATH=${RAG_VECTOR_DB_PATH:-/app/vector_db}
+      - RAG_RELEVANT_CHUNKS_COUNT=${RAG_RELEVANT_CHUNKS_COUNT:-5}
+      - RAG_CHUNK_SIZE=${RAG_CHUNK_SIZE:-500}
+      - RAG_CHUNK_OVERLAP=${RAG_CHUNK_OVERLAP:-50}
+
+      # Storyboard Settings
+      - STORYBOARD_WPM=${STORYBOARD_WPM:-150}
+      - ENABLE_STORYBOARD_GENERATION=${ENABLE_STORYBOARD_GENERATION:-True}
+
+      # Monitoring (App's own health endpoint)
+      - HEALTH_CHECK_ENABLED=${HEALTH_CHECK_ENABLED:-True}
+      - HEALTH_CHECK_ENDPOINT=${HEALTH_CHECK_ENDPOINT:-/health}
+      - METRICS_ENABLED=${METRICS_ENABLED:-True}
+      - METRICS_ENDPOINT=${METRICS_ENDPOINT:-/metrics}
+    command: python3 -m viralStoryGenerator.src.worker_runner api --port 8000
     networks:
       - viral-network
     restart: unless-stopped
-    deploy:
-      replicas: 1
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 1G
-      restart_policy:
-        condition: on-failure
-        max_attempts: 3
+    mem_limit: 1G
+    cpus: '1.0'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     volumes:
-      - ./data:/app/data
+      - ./storage:/app/storage
+      - ./vector_db:/app/vector_db
+      - ./data/sources:/app/data/sources
       - ./.env:/app/.env:ro
 
   scraper:
@@ -75,62 +151,174 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      backend:
+        condition: service_healthy
     environment:
-      - REDIS_HOST=${REDIS_HOST}
-      - REDIS_PORT=${REDIS_PORT}
-      - REDIS_ENABLED=${REDIS_ENABLED}
-      - LOG_LEVEL=${LOG_LEVEL}
-      - ENVIRONMENT=${ENVIRONMENT}
-      - REDIS_WORKER_BATCH_SIZE=5
-      - REDIS_WORKER_MAX_CONCURRENT=3
+      # General
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+
+      # Redis
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_ENABLED=${REDIS_ENABLED:-True}
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - REDIS_WORKER_BATCH_SIZE=${WORKER_BATCH_SIZE:-1}
+      - REDIS_WORKER_MAX_CONCURRENT=${WORKER_CONCURRENT:-1}
+      - REDIS_WORKER_SLEEP_INTERVAL=${REDIS_WORKER_SLEEP_INTERVAL:-1}
+      - REDIS_SCRAPE_QUEUE_NAME=${REDIS_SCRAPE_QUEUE_NAME:-scraper_jobs}
+      - REDIS_SCRAPE_RESULT_PREFIX=${REDIS_SCRAPE_RESULT_PREFIX:-scraper_jobs_result:}
+      - REDIS_SCRAPE_RESULT_TTL=${REDIS_SCRAPE_RESULT_TTL:-3600}
+
+      # Scraper Configuration (Crawl4AI specific)
+      - SCRAPER_BM25_THRESHOLD=${SCRAPER_BM25_THRESHOLD:-1.2}
+      - SCRAPER_PRUNING_THRESHOLD=${SCRAPER_PRUNING_THRESHOLD:-0.48}
+      - SCRAPER_PRUNING_THRESHOLD_TYPE=${SCRAPER_PRUNING_THRESHOLD_TYPE:-fixed}
+      - SCRAPER_MD_IGNORE_LINKS=${SCRAPER_MD_IGNORE_LINKS:-True}
+      - SCRAPER_CHECK_ROBOTS_TXT=${SCRAPER_CHECK_ROBOTS_TXT:-True}
+
+      # Scraper Rate Limiter Configuration
+      - SCRAPER_RL_BASE_DELAY=${SCRAPER_RL_BASE_DELAY:-'1.0,3.0'}
+      - SCRAPER_RL_MAX_DELAY=${SCRAPER_RL_MAX_DELAY:-60.0}
+      - SCRAPER_RL_MAX_RETRIES=${SCRAPER_RL_MAX_RETRIES:-3}
+      - SCRAPER_RL_CODES=${SCRAPER_RL_CODES:-'429,503'}
+
+      # Scraper Crawler Monitor Configuration
+      - SCRAPER_MONITOR_ENABLED=${SCRAPER_MONITOR_ENABLED:-False}
+      - SCRAPER_MONITOR_MAX_ROWS=${SCRAPER_MONITOR_MAX_ROWS:-10}
+      - SCRAPER_MONITOR_DISPLAY_MODE=${SCRAPER_MONITOR_DISPLAY_MODE:-AGGREGATED}
+
+      # Scraper Dispatcher Configuration
+      - SCRAPER_DISP_SEMA_MAX_PERMIT=${SCRAPER_DISP_SEMA_MAX_PERMIT:-10}
+      - SCRAPER_DISP_MEM_THRESHOLD=${SCRAPER_DISP_MEM_THRESHOLD:-85.0}
+      - SCRAPER_DISP_MEM_INTERVAL=${SCRAPER_DISP_MEM_INTERVAL:-1.0}
+      - SCRAPER_DISP_MEM_MAX_PERMIT=${SCRAPER_DISP_MEM_MAX_PERMIT:-5}
+      - SCRAPER_DISP_MEM_WAIT_TIMEOUT=${SCRAPER_DISP_MEM_WAIT_TIMEOUT:-300.0}
+
+      # Scraper Worker Specific Configuration
+      - SCRAPER_WORKER_MAX_CONCURRENT_JOBS=${SCRAPER_WORKER_MAX_CONCURRENT_JOBS:-2}
+      - SCRAPER_WORKER_SHUTDOWN_TIMEOUT=${SCRAPER_WORKER_SHUTDOWN_TIMEOUT:-30}
+      - SCRAPER_ARUN_MANY_TIMEOUT=${SCRAPER_ARUN_MANY_TIMEOUT:-60.0}
+
+      # Storage for screenshots
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER:-local}
+      - LOCAL_STORAGE_PATH=${LOCAL_STORAGE_PATH:-/app/storage}
+      - SCREENSHOT_STORAGE_PATH=${SCREENSHOT_STORAGE_PATH:-/app/storage/screenshots}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - S3_REGION=${S3_REGION}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL}
+      - AZURE_ACCOUNT_NAME=${AZURE_ACCOUNT_NAME}
+      - AZURE_ACCOUNT_KEY=${AZURE_ACCOUNT_KEY}
+      - AZURE_CONTAINER_NAME=${AZURE_CONTAINER_NAME}
+    command: python3 -m viralStoryGenerator.src.worker_runner worker --worker-type scrape
     networks:
       - viral-network
     restart: unless-stopped
-    deploy:
-      replicas: 2
-      resources:
-        limits:
-          cpus: '0.7'
-          memory: 1G
-      restart_policy:
-        condition: on-failure
-        max_attempts: 3
+    shm_size: '2gb'
+    mem_limit: 4G
+    cpus: '1.5'
     volumes:
       - ./data:/app/data
+      - ./storage:/app/storage
       - ./.env:/app/.env:ro
 
   api-worker:
     build:
       context: .
-      dockerfile: Dockerfile.worker
+      dockerfile: Dockerfile.workerapi
     depends_on:
       redis:
         condition: service_healthy
+      backend:
+        condition: service_healthy
     environment:
-      - REDIS_HOST=${REDIS_HOST}
-      - REDIS_PORT=${REDIS_PORT}
-      - REDIS_ENABLED=${REDIS_ENABLED}
-      - LOG_LEVEL=${LOG_LEVEL}
-      - ENVIRONMENT=${ENVIRONMENT}
-      - REDIS_QUEUE_NAME=api_requests
-      - REDIS_RESULT_PREFIX="api_result:"
-      - REDIS_WORKER_BATCH_SIZE=3
-      - REDIS_WORKER_MAX_CONCURRENT=2
-    command: python -m viralStoryGenerator.src.api_worker
+      # General
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+
+      # Redis
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_ENABLED=${REDIS_ENABLED:-True}
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - REDIS_WORKER_BATCH_SIZE=${WORKER_BATCH_SIZE:-1}
+      - REDIS_WORKER_MAX_CONCURRENT=${WORKER_CONCURRENT:-1}
+      - REDIS_WORKER_SLEEP_INTERVAL=${REDIS_WORKER_SLEEP_INTERVAL:-1}
+      - REDIS_QUEUE_NAME=${REDIS_QUEUE_NAME:-api_jobs}
+      - REDIS_RESULT_PREFIX=${REDIS_RESULT_PREFIX:-api_jobs_result:}
+      - REDIS_RESULT_TTL=${REDIS_RESULT_TTL:-3600}
+
+      # LLM Configuration
+      - LLM_ENDPOINT=${LLM_ENDPOINT}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_MODEL_MULTI=${LLM_MODEL_MULTI}
+      - LLM_MODEL_SMALL=${LLM_MODEL_SMALL}
+      - LLM_MODEL_LARGE=${LLM_MODEL_LARGE}
+      - LLM_CHUNK_SIZE=${LLM_CHUNK_SIZE:-5000}
+      - LLM_SHOW_THINKING=${LLM_SHOW_THINKING:-False}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.7}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-32768}
+      - LLM_CLEANING_MAX_PROMPT_CHARS=${LLM_CLEANING_MAX_PROMPT_CHARS:-500000}
+      - LLM_CLEANING_MAX_OUTPUT_TOKENS=${LLM_CLEANING_MAX_OUTPUT_TOKENS:-32768}
+      - LLM_MIN_CLEANING_LENGTH=${LLM_MIN_CLEANING_LENGTH:-200}
+
+      # ElevenLabs API Configuration
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID}
+      - ENABLE_AUDIO_GENERATION=${ENABLE_AUDIO_GENERATION:-False}
+      - ELEVENLABS_MODEL_ID=${ELEVENLABS_MODEL_ID:-eleven_multilingual_v2}
+      - ELEVENLABS_STABILITY=${ELEVENLABS_STABILITY:-0.5}
+      - ELEVENLABS_SIMILARITY_BOOST=${ELEVENLABS_SIMILARITY_BOOST:-0.75}
+
+      # OpenAI Configuration
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ENABLE_IMAGE_GENERATION=${ENABLE_IMAGE_GENERATION:-False}
+
+      # Storage
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER:-local}
+      - LOCAL_STORAGE_PATH=${LOCAL_STORAGE_PATH:-/app/storage}
+      - AUDIO_STORAGE_PATH=${AUDIO_STORAGE_PATH:-/app/storage/audio}
+      - STORY_STORAGE_PATH=${STORY_STORAGE_PATH:-/app/storage/stories}
+      - STORYBOARD_STORAGE_PATH=${STORYBOARD_STORAGE_PATH:-/app/storage/storyboards}
+      - SCREENSHOT_STORAGE_PATH=${SCREENSHOT_STORAGE_PATH:-/app/storage/screenshots}
+      - FILE_RETENTION_DAYS=${FILE_RETENTION_DAYS:-30}
+      - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS:-24}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - S3_REGION=${S3_REGION}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL}
+      - AZURE_ACCOUNT_NAME=${AZURE_ACCOUNT_NAME}
+      - AZURE_ACCOUNT_KEY=${AZURE_ACCOUNT_KEY}
+      - AZURE_CONTAINER_NAME=${AZURE_CONTAINER_NAME}
+      - SOURCE_MATERIALS_PATH=${SOURCE_MATERIALS_PATH:-/app/data/sources}
+
+      # RAG Configuration
+      - RAG_ENABLED=${RAG_ENABLED:-True}
+      - RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - RAG_VECTOR_DB_PATH=${RAG_VECTOR_DB_PATH:-/app/vector_db}
+      - RAG_RELEVANT_CHUNKS_COUNT=${RAG_RELEVANT_CHUNKS_COUNT:-5}
+      - RAG_CHUNK_SIZE=${RAG_CHUNK_SIZE:-500}
+      - RAG_CHUNK_OVERLAP=${RAG_CHUNK_OVERLAP:-50}
+
+      # Storyboard Settings
+      - STORYBOARD_WPM=${STORYBOARD_WPM:-150}
+      - ENABLE_STORYBOARD_GENERATION=${ENABLE_STORYBOARD_GENERATION:-True}
+    command: python3 -m viralStoryGenerator.src.worker_runner worker --worker-type queue
     networks:
       - viral-network
     restart: unless-stopped
-    deploy:
-      replicas: 2
-      resources:
-        limits:
-          cpus: '0.7'
-          memory: 1G
-      restart_policy:
-        condition: on-failure
-        max_attempts: 3
+    mem_limit: 2G
+    cpus: '1.0'
     volumes:
       - ./data:/app/data
+      - ./storage:/app/storage
+      - ./vector_db:/app/vector_db
+      - ./data/sources:/app/data/sources
       - ./.env:/app/.env:ro
 
 networks:

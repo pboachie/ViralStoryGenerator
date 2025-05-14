@@ -1,5 +1,7 @@
 # viralStoryGenerator/prompts/prompts.py
 
+from viralStoryGenerator.utils.config import app_config
+
 def get_system_instructions():
   return (
       "## Role\n"
@@ -110,46 +112,42 @@ def get_system_instructions():
   )
 
 
-def get_user_prompt(topic, sources):
+def get_user_prompt(topic: str, relevant_chunks: str) -> str:
+    """Generates the user prompt for the LLM, using relevant chunks from RAG."""
+    # If no relevant chunks were found, provide a basic prompt
+    if not relevant_chunks or all((not chunk or str(chunk).isspace()) for chunk in relevant_chunks):
+        print("No relevant chunks found. Generating prompt based on topic alone.")
+        relevant_chunks_section = "No specific context snippets were retrieved. Please generate the story based on the topic alone."
+    else:
+        relevant_chunks_section = f"""## Relevant Information Snippets:
+{relevant_chunks}"""
+
     return f"""
-## Source Material Analysis
-Analyze these {topic} sources and identify:
-1. Core controversy or unique angle
-2. Key technical issues or failures (explain simply, avoid jargon)
-3. Unconfirmed or speculative claims from leaks (treat as rumors)
-4. Industry or public reactions if available
+## Task
+Generate a viral story script and video description about '{topic}' based *only* on the following relevant information snippets (if provided).
+
+{relevant_chunks_section}
 
 ## Story Requirements
-Transform these key points into a spicy, viral narrative:
+Transform the key points from the snippets (or general knowledge if no snippets provided) into a spicy, viral narrative:
 - Start with a bold, attention-grabbing hook
 - Use short, punchy sentences for drama
-- Weave in 2-3 controversial elements from the sources
-- Treat unverified info as 'alleged', 'rumored' or similar and avoid definitive statements. Warn about potential inaccuracies if needed.
+- Weave in 2-3 controversial elements if found in the snippets
+- Treat unverified info as 'alleged', 'rumored' or similar if applicable based on snippets.
 - End with an open question about possible implications
 
 ## Formatting Rules
-STRICTLY follow this structure:
+STRICTLY follow this structure. Output ONLY the two sections below, with NO additional text, labels, explanations, or markdown formatting before or after.
 
 ### Story Script:
-[Your story text in 3-5 short paragraphs, Must be a minumum of 200-220 words total. No markdown]
+[Your story text in 3-5 short paragraphs, Must be a minumum of 200-220 words total.]
 
 ### Video Description:
 [Single line, ≤100 chars, 3-5 hashtags related to {topic}, key entities, emotions]
 
-## Example Output
-Sources: "Internal memo suggests CEO knew about security flaws... Reddit leaks show prototype images..."
-
-### Story Script:
-You won't believe what leaked from TechCorp's secret servers. Internal docs reveal...
-
-### Video Description:
-CEO knew about security flaws? #TechScandal #DataLeak #CorporateDrama
-
-## Current Sources:
-{sources}
-
-Generate story script and description now using the source(s) provided tailored for the age group 13-25 years old. Be sure to use info from the sources if any..
+Generate the required output now.
 """.strip()
+
 
 def get_fix_prompt(raw_text):
     return f"""
@@ -186,75 +184,149 @@ CEO knew about security flaws? #TechScandal #DataLeak #CorporateDrama
 Generate the corrected version now.
 """.strip()
 
+def get_clean_markdown_prompt(raw_markdown: str) -> str:
+    """
+    Creates a prompt for the LLM to clean raw markdown content.
+
+    Args:
+        raw_markdown: The raw markdown string scraped from a webpage.
+
+    Returns:
+        A formatted user prompt string.
+    """
+    return f"""Analyze the following raw markdown text scraped from a webpage. Your goal is to extract *only* the main article content, discarding all extraneous elements.
+
+**CRUCIAL OVERARCHING PRINCIPLE: VERBATIM EXTRACTION, NOT GENERATION.**
+**YOUR TASK IS TO *EXTRACT* EXISTING CONTENT. DO *NOT* SUMMARIZE, PARAPHRASE, REWRITE, INTERPRET, OR GENERATE NEW TEXT. THE OUTPUT MUST BE A VERBATIM SUBSET OF THE INPUT, CONTAINING ONLY THE IDENTIFIED ARTICLE CONTENT. ANY DEVIATION FROM THIS IS A FAILURE.**
+
+**Key Principles:**
+1.  **Article Centricity:** The primary goal is to isolate the narrative/informational core of the article.
+2.  **Aggressive Clutter Removal:** Remove anything not contributing directly to the article's main content.
+3.  **Format Fidelity:** Preserve original markdown formatting *only* for the extracted article content.
+
+**Detailed Instructions:**
+
+1.  **Identify Article Boundaries:**
+    *   **Start:** Locate the main article headline (often a H1, H2, or prominent large text). The core article content typically begins with or immediately after this headline and any directly associated byline/date.
+    *   **End:** The article content usually ends before sections like "Related Articles," "Up Next," "Most Read," "Comments," "Author Bio (if a separate, distinct block)," "Tags," or the website footer.
+
+2.  **Core Content Extraction:**
+    *   Preserve the main textual body, including paragraphs, blockquotes, and lists (`*`, `-`, `1.`) that form the article's narrative.
+    *   Keep images (`![alt](src)`) and their accompanying captions if they are embedded within and illustrative of the article content.
+    *   Retain headings (`#`, `##`, etc.) that structure the main article itself.
+    *   Keep hyperlinks (`[text](url)`) that are part of sentences within the core content.
+
+3.  **Header & Preamble Handling:**
+    *   Discard global site headers, primary navigation menus (top, side, or hamburger menus), site branding/logos (unless it's an image clearly part of the article's masthead area and not a general site logo), search bars, and login/account links typically found at the very top of a page or in persistent sidebars.
+    *   Keep the article's main headline.
+    *   Keep bylines (e.g., "By Author Name"), publication dates, update dates, and brief source attributions (e.g., "City, ST — Source:") if they directly precede or immediately follow the main headline and serve to introduce the article.
+
+4.  **Clutter Elimination (Non-Exhaustive List):**
+    *   **Navigation:** All forms of site navigation (menus, breadcrumbs, lists of sections/categories, "More" links leading to other site sections, pagination links not essential for reading a single article).
+    *   **Promotional Content:** Advertisements, ad placeholders (e.g., text like "Advertisement", "Ad Feedback"), "paid content" sections, "sponsored by" notices, lists of affiliate links.
+    *   **Social Interaction:** Social media sharing buttons/links (including those with only icons and no descriptive text, e.g., `[ ](social_url)`), "Share this" prompts, like/reaction buttons, "Link Copied!" messages, comment submission forms, and displayed comment sections.
+    *   **Related Content:** Lists, carousels, or grids of "Related Articles," "Recommended Reading," "Up Next," "More from [Site]," "Most Popular/Read."
+    *   **Author Information (Standalone):** Author biographies presented as separate, standalone blocks (e.g., an "About the Author" box at the end of the article), especially if they are lengthy or contain promotional links. A simple byline (as per instruction 3) should be kept.
+    *   **Website Footer Content:** Copyright notices, privacy policy links, terms of service, "About Us" links, contact links, site maps, and other boilerplate links typically found at the bottom of every page.
+    *   **Cookie/Privacy Banners:** Cookie consent banners, privacy notices, GDPR pop-ups.
+    *   **UI/UX Elements:** Non-content UI elements such as "scroll to top" buttons, print buttons (unless the content is about printing), font size adjusters, theme toggles, or purely functional links/buttons not part of the article's text. "Ad Feedback" forms or links.
+    *   **Redundant Elements:** Repeated navigation blocks, account management sections that might appear in multiple places.
+    *   **Empty/Icon Links:** Remove links that primarily serve as icons or have no descriptive link text (e.g., `[ ](url)`), especially if they are adjacent to bylines or in social sharing areas, and are not part of the main article's narrative flow. (Exception: image links `![alt](src)` as per instruction 2).
+
+5.  **Formatting & Links (Reiteration):**
+    *   Maintain original markdown formatting (`**bold**`, `*italic*`, lists, ` ```code blocks``` `, etc.) exclusively for the extracted article. Do not introduce new formatting or alter existing formatting of the core content.
+    *   Remove navigational, promotional, or boilerplate link lists. Only hyperlinks embedded naturally within the article's sentences and paragraphs should remain.
+
+6.  **Special Sections Within Article Flow:**
+    *   Retain sections like "Methodology," "Sources," "Acknowledgements," or "Editor's Note" if they are clearly part of the article's structure (e.g., follow the main body, use article headings) and provide essential context, support, or clarification for its content, rather than being generic site-wide links or separate pages.
+
+7.  **Output Requirements:**
+    *   **YOUR RESPONSE MUST CONSIST *SOLELY* AND *EXCLUSIVELY* OF THE CLEANED MARKDOWN TEXT OF THE MAIN ARTICLE. THERE SHOULD BE NO OTHER TEXT WHATSOEVER IN YOUR RESPONSE.**
+    *   **ABSOLUTELY NO** introductory phrases (e.g., "Here is the cleaned text:"), NO concluding remarks (e.g., "I hope this helps!"), NO explanations, NO summaries, NO apologies, NO comments about your process, NO disclaimers, NO labels, NO preambles.
+    *   Do NOT wrap the *entire* output in markdown code fences (```) unless the *entire extracted article itself* is a single markdown code block (which is rare). If the article contains code blocks, those should be preserved *within* the extracted article text, not wrapping the whole thing.
+    *   **IF YOU ARE TEMPTED TO ADD *ANY* TEXT THAT IS NOT DIRECTLY AND VERBATIM EXTRACTED FROM THE ARTICLE PORTION OF THE INPUT, SUPPRESS THAT TEMPTATION. OUTPUT *ONLY* THE ARTICLE ITSELF.**
+
+8.  **Handling No Content:** If, after aggressive cleaning, no discernible main article content remains (e.g., the page was purely navigational or an error page), output an empty string. **AND NOTHING ELSE. NOT EVEN A SPACE.**
+
+9.  **Precision and Focus:** Prioritize accuracy. The aim is a clean, uninterrupted representation of the article's primary content, as if it were the only thing on the page. Be discerning about what constitutes the "main story."
+
+**Raw Markdown Input:**
+<RAW_MARKDOWN_START>
+{raw_markdown}
+<RAW_MARKDOWN_END>
+
+**Cleaned Markdown Output:**
+"""
+
 def get_storyboard_prompt(story):
     return f"""
 ## Role
-You are a Storyboard Generator that chunks stories into structured JSON for video production.
+You are a Storyboard Planner. Analyze the provided story and identify logical scene breaks. For each scene, provide a starting marker (the first few words) and an image prompt.
 
 ## Task
-Convert this story into 3-5 scenes with narration timing and image prompts.
+Analyze the input story's narrative flow and emotional tone. Identify 3-5 logical scene breaks. For each scene, provide:
+1.  `scene_number`: An integer starting from 1.
+2.  `scene_start_marker`: The **exact first 5 to 10 words** of the text segment that should begin this scene. This marker **MUST** be a non-empty string copied precisely from the beginning of the corresponding text segment in the input story. It is critical for splitting the story later.
+3.  `image_prompt`: A concise DALL-E image description for the scene.
+Output ONLY the valid JSON object containing a 'scenes' list, with NO other text before or after the JSON structure. Adhere strictly to the schema.
 
 ## JSON Requirements
 {{
   "scenes": [
     {{
       "scene_number": 1,
-      "narration_text": "Exact text from the story to narrate",
+      "scene_start_marker": "Exact first 5-10 words of the scene...", // CRITICAL: Must be exact, non-empty text from the story.
       "image_prompt": "DALL-E description focusing on: [1] Main subject [2] Style refs [3] Key details",
-      "duration": 5
+      "duration": 0, // Placeholder - Will be calculated later
+      "start_time": 0 // Placeholder - Will be calculated later
     }}
+    // ... more scenes ...
   ]
 }}
 
 ## Guidelines
-1. Narration text: 15-30 words per scene (150 WPM = 6-12s audio)
-2. Image prompts must include:
-   - Concrete visual elements (no abstract concepts)
-   - Style references (e.g., "cyberpunk animation style", "Ultra photorealistic")
-   - Composition notes (e.g., "close-up", "wide shot")
-3. Duration rounded to nearest whole second
+1.  **Analyze Flow & Tone:** Read the entire story to understand its structure, pacing, and emotional shifts.
+2.  **Identify Breaks:** Determine 3-5 points where the narrative logically shifts (change in time, location, focus, or emotion).
+3.  **Extract Start Markers:** For each identified scene break, copy the **exact first 5 to 10 words** from the original story that mark the beginning of that scene. These markers **MUST** be accurate, non-empty string substrings of the original story. Double-check this requirement.
+4.  **Image Prompts:** Generate a concise, descriptive `image_prompt` for each scene, including:
+    *   Concrete visual elements (no abstract concepts).
+    *   Style references (e.g., "cyberpunk animation style", "Ultra photorealistic").
+    *   Composition notes (e.g., "close-up", "wide shot").
+5.  **Placeholders:** Set `duration` and `start_time` to `0`.
+6.  **Output:** Generate ONLY the valid JSON structure. No extra text, explanations, or markdown. Ensure all required fields, especially `scene_start_marker`, are present and correctly formatted for every scene.
 
-## Example
-Story: "You won't believe what's happening in China right now—NVIDIA GPUs are literally bricking! Users report their high-end graphics cards suddenly becoming worthless, leaving gamers and professionals in crisis mode. What makes this even more explosive is the rumor that NVIDIA knew about these issues but didn’t warn customers.
-The controversy heats up with claims that NVIDIA’s rushed manufacturing process caused irreversible damage. Leaks suggest internal memos showed they were aware of potential flaws but prioritized release deadlines over quality. Meanwhile, some users are demanding refunds, while others accuse China-specific components of being faulty.
-Now here's the kicker—alleged whistleblowers say NVIDIA is considering a recall but fears public backlash. The company remains silent, leaving customers in limbo. Could this be the start of a bigger tech scandal? Or will NVIDIA fix this mess?"
+## Example (Illustrates Markers)
+Story: "The city held its breath. Sirens wailed in the distance, growing closer. Suddenly, a deafening explosion rocked the downtown core! Debris rained down as people scrambled for cover, their faces etched with panic. News helicopters were already circling overhead, capturing the chaos. What had happened? Early reports mentioned a possible gas leak, but whispers of sabotage quickly spread through the terrified crowds. Authorities urged calm, but the fear was palpable."
 
 {{
   "scenes": [
     {{
       "scene_number": 1,
-      "narration_text": "You won't believe what's happening in China right now—NVIDIA GPUs are literally bricking! Users report their high-end graphics cards suddenly becoming worthless, leaving gamers and professionals in crisis mode.",
-      "image_prompt": "A bustling Chinese tech lab with frustrated gamers and professionals, close-up of a damaged NVIDIA GPU on a cluttered desk, digital glitch effects, cinematic lighting, realistic style.",
-      "duration": 12,
+      "scene_start_marker": "The city held its breath.", // First 5 words
+      "image_prompt": "A tense cityscape at dusk, focus on distant flashing lights, silhouetted buildings, ominous atmosphere, cinematic wide shot, realistic style.",
+      "duration": 0,
       "start_time": 0
     }},
     {{
       "scene_number": 2,
-      "narration_text": "What makes this even more explosive is the rumor that NVIDIA knew about these issues but didn’t warn customers. The controversy heats up with",
-      "image_prompt": "A dramatic newsroom scene with swirling rumor clouds and digital headlines about NVIDIA, vibrant red and orange tones, intense cinematic lighting, realistic style.",
-      "duration": 10,
-      "start_time": 12
+      "scene_start_marker": "Suddenly, a deafening explosion", // First 4 words
+      "image_prompt": "Chaotic street-level view of an explosion's aftermath, dust and debris falling, blurred figures running in panic, dynamic motion blur, dramatic lighting, photorealistic.",
+      "duration": 0,
+      "start_time": 0
     }},
     {{
       "scene_number": 3,
-      "narration_text": "claims that NVIDIA’s rushed manufacturing process caused irreversible damage. Leaks suggest internal memos showed they were aware of potential flaws but prioritized release deadlines over quality.",
-      "image_prompt": "Inside a high-tech factory with hurried assembly lines, close-up of a flawed NVIDIA GPU board, scattered internal memos, cold blue industrial lighting, realistic style.",
-      "duration": 10,
-      "start_time": 22
+      "scene_start_marker": "News helicopters were already", // First 4 words
+      "image_prompt": "View from above looking down at a smoke-filled city street, news helicopters circling, emergency vehicles below, high-angle shot, news report style.",
+      "duration": 0,
+      "start_time": 0
     }},
     {{
       "scene_number": 4,
-      "narration_text": "Meanwhile, some users are demanding refunds, while others accuse China-specific components of being faulty. Now here's the kicker—alleged whistleblowers say NVIDIA is considering a recall but fears public backlash.",
-      "image_prompt": "A split-screen image with angry consumers holding refund signs on one side and a shadowy whistleblower in a dark corridor with secret documents on the other, dramatic contrast, realistic style.",
-      "duration": 12,
-      "start_time": 32
-    }},
-    {{
-      "scene_number": 5,
-      "narration_text": "The company remains silent, leaving customers in limbo. Could this be the start of a bigger tech scandal? Or will NVIDIA fix this mess?",
-      "image_prompt": "A somber corporate boardroom with empty seats and a silent, dark backdrop, frustrated customers watching a blank screen, muted color palette, realistic style.",
-      "duration": 10,
-      "start_time": 44
+      "scene_start_marker": "Early reports mentioned a possible", // First 5 words
+      "image_prompt": "Montage: close-up of anxious faces in a crowd, a flickering gas meter, shadowy figures whispering, officials speaking at a podium, split-screen effect, suspenseful mood, realistic style.",
+      "duration": 0,
+      "start_time": 0
     }}
   ]
 }}
@@ -262,9 +334,10 @@ Now here's the kicker—alleged whistleblowers say NVIDIA is considering a recal
 ## Input Story
 {story}
 
-Generate valid JSON:
+Generate valid JSON output now. Ensure every scene includes a valid 'scene_start_marker'.
     """.strip()
 
+# TODO: To be implemented in the future
 def _identify_errors(text):
     """Helper to generate error descriptions"""
     errors = []
