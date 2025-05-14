@@ -1,418 +1,278 @@
 # viralStoryGenerator/src/api_handlers.py
+import tempfile
 import time
 import os
 import datetime
 import json
 import uuid
+import re # For sanitization
 from typing import Dict, Any, Optional, List
 
 from viralStoryGenerator.models import (
     StoryGenerationResult,
     JobStatusResponse
 )
-from viralStoryGenerator.src.llm import generate_story_script
-from viralStoryGenerator.src.source_cleanser import chunkify_and_summarize
-from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
-from viralStoryGenerator.src.logger import logger as _logger
+import logging
 from viralStoryGenerator.utils.config import config as appconfig
-from viralStoryGenerator.utils.redis_manager import RedisManager
+from viralStoryGenerator.utils.redis_manager import RedisMessageBroker
+from viralStoryGenerator.utils.storage_manager import storage_manager
+from viralStoryGenerator.utils.security import is_file_in_directory, validate_path_component, sanitize_for_filename
 
-# Directory where failed audio generations are queued
-AUDIO_QUEUE_DIR = appconfig.AUDIO_QUEUE_DIR
-# Redis manager for task queue
-redis_manager = RedisManager() if appconfig.redis.ENABLED else None
+import viralStoryGenerator.src.logger
+_logger = logging.getLogger(__name__)
+
+def get_message_broker() -> RedisMessageBroker:
+    """Get Redis message broker for API handlers"""
+    redis_url = "redis://" + appconfig.redis.HOST + ":" + str(appconfig.redis.PORT)
+    return RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
 
 class StoryTask:
-    """Class to manage story generation tasks"""
-    def __init__(self, task_id: str, topic: str, sources: Optional[str] = None,
-                 voice_id: Optional[str] = None, status: str = "pending",
-                 created_at: Optional[str] = None):
+    """Basic representation of a task state for API response."""
+    def __init__(self, task_id: str, topic: str, status: str = "pending", created_at: Optional[str] = None):
         self.task_id = task_id
         self.topic = topic
-        self.sources = sources
-        self.voice_id = voice_id
         self.status = status
-        self.created_at = created_at or datetime.datetime.now().isoformat()
-        self.result = None
-        self.error = None
-        self.file_paths = {
-            "story": None,
-            "audio": None,
-            "storyboard": None
-        }
+        self.created_at = created_at or datetime.datetime.now(datetime.timezone.utc).isoformat() # Use UTC
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert task to dictionary for serialization"""
+        """Convert task to dictionary for API response."""
         return {
             "task_id": self.task_id,
             "topic": self.topic,
             "status": self.status,
             "created_at": self.created_at,
-            "file_paths": self.file_paths,
-            "error": self.error
         }
 
-def _save_story_output(result, topic, voice_id=None) -> Dict[str, str]:
-    """
-    Save story output to files and return paths to the created files.
-
-    Returns:
-        Dict with paths to generated files
-    """
-    now = datetime.datetime.now()
-    date_str = now.strftime("%Y-%m-%d")
-    week_num = now.isocalendar().week
-
-    folder_path = os.path.join("GeneratedStories", f"Week{week_num}")
-    os.makedirs(folder_path, exist_ok=True)
-
-    # Build text filename
-    safe_topic = topic.replace("/", "_").replace("\\", "_")
-    txt_file_name = f"{safe_topic} - {date_str}.txt"
-    txt_file_path = os.path.join(folder_path, txt_file_name)
-
-    # Prepare result paths
-    result_paths = {
-        "story": txt_file_path,
-        "audio": None,
-        "storyboard": None
-    }
-
-    # Write out the story & description
-    with open(txt_file_path, "w", encoding="utf-8") as f:
-        f.write("### Story Script:\n")
-        f.write(result.get("story", ""))
-        f.write("\n\n### Video Description:\n")
-        f.write(result.get("video_description", ""))
-
-    _logger.info(f"Story saved to {txt_file_path}")
-
-    # Save storyboard if available
-    if result.get("storyboard"):
-        storyboard_file = f"{safe_topic} - {date_str}.json"
-        storyboard_path = os.path.join(folder_path, storyboard_file)
-
-        with open(storyboard_path, "w", encoding="utf-8") as f:
-            json.dump(result.get("storyboard"), f, indent=2)
-
-        _logger.info(f"Storyboard saved to {storyboard_path}")
-        result_paths["storyboard"] = storyboard_path
-
-    # Also generate audio from the story (if we have content)
-    story_text = result.get("story", "")
-    if story_text.strip():
-        # Build MP3 filename (same base name, .mp3 extension)
-        base_name = os.path.splitext(txt_file_name)[0]  # e.g. "MyTopic - 2025-02-02"
-        mp3_file_path = os.path.join(folder_path, f"{base_name}.mp3")
-        result_paths["audio"] = mp3_file_path
-
-        # We'll assume your ElevenLabs API key is stored somewhere
-        api_key = appconfig.elevenLabs.API_KEY
-        if not api_key:
-            _logger.warning("No ElevenLabs API Key found. Skipping TTS generation.")
-            return result_paths
-
-        # Use the provided voice_id (if any) or default
-        success = generate_elevenlabs_audio(
-            text=story_text,
-            api_key=api_key,
-            output_mp3_path=mp3_file_path,
-            voice_id=voice_id,
-            model_id="eleven_multilingual_v2",
-            stability=0.5,
-            similarity_boost=0.75
-        )
-        if success:
-            _logger.info(f"Audio TTS saved to {mp3_file_path}")
-        else:
-            _logger.warning("Audio generation failed. Queueing for later re-generation.")
-            # Prepare metadata for retrying audio generation later
-            metadata = {
-                "topic": topic,
-                "story": story_text,
-                "mp3_file_path": mp3_file_path,
-                "voice_id": voice_id,
-                "model_id": "eleven_multilingual_v2",
-                "stability": 0.5,
-                "similarity_boost": 0.75,
-                "attempts": 1,
-                "timestamp": datetime.datetime.now().isoformat()
-            }
-            queue_failed_audio(metadata)
-
-    return result_paths
-
-
-def queue_failed_audio(metadata):
-    """
-    Saves the metadata for a failed audio generation attempt into the AUDIO_QUEUE_DIR.
-    """
-    os.makedirs(AUDIO_QUEUE_DIR, exist_ok=True)
-    # Create a safe filename using the topic and current timestamp.
-    safe_topic = metadata.get("topic", "untitled").replace("/", "_").replace("\\", "_")
-    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    filename = f"{safe_topic}_{timestamp}.json"
-    file_path = os.path.join(AUDIO_QUEUE_DIR, filename)
-    try:
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=4)
-        _logger.info(f"Queued failed audio generation to {file_path}")
-    except Exception as e:
-        _logger.error(f"Failed to write queue file {file_path}: {e}")
-
-
-def process_audio_queue():
-    """
-    Scans the AUDIO_QUEUE_DIR for queued audio jobs and attempts to re-generate audio.
-    On success, the queued file is removed.
-    """
-    if not os.path.isdir(AUDIO_QUEUE_DIR):
-        return
-
-    for filename in os.listdir(AUDIO_QUEUE_DIR):
-        if filename.endswith(".json"):
-            file_path = os.path.join(AUDIO_QUEUE_DIR, filename)
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    metadata = json.load(f)
-            except Exception as e:
-                _logger.error(f"Error reading queued file {file_path}: {e}")
-                continue
-
-            api_key = appconfig.elevenLabs.API_KEY
-            if not api_key:
-                _logger.error("No ElevenLabs API Key found. Skipping queued audio generation.")
-                break
-
-            _logger.info(f"Attempting queued audio generation for {metadata.get('mp3_file_path')}")
-            success = generate_elevenlabs_audio(
-                text=metadata["story"],
-                api_key=api_key,
-                output_mp3_path=metadata["mp3_file_path"],
-                voice_id=metadata.get("voice_id"),
-                model_id=metadata.get("model_id", "eleven_multilingual_v2"),
-                stability=metadata.get("stability", 0.5),
-                similarity_boost=metadata.get("similarity_boost", 0.75)
-            )
-            if success:
-                _logger.info(f"Queued audio generated successfully for {metadata.get('mp3_file_path')}. Removing from queue.")
-                try:
-                    os.remove(file_path)
-                except Exception as e:
-                    _logger.error(f"Could not remove queue file {file_path}: {e}")
-            else:
-                _logger.warning(f"Queued audio generation failed for {metadata.get('mp3_file_path')}. Will retry on next run.")
-
-
-def _read_sources_from_folder(folder_path):
-    """
-    Reads all files from `folder_path` (e.g., .txt, .md, or any extension),
-    concatenates their contents, and returns one combined string.
-    """
-    combined_texts = []
-    if not os.path.isdir(folder_path):
-        _logger.warning(f"Sources folder does not exist: {folder_path}")
-        return ""
-
-    for filename in os.listdir(folder_path):
-        file_path = os.path.join(folder_path, filename)
-        if os.path.isfile(file_path):
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    text = f.read().strip()
-                    if text:
-                        combined_texts.append(text)
-            except Exception as e:
-                _logger.error(f"Failed to read {file_path}: {e}")
-
-    # Combine them into one big block of text separated by double newlines
-    return "\n\n".join(combined_texts)
-
+# ---- API Facing Functions ----
 
 def create_story_task(topic: str, sources_folder: Optional[str] = None,
                      voice_id: Optional[str] = None) -> Dict[str, Any]:
     """
-    API handler to create a new story generation task.
-
-    Args:
-        topic: The topic for the story
-        sources_folder: Optional folder with source files
-        voice_id: Optional voice ID for ElevenLabs
-
-    Returns:
-        Dict with task information including task_id
+    API handler logic to create a new story generation task.
+    Validates inputs and queues the task via Redis Streams.
     """
+    if not appconfig.storyboard.ENABLE_STORYBOARD_GENERATION:
+        _logger.info("Storyboard generation is disabled in the configuration.")
+        include_storyboard = False
+    else:
+        include_storyboard = True
+
+    if not appconfig.ENABLE_IMAGE_GENERATION:
+        _logger.info("Image generation is disabled. Skipping related tasks.")
+        include_storyboard = False
+
+    if not appconfig.ENABLE_AUDIO_GENERATION:
+        _logger.info("Audio generation is disabled. Skipping related tasks.")
+
     # Generate a unique task ID
     task_id = str(uuid.uuid4())
 
-    # Create task object
-    task = StoryTask(
+    task_response = StoryTask(
         task_id=task_id,
-        topic=topic,
-        voice_id=voice_id
-    )
+        topic=topic
+    ).to_dict()
 
-    # If using Redis, queue the task for processing
-    if redis_manager:
-        task_data = {
-            "task_id": task_id,
-            "topic": topic,
-            "sources_folder": sources_folder,
-            "voice_id": voice_id
-        }
-        redis_manager.enqueue_task(task_data)
-        _logger.info(f"Task {task_id} queued for processing")
-    else:
-        # Process the task immediately (synchronously - not ideal for production)
-        _logger.warning("Redis disabled. Processing task synchronously (not recommended for production)")
-        # Start processing in background thread
-        import threading
-        thread = threading.Thread(
-            target=process_story_task,
-            args=(task_id, topic, sources_folder, voice_id)
-        )
-        thread.daemon = True
-        thread.start()
+    task_data_payload = {
+        "job_id": task_id,
+        "job_type": "generate_story",
+        "topic": topic,
+        "sources_folder": sources_folder,
+        "voice_id": voice_id,
+        "include_storyboard": include_storyboard,
+        "request_time": time.time()
+    }
 
-    return task.to_dict()
-
-
-def process_story_task(task_id: str, topic: str, sources_folder: Optional[str] = None,
-                      voice_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Process a story generation task.
-
-    Args:
-        task_id: Unique task ID
-        topic: Topic for the story
-        sources_folder: Optional folder with source files
-        voice_id: Optional voice ID for ElevenLabs
-
-    Returns:
-        Dict with task results
-    """
-    start_exec = time.time()
     try:
-        # Update task status
-        if redis_manager:
-            redis_manager.update_task_status(task_id, "processing")
+        message_broker = get_message_broker()
+        message_broker.ensure_stream_exists("api_jobs")
 
-        # Process any queued failed audio generations
-        process_audio_queue()
+        message_id = message_broker.publish_message(task_data_payload)
+        success = message_id is not None
+    except Exception as e:
+        _logger.error(f"Failed to publish task to Redis Stream: {e}")
+        success = False
 
-        raw_sources = None
-        # Read all the files from the sources folder into one combined text
-        if sources_folder and len(sources_folder) >= 1:
-            _logger.debug(f"Reading all files in folder '{sources_folder}' for sources...")
-            raw_sources = _read_sources_from_folder(sources_folder)
+    if success:
+        _logger.info(f"Task {task_id} queued successfully via Redis Stream for topic: '{topic}'.")
+        task_response["status"] = "queued"
+    else:
+        _logger.error(f"Failed to queue task {task_id} via Redis Stream.")
+        raise RuntimeError("Failed to add task to Redis Stream.")
 
-        # Chunkify & Summarize them into a single cohesive summary
-        if raw_sources and raw_sources.strip():
-            _logger.debug("Splitting & summarizing sources via LLM (multi-chunk)...")
-            cleansed_sources = chunkify_and_summarize(
-                raw_sources=raw_sources,
-                endpoint=appconfig.llm.ENDPOINT,
-                model=appconfig.llm.MODEL,
-                temperature=appconfig.llm.TEMPERATURE,
-                chunk_size=appconfig.llm.CHUNK_SIZE
-            )
-            _logger.debug("Sources cleansed. Proceeding with story generation...")
+    return task_response
+
+def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Get the status of a task. Checks Redis Streams first, then final storage
+    if the task is marked completed or not found in Redis.
+    Returns a dictionary conforming to JobStatusResponse or None if not found.
+    """
+    status_source = "unknown"
+    try:
+        message_broker = get_message_broker()
+        stream_status = message_broker.get_job_status(task_id)
+        final_result_data = {}
+
+        if stream_status:
+            status_source = "redis"
+            _logger.debug(f"Stream status for task {task_id}: {json.dumps(stream_status, indent=2)}")
+            current_status = stream_status.get("status", "pending")
+
+            # If completed according to Redis, try fetching final results from storage
+            if current_status == "completed":
+                try:
+                    final_result_data = storage_manager.get_story_metadata(task_id) or {}
+                    if not final_result_data:
+                         _logger.warning(f"Task {task_id} status is 'completed' in Redis, but final metadata not found/empty in storage.")
+                    else:
+                         _logger.info(f"Fetched final metadata for completed task {task_id} from storage.")
+                except FileNotFoundError:
+                    _logger.warning(f"Task {task_id} status is 'completed' in Redis, but final metadata file not found in storage.")
+                    final_result_data = {"error": "Completed task metadata file not found in storage."}
+                except Exception as storage_err:
+                    _logger.error(f"Error fetching final metadata for completed task {task_id} from storage: {storage_err}")
+                    final_result_data = {"error": f"Failed to fetch final results from storage: {storage_err}"}
+
+            status_data = {
+                "status": current_status,
+                "job_id": stream_status.get("job_id", task_id),
+                "message": stream_status.get("message", f"Job status from Redis Stream ({current_status})"),
+                "created_at": stream_status.get("created_at") or stream_status.get("timestamp"),
+                "updated_at": stream_status.get("updated_at") or stream_status.get("timestamp"),
+                "error": stream_status.get("error"),
+                "story_script": stream_status.get("story_script") or stream_status.get("result"),
+                "storyboard": stream_status.get("storyboard"),
+                "audio_url": stream_status.get("audio_url"),
+                "sources": stream_status.get("sources"),
+            }
+
+            # Merge/Overwrite with final data if available
+            if final_result_data:
+                status_data["story_script"] = final_result_data.get("story_script", status_data["story_script"])
+                status_data["storyboard"] = final_result_data.get("storyboard", status_data["storyboard"])
+                status_data["audio_url"] = final_result_data.get("audio_url", status_data["audio_url"])
+                status_data["sources"] = final_result_data.get("sources", status_data["sources"])
+                storage_error = final_result_data.get("error")
+                if storage_error:
+                     # Combine Redis error (if any) and storage error
+                     existing_error = status_data.get("error")
+                     combined_error = f"{existing_error}; {storage_error}" if existing_error else storage_error
+                     status_data["error"] = combined_error
+                     status_data["message"] = f"Job status from Redis ({current_status}). Error fetching final results: {storage_error}"
+                elif current_status == "completed":
+                     status_data["message"] = final_result_data.get("message", "Job completed and final results retrieved from storage.") # Update message if completed successfully
+
+                status_data["created_at"] = final_result_data.get("created_at", status_data["created_at"])
+                status_data["updated_at"] = final_result_data.get("updated_at", status_data["updated_at"])
+
+
+            response = JobStatusResponse(**status_data).model_dump(exclude_none=True)
+            return response
+
         else:
-            _logger.debug("No sources found. Skipping cleansing step.")
-            cleansed_sources = ""
-
-        # Generate the story script from these cleansed/merged sources
-        result = generate_story_script(
-            topic=topic,
-            sources=cleansed_sources,
-            endpoint=appconfig.llm.ENDPOINT,
-            model=appconfig.llm.MODEL,
-            temperature=appconfig.llm.TEMPERATURE,
-            show_thinking=appconfig.llm.SHOW_THINKING
-        )
-
-        # Save the final outputs including audio generation
-        file_paths = _save_story_output(result, topic, voice_id=voice_id)
-
-        # Prepare the final result
-        task_result = {
-            "task_id": task_id,
-            "topic": topic,
-            "status": "completed",
-            "result": {
-                "story": result.get("story", ""),
-                "video_description": result.get("video_description", ""),
-                "storyboard": result.get("storyboard", {}),
-            },
-            "file_paths": file_paths,
-            "processing_time": time.time() - start_exec
-        }
-
-        # Convert to StoryGenerationResult model if needed
-        story_result = {
-            "story_script": result.get("story", ""),
-            "storyboard": result.get("storyboard", {}),
-            "sources": [sources_folder] if sources_folder else []
-        }
-
-        # Add audio URL if available
-        if file_paths.get("audio"):
-            story_result["audio_url"] = f"/audio/{os.path.basename(file_paths['audio'])}"
-
-        # Update Redis if enabled
-        if redis_manager:
-            redis_manager.update_task_result(task_id, task_result)
-
-        return task_result
+            # Task ID not found in Redis Streams, check final storage directly
+            status_source = "storage"
+            _logger.debug(f"Task ID {task_id} not found in Redis Streams. Checking final storage.")
+            try:
+                final_result_data = storage_manager.get_story_metadata(task_id)
+                if final_result_data:
+                    _logger.info(f"Task {task_id} not found in Redis, but found completed results in storage.")
+                    status_data = {
+                        "status": final_result_data.get("status", "completed"),
+                        "job_id": task_id,
+                        "message": final_result_data.get("message", "Job status retrieved from final storage (not found in Redis)."),
+                        "story_script": final_result_data.get("story_script"),
+                        "storyboard": final_result_data.get("storyboard"),
+                        "audio_url": final_result_data.get("audio_url"),
+                        "sources": final_result_data.get("sources"),
+                        "error": final_result_data.get("error"),
+                        "created_at": final_result_data.get("created_at"),
+                        "updated_at": final_result_data.get("updated_at"),
+                    }
+                    response = JobStatusResponse(**status_data).model_dump(exclude_none=True)
+                    return response
+                else:
+                    # Not found in Redis or storage
+                     _logger.debug(f"Task ID {task_id} not found in Redis Streams or final storage.")
+                     return None
+            except FileNotFoundError:
+                 _logger.debug(f"Task ID {task_id} metadata file not found in storage (after Redis miss).")
+                 return None
+            except Exception as storage_err:
+                 _logger.error(f"Error checking storage for task {task_id} after Redis miss: {storage_err}")
+                 return {"status": "error", "message": f"Error checking storage for job status: {str(storage_err)}", "task_id": task_id}
 
     except Exception as e:
-        error_msg = f"Error processing task {task_id}: {str(e)}"
-        _logger.error(error_msg)
+        _logger.exception(f"Error retrieving task status for {task_id} (source: {status_source}): {e}")
+        error_response = {"status": "error", "message": f"Failed to retrieve task status: {str(e)}", "task_id": task_id}
+        try:
+            return JobStatusResponse(**error_response).model_dump(exclude_none=True)
+        except Exception:
+            return error_response
 
-        # Update task status in Redis
-        if redis_manager:
-            redis_manager.update_task_error(task_id, error_msg)
-
-        return {
-            "task_id": task_id,
-            "topic": topic,
-            "status": "failed",
-            "error": error_msg
-        }
-
-
-def get_task_status(task_id: str) -> Dict[str, Any]:
+# --- Audio Queue Processing (Called periodically or by cleanup task) ---
+def process_audio_queue():
     """
-    Get the status of a task.
-
-    Args:
-        task_id: The ID of the task to check
-
-    Returns:
-        Dict with task status information that can be converted to JobStatusResponse
+    Scans AUDIO_QUEUE_DIR for failed jobs and retries audio generation.
+    NOTE: This relies on local filesystem queuing, which is less robust than Redis.
+    TODO: Consider integrating audio retry logic into the Redis task flow if possible.
     """
-    if not redis_manager:
-        return {"error": "Task tracking unavailable without Redis", "status": "failed"}
+    audio_queue_dir = appconfig.AUDIO_QUEUE_DIR
+    if not os.path.isdir(audio_queue_dir):
+        _logger.debug("Audio queue directory not found, skipping processing.")
+        return
 
-    result = redis_manager.get_task_status(task_id)
+    _logger.info(f"Checking for queued audio jobs in: {audio_queue_dir}")
+    api_key = appconfig.elevenLabs.API_KEY
+    if not api_key:
+        _logger.error("Cannot process audio queue: ElevenLabs API Key not configured.")
+        return
 
-    # Ensure the result matches the JobStatusResponse model structure
-    if result and "status" in result:
-        # Make sure all required fields from JobStatusResponse are present
-        if "message" not in result:
-            result["message"] = None
-        if result["status"] == "completed" and "result" in result:
-            # Extract story data from the result
-            result["story_script"] = result.get("result", {}).get("story")
-            result["storyboard"] = result.get("result", {}).get("storyboard")
+    processed_count = 0
+    failed_count = 0
+    from .elevenlabs_tts import generate_elevenlabs_audio # Local import
 
-            # Add audio URL if available
-            if "file_paths" in result and result["file_paths"].get("audio"):
-                result["audio_url"] = f"/audio/{os.path.basename(result['file_paths']['audio'])}"
-            else:
-                result["audio_url"] = None
+    for filename in os.listdir(audio_queue_dir):
+        if filename.endswith(".json"):
+            file_path = os.path.join(audio_queue_dir, filename)
+            _logger.debug(f"Processing queued audio file: {filename}")
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
 
-            # Add sources data
-            result["sources"] = [result.get("sources_folder")] if result.get("sources_folder") else []
+                # Basic validation of metadata
+                if not all(k in metadata for k in ["story", "mp3_file_path"]):
+                     _logger.warning(f"Skipping invalid queue file {filename}: missing required keys.")
+                     # Optionally move/delete invalid file
+                     continue
 
-    return result
+                # Attempt regeneration
+                success = generate_elevenlabs_audio(
+                    text=metadata["story"],
+                    api_key=api_key,
+                    output_mp3_path=metadata["mp3_file_path"], # Assumes original path is still valid
+                    voice_id=metadata.get("voice_id"),
+                    model_id=metadata.get("model_id", "eleven_multilingual_v2"),
+                    stability=metadata.get("stability", 0.5),
+                    similarity_boost=metadata.get("similarity_boost", 0.75)
+                )
+
+                if success:
+                    _logger.info(f"Queued audio generated successfully for {metadata.get('mp3_file_path')}. Removing queue file.")
+                    processed_count += 1
+                    try:
+                        os.remove(file_path)
+                    except OSError as e:
+                        _logger.error(f"Failed to remove queue file {file_path}: {e}")
+                else:
+                    _logger.warning(f"Queued audio generation attempt failed for {metadata.get('mp3_file_path')}. Will retry later.")
+                    failed_count += 1
+
+            except json.JSONDecodeError:
+                 _logger.error(f"Error reading queued file {file_path}: Invalid JSON.")
+                 # Optionally move/delete invalid file
+            except Exception as e:
+                _logger.exception(f"Unexpected error processing queue file {file_path}: {e}")
+
+    if processed_count > 0 or failed_count > 0:
+         _logger.info(f"Audio queue processing finished. Successful: {processed_count}, Failed attempts: {failed_count}")

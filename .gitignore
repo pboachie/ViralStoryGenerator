@@ -8,3 +8,6 @@ __pycache__
 *_cache.db*
 /build/*
 build/*
+*.log
+*.sqlite3
+storage/*

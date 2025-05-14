@@ -29,8 +29,5 @@ RUN apt-get update && \
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 
-# Expose the port the app runs on
-EXPOSE 8000
-
-# Default command runs the API server
-CMD ["python3", "-m", "viralStoryGenerator.src.worker_runner", "api", "--host", "0.0.0.0", "--port", "8000"]
+# Command to run the worker
+CMD ["python3", "-m", "viralStoryGenerator.src.worker_runner", "worker", "--worker-type", "queue"]

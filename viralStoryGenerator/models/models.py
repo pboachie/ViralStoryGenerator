@@ -1,15 +1,46 @@
 #!/usr/bin/env python
 # viralStoryGenerator/models/models.py
 
-from typing import Dict, Any, Optional, List, Union
-from pydantic import BaseModel, AnyHttpUrl, Field, field_validator
+from typing import Dict, Any, Optional, List, Union, Tuple
+from pydantic import BaseModel, AnyHttpUrl, Field, HttpUrl, field_validator, RootModel
 from viralStoryGenerator.utils.config import config as app_config
+
+
+class URLMetadata(BaseModel):
+    url: Union[AnyHttpUrl, str]
+    final_url: Optional[Union[AnyHttpUrl, str]] = None
+    status: str = "pending"  # e.g., pending, success, error
+    markdown_content: Optional[str] = None
+    html_content: Optional[str] = None
+    raw_html_snippet: Optional[str] = None #
+    title: Optional[str] = None
+    description: Optional[str] = None
+    metadata_payload: Optional[Dict[str, Any]] = Field(default=None, alias="metadata")
+    error: Optional[str] = None
+    processing_time_seconds: Optional[float] = None
+    screenshot_path: Optional[str] = None
+    screenshot_url: Optional[AnyHttpUrl] = None
+    screenshot_base64: Optional[str] = None
+    pdf_path: Optional[str] = None
+    pdf_url: Optional[AnyHttpUrl] = None
+    mhtml_path: Optional[str] = None
+    mhtml_url: Optional[AnyHttpUrl] = None
+    job_id: Optional[str] = None
+    dispatch_task_id: Optional[str] = None
+    dispatch_memory_usage: Optional[Any] = None
+    dispatch_duration_seconds: Optional[float] = None
+    all_meta_tags: Optional[Dict[str, str]] = None
+    image_url: Optional[AnyHttpUrl] = None
+
+    class Config:
+        populate_by_name = True # Allows using alias "metadata" for "metadata_payload"
 
 class StoryGenerationRequest(BaseModel):
     """Request model for generating a story from URLs"""
     urls: List[AnyHttpUrl] = Field(..., description="List of URLs to parse for content", max_items=10)
     topic: str = Field(..., description="Topic for the story", min_length=1, max_length=500)
     generate_audio: bool = Field(False, description="Whether to generate audio")
+    include_images: bool = Field(False, description="Whether to generate images for storyboard")
     temperature: Optional[float] = Field(None, description="LLM temperature", ge=0.0, le=1.0)
     chunk_size: Optional[int] = Field(None, description="Word chunk size for splitting sources", ge=50, le=5000)
 
@@ -85,5 +116,111 @@ class JobStatusResponse(BaseModel):
     audio_url: Optional[str] = Field(None, description="URL to the generated audio file if completed")
     sources: Optional[List[str]] = Field(None, description="Sources used to generate the story")
     error: Optional[str] = Field(None, description="Error message if failed")
-    created_at: Optional[float] = Field(None, description="Timestamp when job was created")
-    updated_at: Optional[float] = Field(None, description="Timestamp when job was last updated")
+    created_at: Optional[str] = Field(None, description="Timestamp when job was created")
+    updated_at: Optional[str] = Field(None, description="Timestamp when job was last updated")
+
+class StoryboardScene(BaseModel):
+    scene_number: int = Field(..., description="Scene number")
+    narration_text: str = Field(..., description="Narration text")
+    image_prompt: str = Field(..., description="Image prompt")
+    duration: float = Field(..., description="Duration in seconds")
+    start_time: float = Field(..., description="Start time in seconds")
+
+class StoryboardResponse(BaseModel):
+    scenes: List[StoryboardScene] = Field(..., description="List of scenes in storyboard")
+
+class ScrapeJobRequest(BaseModel):
+    job_id: str = Field(..., description="Unique job identifier for the scrape request")
+    urls: List[str] = Field(..., description="List of URLs to scrape")
+    browser_config: Optional[Dict[str, Any]] = Field(None, description="Optional browser configuration")
+    run_config: Optional[Dict[str, Any]] = Field(None, description="Optional crawler run configuration")
+    request_time: float = Field(..., description="Timestamp when the scrape request was created")
+
+class ScrapeJobResult(BaseModel):
+    status: str = Field(..., description="Job status: processing, completed, or failed")
+    message: Optional[str] = Field(None, description="Update or status message")
+    error: Optional[str] = Field(None, description="Error details if the job failed")
+    data: Optional[List[Tuple[str, Optional[str]]]] = Field(None, description="List of scraped results (url and content)")
+    created_at: float = Field(..., description="Timestamp when the job was created")
+    updated_at: float = Field(..., description="Timestamp when the job was last updated")
+
+class ClearStalledJobsResponse(BaseModel):
+    message: str
+    claimed_count: int
+    failed_count: int
+    reprocessed_count: int
+
+class SuccessResponse(BaseModel):
+    message: str
+    detail: Optional[str] = None
+
+class FailureResponse(BaseModel):
+    error: str
+    detail: Optional[str] = None
+
+class QueueConsumerDetail(BaseModel):
+    name: str
+    pending: Optional[int]
+    idle: Optional[int]
+
+class QueueConsumerGroup(BaseModel):
+    group_name: str
+    pending: Optional[int]
+    consumers: int
+    consumer_details: List[QueueConsumerDetail]
+
+class QueueRecentMessage(BaseModel):
+    id: str
+    timestamp: str
+    job_id: Optional[str]
+    status: str
+    is_system_message: Optional[bool] = False
+
+class QueueStreamStatus(BaseModel):
+    stream_length: int
+    consumer_groups: List[QueueConsumerGroup]
+    recent_messages: List[QueueRecentMessage]
+
+class AllQueueStatusResponse(RootModel):
+    root: Dict[str, QueueStreamStatus]
+
+class QueueStatusResponse(BaseModel):
+    status: str
+    stream_length: int
+    consumer_groups: List[QueueConsumerGroup]
+    recent_messages: List[QueueRecentMessage]
+
+class SingleQueueStatusResponse(BaseModel):
+    status: str = "available"
+    stream_name: str
+    stream_length: int
+    consumer_groups: List[Dict[str, Any]]
+    recent_messages: List[QueueRecentMessage]
+
+STORYBOARD_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "storyboard_response",
+        "strict": "true",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "scenes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "scene_number": {"type": "integer"},
+                            "scene_start_marker": {"type": "string", "description": "The exact first 5-10 words of the scene text."},
+                            "image_prompt": {"type": "string"},
+                            "duration": {"type": "number"},
+                            "start_time": {"type": "number"}
+                        },
+                        "required": ["scene_number", "scene_start_marker", "image_prompt", "duration", "start_time"]
+                    }
+                }
+            },
+            "required": ["scenes"]
+        }
+    }
+}
