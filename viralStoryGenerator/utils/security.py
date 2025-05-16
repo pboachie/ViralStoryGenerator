@@ -12,47 +12,63 @@ from viralStoryGenerator.utils.config import config as app_config
 import viralStoryGenerator.src.logger
 _logger = logging.getLogger(__name__)
 
-def is_safe_filename(filename: str) -> bool:
+def is_safe_filename(path_or_filename: str) -> bool:
     """
-    Validate that a filename is safe and doesn't contain path traversal
-    or other potentially harmful patterns. Allows typical filename characters.
+    Validate that the basename of a given path or filename string is safe.
+    It checks the component after the last path separator.
+    Allows typical filename characters (alphanumeric, underscore, hyphen, period).
+    Disallows path traversal ('..') in the basename component.
 
     Args:
-        filename: The filename to validate
+        path_or_filename: The string to extract the basename from and validate.
 
     Returns:
-        bool: True if the filename is safe, False otherwise
+        bool: True if the extracted basename is safe, False otherwise
     """
-    if not filename:
+    if not path_or_filename:
+        _logger.debug(f"Input to is_safe_filename is empty.")
         return False
 
-    # 1. Check for path traversal or separators
-    if '..' in filename or '/' in filename or '\\' in filename:
-        _logger.debug(f"Unsafe filename detected (path traversal): {filename}")
+    # Extract the basename component for validation
+    filename_component = os.path.basename(path_or_filename)
+
+    if not filename_component: # e.g. from os.path.basename("/") -> ""
+        _logger.debug(f"Extracted basename from '{path_or_filename}' is empty.")
+        return False
+
+    # 1. Check for '..' explicitly in the extracted component.
+    #    os.path.basename will preserve '..' if it's the component (e.g. "foo/..")
+    #    A basename component should not be '..'.
+    #    Also check for path separators, which might appear if os.path.basename encounters unusual input
+    #    or on certain OS edge cases (e.g. os.path.basename("foo/bar\\baz") on POSIX -> "bar\\baz").
+    if '..' in filename_component or '/' in filename_component or '\\' in filename_component:
+        _logger.debug(f"Unsafe basename detected (path traversal or separators in component '{filename_component}' from input '{path_or_filename}')")
         return False
 
     # 2. Check for null bytes
-    if '\0' in filename:
-        _logger.debug(f"Unsafe filename detected (null byte): {filename}")
+    if '\0' in filename_component:
+        _logger.debug(f"Unsafe basename detected (null byte in component '{filename_component}' from input '{path_or_filename}')")
         return False
 
     # 3. Check character whitelist (allow alphanumeric, underscore, hyphen, period)
     # Allows for common filename patterns like 'my-file_v2.txt'
+    # Note: os.path.basename('.') is '.', os.path.basename('..') is '..'
+    # '..' is caught by the specific check above. '.' is generally a safe filename component.
     pattern = re.compile(r'^[a-zA-Z0-9_\-\.]+$')
-    if not pattern.match(filename):
-        _logger.debug(f"Unsafe filename detected (invalid characters): {filename}")
+    if not pattern.match(filename_component):
+        _logger.debug(f"Unsafe basename detected (invalid characters in component '{filename_component}' from input '{path_or_filename}')")
         return False
 
     # 4. Optional: Check for reserved filenames on different OS (e.g., CON, PRN on Windows)
     # reserved_windows = {'CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'LPT1'}
-    # if os.name == 'nt' and filename.upper().split('.')[0] in reserved_windows:
-    #    _logger.debug(f"Unsafe filename detected (reserved name): {filename}")
+    # if os.name == 'nt' and filename_component.upper().split('.')[0] in reserved_windows:
+    #    _logger.debug(f"Unsafe basename detected (reserved name '{filename_component}' from input '{path_or_filename}')")
     #    return False
 
     # 5. Optional: Check length
     MAX_FILENAME_LENGTH = 255 # Common filesystem limit
-    if len(filename) > MAX_FILENAME_LENGTH:
-         _logger.debug(f"Unsafe filename detected (too long): {filename}")
+    if len(filename_component) > MAX_FILENAME_LENGTH:
+         _logger.debug(f"Unsafe basename detected (component '{filename_component}' from input '{path_or_filename}' is too long)")
          return False
 
     return True
@@ -136,7 +152,7 @@ def is_valid_voice_id(voice_id: Optional[str]) -> bool:
 
 
 def sanitize_input(input_string: Optional[str],
-                  max_length: int = None,
+                  max_length: Optional[int] = None,
                   remove_chars: Optional[List[str]] = None) -> str:
     """
     Basic sanitization for user input strings. Primarily truncates length

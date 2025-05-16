@@ -140,6 +140,11 @@ async def process_api_jobs(group_name: str, consumer_name: str):
                 tasks = []
 
                 for message_id, message_data in stream_messages:
+                    if not isinstance(message_data, dict):
+                        _logger.warning(f"Skipping message {message_id}: message_data is not a dict ({type(message_data)})")
+                        message_broker.acknowledge_message(group_name, message_id)
+                        continue
+
                     job_data = {
                         k.decode() if isinstance(k, bytes) else k:
                         v.decode() if isinstance(v, bytes) else v
@@ -152,7 +157,7 @@ async def process_api_jobs(group_name: str, consumer_name: str):
                         message_broker.acknowledge_message(group_name, message_id)
                         continue
 
-                    # Basic validation - check if we have job_id and job_type
+                    # Check if we have job_id and job_type
                     job_id = job_data.get("job_id")
                     job_type = job_data.get("job_type")
 

@@ -39,10 +39,14 @@ class StoryGenerationRequest(BaseModel):
     """Request model for generating a story from URLs"""
     urls: List[AnyHttpUrl] = Field(..., description="List of URLs to parse for content")
     topic: str = Field(..., description="Topic for the story", min_length=1, max_length=500)
-    generate_audio: bool = Field(False, description="Whether to generate audio")
-    include_images: bool = Field(False, description="Whether to generate images for storyboard")
+    generate_audio: bool = Field(False, description="Whether to generate audio (overall toggle)")
+    include_images: bool = Field(False, description="Whether to include images (overall toggle)")
     temperature: Optional[float] = Field(None, description="LLM temperature", ge=0.0, le=1.0)
     chunk_size: Optional[int] = Field(None, description="Word chunk size for splitting sources", ge=50, le=5000)
+    voice_id: Optional[str] = Field(None, description="Voice ID for audio generation, if specific voice is requested.")
+    include_storyboard: Optional[bool] = Field(None, description="Whether to generate a storyboard. Overrides global config if set.")
+    custom_prompt: Optional[str] = Field(None, description="Custom prompt for the LLM.")
+    output_format: Optional[str] = Field(None, description="Desired output format (e.g., 'standard', 'script_only').")
 
     class Config:
         validate_assignment = True
@@ -163,10 +167,11 @@ class QueueConsumerDetail(BaseModel):
     idle: Optional[int]
 
 class QueueConsumerGroup(BaseModel):
-    group_name: str
-    pending: Optional[int]
+    name: str
+    pending_messages: Optional[int]
     consumers: int
     consumer_details: List[QueueConsumerDetail]
+    last_delivered_id: Optional[str] = None
 
 class QueueRecentMessage(BaseModel):
     id: str
@@ -180,20 +185,23 @@ class QueueStreamStatus(BaseModel):
     consumer_groups: List[QueueConsumerGroup]
     recent_messages: List[QueueRecentMessage]
 
-class AllQueueStatusResponse(RootModel):
-    root: Dict[str, QueueStreamStatus]
+class SingleQueueStatusResponse(BaseModel):
+    queue_name: str
+    status: str = "available"
+    stream_length: int
+    consumer_groups: List[QueueConsumerGroup]
+    recent_messages: List[QueueRecentMessage]
+    consumer_groups_count: Optional[int] = None
+    recent_messages_count: Optional[int] = None
+    error_message: Optional[str] = None
+
+class AllQueueStatusResponse(RootModel[Dict[str, SingleQueueStatusResponse]]):
+    pass
 
 class QueueStatusResponse(BaseModel):
     status: str
     stream_length: int
     consumer_groups: List[QueueConsumerGroup]
-    recent_messages: List[QueueRecentMessage]
-
-class SingleQueueStatusResponse(BaseModel):
-    status: str = "available"
-    stream_name: str
-    stream_length: int
-    consumer_groups: List[Dict[str, Any]]
     recent_messages: List[QueueRecentMessage]
 
 STORYBOARD_RESPONSE_FORMAT = {

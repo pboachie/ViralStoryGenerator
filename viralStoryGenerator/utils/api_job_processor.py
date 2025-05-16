@@ -52,9 +52,46 @@ async def process_api_job(job_data: Dict[str, Any], consumer_name: str, group_na
                 _logger.warning(f"Message {job_id} has no valid URLs, acknowledging and skipping")
                 message_broker.track_job_progress(job_id, "failed", {"error": "No valid URLs provided"})
                 return False
-            topic = job_data.get("topic", None)
-            temperature = job_data.get("temperature", app_config.llm.TEMPERATURE)
+
+            topic_val = job_data.get("topic")
+            topic_str: str
+            if topic_val is None:
+                _logger.warning(f"Job {job_id}: 'topic' is missing or None in job_data. Using default 'General Topic'.")
+                topic_str = "General Topic"
+            elif not isinstance(topic_val, str):
+                _logger.warning(f"Job {job_id}: 'topic' is not a string (type: {type(topic_val)} value: '{topic_val}'). Converting to string.")
+                topic_str = str(topic_val)
+            else:
+                topic_str = topic_val
+
+            raw_temp = job_data.get("temperature")
+            temperature: float
+            default_temp_from_config = app_config.llm.TEMPERATURE
+            final_default_temp = 0.9
+
+            if default_temp_from_config is not None:
+                try:
+                    final_default_temp = float(default_temp_from_config)
+                except (ValueError, TypeError):
+                    _logger.warning(f"Job {job_id}: Invalid default temperature in config '{default_temp_from_config}'. Using {final_default_temp}.")
+
+            if raw_temp is not None:
+                try:
+                    temperature = float(raw_temp)
+                except (ValueError, TypeError):
+                    _logger.warning(f"Job {job_id}: Invalid temperature value '{raw_temp}' in job_data. Defaulting to {final_default_temp}.")
+                    temperature = final_default_temp
+            else:
+                temperature = final_default_temp
+
             voice_id = job_data.get("voice_id")
+
+            # Validate essential LLM configurations for story script generation
+            llm_model_script = app_config.llm.MODEL
+            if llm_model_script is None:
+                _logger.error(f"Job {job_id}: LLM_MODEL for script generation is not configured in app_config.")
+                message_broker.track_job_progress(job_id, "failed", {"error": "LLM_MODEL for script is not configured."})
+                return False
 
             # --- Scraping --- >
             message_broker.track_job_progress(
@@ -68,7 +105,7 @@ async def process_api_job(job_data: Dict[str, Any], consumer_name: str, group_na
                 _logger.info(f"Job {job_id}: Queuing scrape request for {len(urls)} URLs.")
                 scrape_job_id = await queue_scrape_request(
                     urls,
-                    user_query_for_bm25=topic,
+                    user_query_for_bm25=topic_str,
                     wait_for_result=True,
                     timeout=app_config.httpOptions.TIMEOUT
                 )
@@ -103,23 +140,34 @@ async def process_api_job(job_data: Dict[str, Any], consumer_name: str, group_na
             cleaned_scraped_content = []
             if scraped_content:
                 for content_item in scraped_content:
-                    cleaned_data = clean_markdown_with_llm(content_item)
-                    if cleaned_data:
-                        cleaned_data, thinking = _extract_chain_of_thought(cleaned_data)
-                        _logger.debug(f"Extracted thinking block: {thinking[:100]}...")
-                    cleaned_scraped_content.append(cleaned_data)
+                    if not content_item or not isinstance(content_item, str):
+                        continue
+                    cleaned_data_str = clean_markdown_with_llm(content_item)
+                    if cleaned_data_str:
+                        cleaned_data_text, thinking = _extract_chain_of_thought(cleaned_data_str)
+                        _logger.debug(f"Extracted thinking block for item: {thinking[:100]}...")
+                        if cleaned_data_text and isinstance(cleaned_data_text, str):
+                           cleaned_scraped_content.append(cleaned_data_text)
 
-            if not cleaned_scraped_content and urls:
-                message_broker.track_job_progress(job_id, "failed", {"error": "Content cleaning step failed for all items."})
-                return False
-
-            _logger.info(f"Job {job_id}: Content cleaning completed. {len(cleaned_scraped_content)} items processed.")
+            _logger.info(f"Job {job_id}: Content cleaning completed. {len(cleaned_scraped_content)} items processed into clean text.")
             # < --- End Clean Scraped contents --- >
 
-            rag_context = cleaned_scraped_content
+            rag_context_str: str
 
-            if len(rag_context) >= app_config.llm.MAX_TOKENS:
-                _logger.warning(f"Job {job_id}: Content length exceeds LLM token limit. Using Chunking with vector DB (RAG) instead.")
+            # Estimate token count for RAG decision (very rough estimate)
+            # Average token length is ~4 chars. Max tokens usually refers to input+output.
+            # Let's assume input context should be somewhat less than MAX_TOKENS.
+            estimated_chars = sum(len(item) for item in cleaned_scraped_content)
+            # A common heuristic: 1 token ~ 4 chars in English.
+            # Or, for safety, assume fewer chars per token if non-English or code-heavy.
+            # Let's use a simple char count against a threshold derived from MAX_TOKENS.
+            # If MAX_TOKENS is 4096, maybe threshold is 10000 chars.
+            # For now, using a direct character count against a scaled MAX_TOKENS.
+            # This needs to be tuned. Let's say MAX_CHARS_BEFORE_RAG = app_config.llm.MAX_TOKENS * 2.5 (conservative char estimate)
+            max_chars_before_rag = (app_config.llm.MAX_TOKENS or 8000) * 2.5
+
+            if cleaned_scraped_content and estimated_chars > max_chars_before_rag:
+                _logger.warning(f"Job {job_id}: Estimated content characters ({estimated_chars}) exceeds threshold ({max_chars_before_rag}). Using Chunking with vector DB (RAG).")
 
                 # --- Chunking & Vector DB Storage (RAG) ---
                 message_broker.track_job_progress(
@@ -151,15 +199,29 @@ async def process_api_job(job_data: Dict[str, Any], consumer_name: str, group_na
                 if all_chunks:
                     query_results = query_collection(
                         collection_name,
-                        query_texts=[topic],
+                        query_texts=[topic_str],
                         n_results=app_config.rag.RELEVANT_CHUNKS_COUNT
                     )
-                    relevant_chunks = query_results.get("documents", [])[0] if query_results.get("documents") else []
+                    docs_from_query = query_results.get("documents")
+                    if docs_from_query and isinstance(docs_from_query, list) and len(docs_from_query) > 0 and isinstance(docs_from_query[0], list):
+                        relevant_chunks = [str(chunk) for chunk in docs_from_query[0] if chunk is not None]
+
                 if relevant_chunks:
-                    rag_context = "\n\n".join(relevant_chunks)
+                    rag_context_str = "\n\n".join(relevant_chunks)
+                    _logger.info(f"Job {job_id}: Using {len(relevant_chunks)} relevant chunks from RAG for context.")
+                elif cleaned_scraped_content:
+                    _logger.warning(f"Job {job_id}: RAG retrieval yielded no relevant chunks. Falling back to using all cleaned content.")
+                    rag_context_str = "\n\n".join(cleaned_scraped_content)
+                else: # No RAG chunks and no cleaned content (should be rare if this path is taken)
+                    rag_context_str = ""
+            else: # Content length is within limits or no content, no RAG needed
+                if cleaned_scraped_content:
+                    rag_context_str = "\n\n".join(cleaned_scraped_content)
+                    _logger.info(f"Job {job_id}: Using all {len(cleaned_scraped_content)} cleaned content items directly (char count: {estimated_chars}).")
                 else:
-                    rag_context = "\n\n".join(cleaned_scraped_content)
-                # < --- End RAG Retrieval ---
+                    rag_context_str = ""
+                    _logger.info(f"Job {job_id}: No scraped content available for LLM context.")
+            # < --- End RAG Retrieval / Direct Context Preparation ---
 
             # --- LLM Processing --- >
             message_broker.track_job_progress(
@@ -167,14 +229,14 @@ async def process_api_job(job_data: Dict[str, Any], consumer_name: str, group_na
                 "processing",
                 {"message": "Generating story script with LLM", "progress": 40}
             )
-            _logger.debug(f"Job {job_id}: Processing scraped content with LLM. Scraped content: {rag_context[:25]}")
+            _logger.debug(f"Job {job_id}: Processing content with LLM. Topic: '{topic_str}', Temperature: {temperature}, Model: {llm_model_script}. Context preview: '{rag_context_str[:100]}...'")
 
             llm_result = process_with_llm(
-                topic=topic,
+                topic=topic_str,
                 temperature=temperature,
-                model=app_config.llm.MODEL,
+                model=llm_model_script,
                 system_prompt=get_system_instructions(),
-                user_prompt=get_user_prompt(topic, rag_context)
+                user_prompt=get_user_prompt(topic_str, rag_context_str)
             )
             if not llm_result:
                  _logger.error(f"Job {job_id}: LLM processing returned empty result.")
@@ -221,34 +283,66 @@ async def process_api_job(job_data: Dict[str, Any], consumer_name: str, group_na
 
             # --- Storyboard Generation --- >
             storyboard_data = None
-            message_broker.track_job_progress(
-                job_id,
-                "processing",
-                {"message": "Generating storyboard (including images/audio if enabled)", "progress": 60}
-            )
-            try:
-                storyboard_data = generate_storyboard(
-                    story=llm_result,
-                    topic=topic,
-                    task_id=job_id,
-                    llm_endpoint=app_config.llm.ENDPOINT,
-                    temperature=temperature,
-                    voice_id=voice_id
-                )
-                if storyboard_data:
-                    _logger.info(f"Job {job_id}: Storyboard generation completed.")
-                    storyboard_info = {
-                        "file_path": storyboard_data.get("storyboard_file"),
-                        "url": storyboard_data.get("storyboard_url"),
-                        "provider": storage_manager.provider # Assume same provider
-                    }
-                else:
-                    _logger.warning(f"Job {job_id}: Storyboard generation returned None. Proceeding without storyboard.")
-                    message_broker.track_job_progress(job_id, "processing", {"message": "Storyboard generation failed or skipped", "progress": 90})
+            storyboard_info = None
+            sb_err = None
 
-            except Exception as sb_err:
-                 _logger.exception(f"Job {job_id}: Error during storyboard generation: {sb_err}")
-                 message_broker.track_job_progress(job_id, "processing", {"message": f"Storyboard generation failed: {sb_err}", "progress": 90})
+            raw_gen_sb_flag = job_data.get("generate_storyboard")
+            should_generate_storyboard: bool
+
+            if isinstance(raw_gen_sb_flag, bool):
+                should_generate_storyboard = raw_gen_sb_flag
+                _logger.info(f"Job {job_id}: 'generate_storyboard' flag from job_data (boolean): {should_generate_storyboard}")
+            elif isinstance(raw_gen_sb_flag, str):
+                should_generate_storyboard = raw_gen_sb_flag.lower() == 'true'
+                _logger.info(f"Job {job_id}: 'generate_storyboard' flag from job_data (string): '{raw_gen_sb_flag}', parsed as: {should_generate_storyboard}")
+            else:
+                should_generate_storyboard = app_config.storyboard.ENABLE_STORYBOARD_GENERATION
+                _logger.info(f"Job {job_id}: 'generate_storyboard' flag not found or invalid in job_data (value: {raw_gen_sb_flag}). Defaulting to global app_config.storyboard.ENABLE_STORYBOARD_GENERATION: {should_generate_storyboard}")
+
+            if should_generate_storyboard:
+                if not llm_result:
+                    _logger.warning(f"Job {job_id}: Skipping storyboard generation because story script (llm_result) is empty.")
+                    message_broker.track_job_progress(job_id, "processing", {"message": "Storyboard skipped: story script is empty.", "progress": 75})
+                else:
+                    _logger.info(f"Job {job_id}: Storyboard generation is ENABLED for this job. Proceeding.")
+
+                    llm_endpoint_storyboard = app_config.llm.ENDPOINT
+                    if llm_endpoint_storyboard is None:
+                        _logger.error(f"Job {job_id}: LLM_ENDPOINT for storyboard is not configured in app_config. Skipping storyboard.")
+                        message_broker.track_job_progress(job_id, "processing", {"message": "Storyboard generation skipped: LLM_ENDPOINT not configured.", "progress": 75})
+                        sb_err = ValueError("LLM_ENDPOINT for storyboard not configured.") # Record as an error for metadata
+                    else:
+                        message_broker.track_job_progress(
+                            job_id,
+                            "processing",
+                            {"message": "Generating storyboard (images/audio if enabled by their global flags)", "progress": 60}
+                        )
+                        try:
+                            storyboard_data = generate_storyboard(
+                                story=llm_result,
+                                topic=topic_str,
+                                task_id=job_id,
+                                llm_endpoint=llm_endpoint_storyboard,
+                                temperature=temperature,
+                                voice_id=voice_id
+                            )
+                            if storyboard_data:
+                                _logger.info(f"Job {job_id}: Storyboard generation process completed.")
+                                storyboard_info = {
+                                    "file_path": storyboard_data.get("storyboard_file"),
+                                    "url": storyboard_data.get("storyboard_url"),
+                                    "provider": storage_manager.provider
+                                }
+                            else:
+                                _logger.warning(f"Job {job_id}: Storyboard generation function returned no data. Proceeding without storyboard.")
+                                message_broker.track_job_progress(job_id, "processing", {"message": "Storyboard generation returned no data.", "progress": 90})
+                        except Exception as e:
+                            sb_err = e
+                            _logger.exception(f"Job {job_id}: Error during storyboard generation call: {sb_err}")
+                            message_broker.track_job_progress(job_id, "processing", {"message": f"Storyboard generation failed: {str(sb_err)}", "progress": 90})
+            else:
+                _logger.info(f"Job {job_id}: Storyboard generation is DISABLED for this job via configuration. Skipping.")
+                message_broker.track_job_progress(job_id, "processing", {"message": "Storyboard generation skipped as per job/app configuration", "progress": 90})
             # < --- End Storyboard Generation ---
 
             # --- Final Metadata Aggregation & Storage --- >
@@ -270,7 +364,7 @@ async def process_api_job(job_data: Dict[str, Any], consumer_name: str, group_na
 
             final_metadata = {
                 "job_id": job_id,
-                "topic": topic,
+                "topic": topic_str,
                 "status": "completed",
                 "message": "Job completed successfully.",
                 "created_at": datetime.datetime.fromtimestamp(created_at_float, tz=datetime.timezone.utc).isoformat() if created_at_float else None,
@@ -283,17 +377,27 @@ async def process_api_job(job_data: Dict[str, Any], consumer_name: str, group_na
                 "audio_file": storyboard_data.get("audio_file") if storyboard_data else None,
                 "audio_url": storyboard_data.get("audio_url") if storyboard_data else None,
                 "sources": urls if urls is not None else [],
-                "story_script_llm_model": app_config.llm.MODEL,
-                "storyboard_llm_model": app_config.llm.MODEL_MULTI,
+                "story_script_llm_model": llm_model_script,
+                "storyboard_llm_model": app_config.llm.MODEL_MULTI if app_config.llm.MODEL_MULTI else llm_model_script,
                 "llm_temperature": temperature,
                 "voice_id": voice_id,
             }
 
-            if not storyboard_info and 'sb_err' in locals():
-                 final_metadata["message"] = f"Job completed, but storyboard generation failed: {sb_err}"
-                 final_metadata["error"] = f"Storyboard generation failed: {sb_err}"
-            elif not storyboard_info and not 'sb_err' in locals():
-                 final_metadata["message"] = "Job completed, but storyboard generation returned no data."
+            if sb_err is not None:
+                 final_metadata["message"] = f"Job completed, but storyboard generation failed: {str(sb_err)}"
+                 final_metadata["error_details"] = final_metadata.get("error_details", {})
+                 final_metadata["error_details"]["storyboard_generation"] = str(sb_err)
+            elif should_generate_storyboard and not storyboard_info and llm_result:
+                 final_metadata["message"] = "Job completed. Storyboard generation was attempted but produced no output."
+            elif not should_generate_storyboard:
+                 final_metadata["message"] = "Job completed. Storyboard generation was skipped as per configuration."
+                 final_metadata["storyboard_file"] = None
+                 final_metadata["storyboard_url"] = None
+                 final_metadata["audio_file"] = None
+                 final_metadata["audio_url"] = None
+            elif not llm_result and should_generate_storyboard:
+                 final_metadata["message"] = "Job completed. Story script generation failed; storyboard generation was skipped."
+
 
             metadata_filename = f"{job_id}_metadata.json"
             try:

@@ -189,8 +189,9 @@ class config:
         DEVICE: str = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     class storyboard:
-        WORD_PER_MINUTE_RATE: int = int(os.environ.get("STORYBOARD_WPM", 150))
         ENABLE_STORYBOARD_GENERATION: bool = os.environ.get("ENABLE_STORYBOARD_GENERATION", "True").lower() in ["true", "1", "yes"]
+        WPM: int = int(os.environ.get("STORYBOARD_WPM", 150))
+        STRUCTURE_MAX_RETRIES: int = int(os.environ.get("STORYBOARD_STRUCTURE_MAX_RETRIES", 2))
 
     class scraper:
         # Content extraction
@@ -236,26 +237,13 @@ class config:
         WORKER_SHUTDOWN_TIMEOUT: int = int(os.environ.get("SCRAPER_WORKER_SHUTDOWN_TIMEOUT", 30))
 
     @staticmethod
-    def set_storyboard_generation(enabled: bool):
-        """Dynamically update the storyboard generation setting."""
-        config.storyboard.ENABLE_STORYBOARD_GENERATION = enabled
-        _logger.info(f"Storyboard generation set to {'enabled' if enabled else 'disabled'}.")
-
-    @classmethod
-    def set_storyboard_generation(cls, enabled: bool):
-        """Dynamically update storyboard generation setting."""
-        cls.storyboard.ENABLE_STORYBOARD_GENERATION = enabled
-
-    @classmethod
-    def set_image_generation(cls, enabled: bool):
-        """Dynamically update image generation setting."""
-        cls.openAI.ENABLED = enabled
-
-    @classmethod
-    def set_audio_generation(cls, enabled: bool):
-        """Dynamically update audio generation setting."""
-        cls.elevenLabs.ENABLED = enabled
-
+    def get_device() -> str:
+        """Returns the appropriate device for PyTorch operations."""
+        if torch.cuda.is_available():
+            return "cuda"
+        elif torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
 
 # --- Configuration Validation ---
 def validate_config_on_startup(cfg: config):

@@ -120,14 +120,15 @@ def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
 
             # If completed according to Redis, try fetching final results from storage
             if current_status == "completed":
+                metadata_filename = f"{task_id}_metadata.json"
                 try:
-                    final_result_data = storage_manager.get_story_metadata(task_id) or {}
+                    final_result_data = storage_manager.retrieve_file_content_as_json(filename=metadata_filename, file_type="metadata") or {}
                     if not final_result_data:
-                         _logger.warning(f"Task {task_id} status is 'completed' in Redis, but final metadata not found/empty in storage.")
+                         _logger.warning(f"Task {task_id} status is 'completed' in Redis, but final metadata not found/empty in storage (checked {metadata_filename}).")
                     else:
                          _logger.info(f"Fetched final metadata for completed task {task_id} from storage.")
                 except FileNotFoundError:
-                    _logger.warning(f"Task {task_id} status is 'completed' in Redis, but final metadata file not found in storage.")
+                    _logger.warning(f"Task {task_id} status is 'completed' in Redis, but final metadata file ({metadata_filename}) not found in storage.")
                     final_result_data = {"error": "Completed task metadata file not found in storage."}
                 except Exception as storage_err:
                     _logger.error(f"Error fetching final metadata for completed task {task_id} from storage: {storage_err}")
@@ -173,10 +174,11 @@ def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
             # Task ID not found in Redis Streams, check final storage directly
             status_source = "storage"
             _logger.debug(f"Task ID {task_id} not found in Redis Streams. Checking final storage.")
+            metadata_filename = f"{task_id}_metadata.json"
             try:
-                final_result_data = storage_manager.get_story_metadata(task_id)
+                final_result_data = storage_manager.retrieve_file_content_as_json(filename=metadata_filename, file_type="metadata")
                 if final_result_data:
-                    _logger.info(f"Task {task_id} not found in Redis, but found completed results in storage.")
+                    _logger.info(f"Task {task_id} not found in Redis, but found completed results in storage (checked {metadata_filename}).")
                     status_data = {
                         "status": final_result_data.get("status", "completed"),
                         "job_id": task_id,
@@ -193,18 +195,42 @@ def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
                     return response
                 else:
                     # Not found in Redis or storage
-                     _logger.debug(f"Task ID {task_id} not found in Redis Streams or final storage.")
+                     _logger.debug(f"Task ID {task_id} not found in Redis Streams or final storage (checked {metadata_filename}).")
                      return None
             except FileNotFoundError:
-                 _logger.debug(f"Task ID {task_id} metadata file not found in storage (after Redis miss).")
+                 _logger.debug(f"Task ID {task_id} metadata file ({metadata_filename}) not found in storage (after Redis miss).")
                  return None
             except Exception as storage_err:
                  _logger.error(f"Error checking storage for task {task_id} after Redis miss: {storage_err}")
-                 return {"status": "error", "message": f"Error checking storage for job status: {str(storage_err)}", "task_id": task_id}
+                 # Ensure error_response aligns with JobStatusResponse types
+                 error_data_for_response = {
+                     "status": "error",
+                     "message": f"Error checking storage for job status: {str(storage_err)}",
+                     "job_id": task_id,
+                     "story_script": None,
+                     "storyboard": None,
+                     "audio_url": None,
+                     "sources": None,
+                     "error": f"Error checking storage for job status: {str(storage_err)}",
+                     "created_at": None,
+                     "updated_at": None
+                 }
+                 return JobStatusResponse(**error_data_for_response).model_dump(exclude_none=True)
 
     except Exception as e:
         _logger.exception(f"Error retrieving task status for {task_id} (source: {status_source}): {e}")
-        error_response = {"status": "error", "message": f"Failed to retrieve task status: {str(e)}", "task_id": task_id}
+        error_response = {
+            "status": "error",
+            "message": f"Failed to retrieve task status: {str(e)}",
+            "job_id": task_id,
+            "story_script": None,
+            "storyboard": None,
+            "audio_url": None,
+            "sources": None,
+            "error": f"Failed to retrieve task status: {str(e)}",
+            "created_at": None,
+            "updated_at": None
+            }
         try:
             return JobStatusResponse(**error_response).model_dump(exclude_none=True)
         except Exception:

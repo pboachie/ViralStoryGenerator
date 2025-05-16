@@ -48,22 +48,27 @@ def test_get_task_status_redis_completed(mock_appconfig):
             "status": "completed",
             "job_id": "abc",
             "story_script": "script",
-            "created_at": "now",
-            "updated_at": "now"
+            "created_at": "2024-06-01T12:00:00Z",
+            "updated_at": "2024-06-01T12:05:00Z"
         }
         mock_broker.return_value = mock_instance
+        # The handler may expect 'story_script', 'storyboard', 'audio_url', 'sources'
         mock_storage.return_value = {
             "story_script": "final_script",
-            "storyboard": "storyboard",
+            "storyboard": {"scenes": []},
             "audio_url": "audio.mp3",
             "sources": ["src1"],
-            "created_at": "now",
-            "updated_at": "now"
+            "created_at": "2024-06-01T12:00:00Z",
+            "updated_at": "2024-06-01T12:05:00Z"
         }
         result = api_handlers.get_task_status("abc")
+        assert result is not None
         assert result["status"] == "completed"
-        assert result["story_script"] == "final_script"
-        assert result["audio_url"] == "audio.mp3"
+        # The handler may return 'story_script', 'storyboard', 'audio_url', 'sources'
+        assert result.get("story_script") == "final_script"
+        assert result.get("audio_url") == "audio.mp3"
+        assert isinstance(result.get("storyboard"), dict)
+        assert isinstance(result.get("sources"), list)
 
 def test_get_task_status_not_found(mock_appconfig):
     with patch.object(api_handlers, "get_message_broker") as mock_broker, \

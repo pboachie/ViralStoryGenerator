@@ -44,7 +44,9 @@ setup(
         "chromadb>=1.0.9",
         "pydantic-settings==2.0.0",
         "torch==2.3.1",
-        "tenacity==8.2.3"
+        "tenacity==8.2.3",
+        "mypy_boto3_s3>=1.38.0",
+        "typing-extensions>=4.13.2"
     ],
     python_requires=">=3.7",
     entry_points={
