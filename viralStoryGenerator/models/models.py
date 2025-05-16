@@ -2,7 +2,7 @@
 # viralStoryGenerator/models/models.py
 
 from typing import Dict, Any, Optional, List, Union, Tuple
-from pydantic import BaseModel, AnyHttpUrl, Field, HttpUrl, field_validator, RootModel
+from pydantic import BaseModel, AnyHttpUrl, Field, HttpUrl, ValidationError, field_validator, RootModel
 from viralStoryGenerator.utils.config import config as app_config
 
 
@@ -37,7 +37,7 @@ class URLMetadata(BaseModel):
 
 class StoryGenerationRequest(BaseModel):
     """Request model for generating a story from URLs"""
-    urls: List[AnyHttpUrl] = Field(..., description="List of URLs to parse for content", max_items=10)
+    urls: List[AnyHttpUrl] = Field(..., description="List of URLs to parse for content")
     topic: str = Field(..., description="Topic for the story", min_length=1, max_length=500)
     generate_audio: bool = Field(False, description="Whether to generate audio")
     include_images: bool = Field(False, description="Whether to generate images for storyboard")
@@ -57,18 +57,17 @@ class StoryGenerationRequest(BaseModel):
     @field_validator('urls')
     def validate_urls(cls, v):
         # Limit the number of URLs to prevent abuse
-        if len(v) > 10:
+        if len(v) > 10: #todo: make this configurable
             raise ValueError("Maximum 10 URLs allowed")
 
         # Check for allowed domains if needed
         allowed_domains = app_config.http.ALLOWED_DOMAINS if hasattr(app_config.http, 'ALLOWED_DOMAINS') else []
         if allowed_domains:
             for url in v:
-                domain = url.netloc
+                domain = url.host
                 if domain not in allowed_domains:
                     raise ValueError(f"URL domain not allowed: {domain}")
         return v
-
 
 class JobResponse(BaseModel):
     """Response model for job creation"""

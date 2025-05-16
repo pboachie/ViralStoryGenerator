@@ -338,13 +338,13 @@ Generate valid JSON output now. Ensure every scene includes a valid 'scene_start
     """.strip()
 
 # TODO: To be implemented in the future
-def _identify_errors(text):
-    """Helper to generate error descriptions"""
-    errors = []
-    if "### Video Description:" not in text:
-        errors.append("Missing video description section")
-    if len(text.split("###")) != 3:
-        errors.append("Incorrect number of sections")
-    if any(c in text for c in ["[Cut to", "[Scene"]):
-        errors.append("Contains forbidden scene directions")
-    return ", ".join(errors) or "Formatting violations"
+# def _identify_errors(text):
+#     """Helper to generate error descriptions"""
+#     errors = []
+#     if "### Video Description:" not in text:
+#         errors.append("Missing video description section")
+#     if len(text.split("###")) != 3:
+#         errors.append("Incorrect number of sections")
+#     if any(c in text for c in ["[Cut to", "[Scene"]):
+#         errors.append("Contains forbidden scene directions")
+#     return ", ".join(errors) or "Formatting violations"
