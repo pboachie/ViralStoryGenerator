@@ -21,10 +21,12 @@ from viralStoryGenerator.utils.security import is_file_in_directory, validate_pa
 import viralStoryGenerator.src.logger
 _logger = logging.getLogger(__name__)
 
-def get_message_broker() -> RedisMessageBroker:
-    """Get Redis message broker for API handlers"""
+async def get_message_broker() -> RedisMessageBroker:
+    """Get Redis message broker for API handlers, ensuring async initialization."""
     redis_url = "redis://" + appconfig.redis.HOST + ":" + str(appconfig.redis.PORT)
-    return RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
+    broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
+    await broker.initialize()
+    return broker
 
 class StoryTask:
     """Basic representation of a task state for API response."""
@@ -45,7 +47,7 @@ class StoryTask:
 
 # ---- API Facing Functions ----
 
-def create_story_task(topic: str, sources_folder: Optional[str] = None,
+async def create_story_task(topic: str, sources_folder: Optional[str] = None,
                      voice_id: Optional[str] = None) -> Dict[str, Any]:
     """
     API handler logic to create a new story generation task.
@@ -83,8 +85,8 @@ def create_story_task(topic: str, sources_folder: Optional[str] = None,
     }
 
     try:
-        message_broker = get_message_broker()
-        message_id = message_broker.publish_message(task_data_payload)
+        message_broker = await get_message_broker()
+        message_id = await message_broker.publish_message(task_data_payload)
         success = message_id is not None
     except Exception as e:
         _logger.error(f"Failed to publish task to Redis Stream: {e}")
@@ -107,7 +109,7 @@ async def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
     """
     status_source = "unknown"
     try:
-        message_broker = get_message_broker()
+        message_broker = await get_message_broker()
         stream_status = await message_broker.get_job_progress(task_id)
         final_result_data = {}
 
@@ -116,7 +118,6 @@ async def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
             _logger.debug(f"Stream status for task {task_id}: {json.dumps(stream_status, indent=2)}")
             current_status = stream_status.get("status", "pending")
 
-            # If completed according to Redis, try fetching final results from storage
             if (current_status == "completed"):
                 metadata_filename = f"{task_id}_metadata.json"
                 try:
@@ -253,7 +254,7 @@ def process_audio_queue():
 
     processed_count = 0
     failed_count = 0
-    from .elevenlabs_tts import generate_elevenlabs_audio # Local import
+    from .elevenlabs_tts import generate_elevenlabs_audio
 
     for filename in os.listdir(audio_queue_dir):
         if (filename.endswith(".json")):
@@ -266,7 +267,7 @@ def process_audio_queue():
                 # Basic validation of metadata
                 if not all(k in metadata for k in ["story", "mp3_file_path"]):
                      _logger.warning(f"Skipping invalid queue file {filename}: missing required keys.")
-                     # Optionally move/delete invalid file
+                     # todo:  move/delete invalid file
                      continue
 
                 # Attempt regeneration

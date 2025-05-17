@@ -12,7 +12,7 @@ class URLMetadata(BaseModel):
     status: str = "pending"  # e.g., pending, success, error
     markdown_content: Optional[str] = None
     html_content: Optional[str] = None
-    raw_html_snippet: Optional[str] = None #
+    raw_html_snippet: Optional[str] = None
     title: Optional[str] = None
     description: Optional[str] = None
     metadata_payload: Optional[Dict[str, Any]] = Field(default=None, alias="metadata")
@@ -31,9 +31,11 @@ class URLMetadata(BaseModel):
     dispatch_duration_seconds: Optional[float] = None
     all_meta_tags: Optional[Dict[str, str]] = None
     image_url: Optional[AnyHttpUrl] = None
+    language: Optional[str] = None
+    favicon_url: Optional[AnyHttpUrl] = None
 
     class Config:
-        populate_by_name = True # Allows using alias "metadata" for "metadata_payload"
+        populate_by_name = True
 
 class StoryGenerationRequest(BaseModel):
     """Request model for generating a story from URLs"""
@@ -53,18 +55,15 @@ class StoryGenerationRequest(BaseModel):
 
     @field_validator('topic')
     def validate_topic(cls, v):
-        # Check for potentially dangerous characters
         if any(char in v for char in ['&', '|', ';', '$', '`', '\\']):
             raise ValueError("Topic contains invalid characters")
         return v
 
     @field_validator('urls')
     def validate_urls(cls, v):
-        # Limit the number of URLs to prevent abuse
         if len(v) > 10: #todo: make this configurable
             raise ValueError("Maximum 10 URLs allowed")
 
-        # Check for allowed domains if needed
         allowed_domains = app_config.http.ALLOWED_DOMAINS if hasattr(app_config.http, 'ALLOWED_DOMAINS') else []
         if allowed_domains:
             for url in v:
@@ -110,17 +109,24 @@ class HealthResponse(BaseModel):
     uptime: Union[float, str] = Field(..., description="Server uptime in seconds or uptime text")
 
 
+class ContentDetailItem(BaseModel):
+    """Model for content URL and its fetched content."""
+    url: Optional[str] = Field(None, description="URL to the content")
+    content: Optional[Any] = Field(None, description="Fetched content from the URL (can be string or dict for JSON)")
+
 class JobStatusResponse(BaseModel):
     """Response model for job status checks"""
+    job_id: str = Field(..., description="Unique identifier for the job")
     status: str = Field(..., description="Job status: pending, processing, completed, or failed")
     message: Optional[str] = Field(None, description="Status message")
-    story_script: Optional[str] = Field(None, description="Generated story script if completed")
-    storyboard: Optional[Dict[str, Any]] = Field(None, description="Generated storyboard if completed")
+    story: Optional[List[ContentDetailItem]] = Field(None, description="Details of the generated story script, including URL and content")
+    storyboard: Optional[List[ContentDetailItem]] = Field(None, description="Details of the generated storyboard, including URL and content")
     audio_url: Optional[str] = Field(None, description="URL to the generated audio file if completed")
     sources: Optional[List[str]] = Field(None, description="Sources used to generate the story")
     error: Optional[str] = Field(None, description="Error message if failed")
     created_at: Optional[str] = Field(None, description="Timestamp when job was created")
     updated_at: Optional[str] = Field(None, description="Timestamp when job was last updated")
+    processing_time_seconds: Optional[float] = Field(None, description="Total processing time in seconds for the job")
 
 class StoryboardScene(BaseModel):
     scene_number: int = Field(..., description="Scene number")

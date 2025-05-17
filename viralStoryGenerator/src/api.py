@@ -17,6 +17,7 @@ from starlette.responses import Response
 import redis
 import uvicorn
 import aiofiles
+import asyncio
 
 from viralStoryGenerator.models.models import (
     StoryGenerationRequest,
@@ -374,7 +375,7 @@ async def create_new_story_task(
 
     # Create and queue the task using the handler function
     try:
-        task_info = create_story_task(
+        task_info = await create_story_task(
              topic=sanitized_topic,
              sources_folder=validated_sources_folder,
              voice_id=voice_id
@@ -396,7 +397,7 @@ async def check_story_status(task_id: str):
         raise HTTPException(status_code=400, detail="Invalid task ID format")
 
     try:
-        task_info = get_task_status(task_id)
+        task_info = await get_task_status(task_id)
         if task_info is None or task_info.get("status") == "not_found":
              _logger.warning(f"Task ID not found: {task_id}")
              raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
@@ -444,6 +445,7 @@ async def serve_task_file(task_id: str, file_type_key: str, request: Request):
         serve_info = storage_manager.serve_file(actual_filename, storage_file_type)
 
         if isinstance(serve_info, str) and os.path.exists(serve_info):  # Local file path
+
             local_file_path = serve_info
 
             # Security check: Ensure file is within the designated storage directory
@@ -590,8 +592,8 @@ async def generate_story_from_urls_endpoint(
             "chunk_size": chunk_size if chunk_size is not None else app_config.llm.CHUNK_SIZE,
         }
 
-        message_broker = get_message_broker()
-        message_id = message_broker.publish_message(task_payload)
+        message_broker = await get_message_broker()
+        message_id = await message_broker.publish_message(task_payload)
 
         if message_id:
             _logger.info(f"Job {job_id} for topic '{sanitized_topic}' queued successfully with message ID {message_id}.")
@@ -609,47 +611,274 @@ async def generate_story_from_urls_endpoint(
 
 @router.get("/status/{job_id}", response_model=JobStatusResponse, tags=["Job Management"], dependencies=[Depends(get_api_key)])
 async def get_job_status_endpoint(job_id: str):
-    """Retrieve the status of a previously submitted job."""
+    """Retrieve the status of a previously submitted job, with caching from storage to Redis."""
     if not is_valid_uuid(job_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id format.")
 
     _logger.debug(f"Fetching status for job_id: {job_id}")
+
+    # This function is intended to be run in a separate thread using asyncio.to_thread
+    def _fetch_story_content_from_storage_sync(current_job_id: str) -> Optional[str]:
+        retrieved_data = storage_manager.retrieve_file(
+            filename=f"{current_job_id}_story.txt",
+            file_type="story"
+        )
+        story_text: Optional[str] = None
+        if retrieved_data:
+            data_to_decode: Optional[bytes] = None
+            try:
+                if isinstance(retrieved_data, bytes):
+                    data_to_decode = retrieved_data
+                elif isinstance(retrieved_data, (bytearray, memoryview)):
+                    data_to_decode = bytes(retrieved_data)
+                elif hasattr(retrieved_data, 'read'):
+                    read_result = retrieved_data.read()
+                    if isinstance(read_result, bytes):
+                        data_to_decode = read_result
+                    elif isinstance(read_result, str):
+                        _logger.warning(f"Job {current_job_id}: Read operation on story file stream returned str, attempting to encode to UTF-8.")
+                        data_to_decode = read_result.encode('utf-8')
+                    else:
+                        _logger.warning(f"Job {current_job_id}: Read operation on story file stream did not return bytes or str. Type: {type(read_result)}")
+                else:
+                    _logger.warning(f"Job {current_job_id}: Retrieved story file data is of an unhandled type: {type(retrieved_data)}")
+
+                if data_to_decode is not None:
+                    story_text = data_to_decode.decode('utf-8')
+
+            except UnicodeDecodeError as ude:
+                _logger.error(f"Job {current_job_id}: Failed to decode story content due to UnicodeDecodeError: {ude}")
+            except Exception as e:
+                _logger.error(f"Job {current_job_id}: Error processing retrieved story file data: {e}")
+            finally:
+                if retrieved_data and \
+                   not isinstance(retrieved_data, (bytes, bytearray, memoryview)) and \
+                   hasattr(retrieved_data, 'close'):
+                    try:
+                        retrieved_data.close()
+                    except Exception as e_close:
+                        _logger.warning(f"Job {current_job_id}: Error closing story file stream: {e_close}")
+        return story_text
+
+    # This function is intended to be run in a separate thread using asyncio.to_thread
+    def _fetch_storyboard_content_from_storage_sync(current_job_id: str) -> Optional[Dict[str, Any]]:
+        storyboard_json_content: Optional[Dict[str, Any]] = None
+        storyboard_filename = f"{current_job_id}_storyboard.json" # Define filename at the beginning
+        try:
+            retrieved_data = storage_manager.retrieve_file_content_as_json(
+                filename=storyboard_filename,
+                file_type="storyboard"
+            )
+            if isinstance(retrieved_data, dict):
+                storyboard_json_content = retrieved_data
+            elif retrieved_data is not None:
+                 _logger.warning(f"Job {current_job_id}: Retrieved storyboard file data for {storyboard_filename} is not a dict: {type(retrieved_data)}. Content: {retrieved_data}")
+        except FileNotFoundError:
+            _logger.info(f"Job {current_job_id}: Storyboard file {storyboard_filename} not found in storage.")
+        except Exception as e:
+            _logger.error(f"Job {current_job_id}: Error retrieving/processing storyboard file {storyboard_filename} from storage: {e}")
+        return storyboard_json_content
+
+    final_status_data: Optional[Dict[str, Any]] = None
+    final_status_source = "not_found"
+    redis_data_from_broker: Optional[Dict[str, Any]] = None
+
+    message_broker: Optional[RedisMessageBroker] = None
     try:
-        message_broker = get_message_broker()
-        status_data = await message_broker.get_job_progress(job_id)
+        message_broker = await get_message_broker()
+    except Exception as e:
+        _logger.error(f"Failed to initialize message broker for job {job_id}: {e}. Proceeding without Redis cache operations.")
 
-        if not status_data:
-            _logger.info(f"Job status for {job_id} not found in Redis stream/results.")
-            handler_status = get_task_status(job_id)
-            if handler_status and handler_status.get("status") != "not_found":
-                _logger.info(f"Job status for {job_id} found via api_handlers.get_task_status.")
-                return JobStatusResponse(**handler_status)
-            else:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job with ID {job_id} not found.")
+    # 1. Try to get from Redis
+    if message_broker:
+        try:
+            redis_data_from_broker = await message_broker.get_job_progress(job_id)
+        except Exception as redis_err:
+            _logger.warning(f"Could not retrieve job {job_id} status from Redis: {redis_err}. Will attempt to load from storage.")
+    else:
+        _logger.warning(f"Message broker not available for job {job_id}. Skipping Redis read attempt.")
 
-        response_data = {
-            "job_id": status_data.get("job_id", job_id),
-            "status": status_data.get("status", "unknown"),
-            "message": status_data.get("message", "Status retrieved from Redis."),
-            "created_at": status_data.get("created_at") or status_data.get("request_time"),
-            "updated_at": status_data.get("updated_at") or status_data.get("timestamp"),
-            "error": status_data.get("error"),
-            "result": status_data.get("result"),
-            "story_script": status_data.get("story_script", status_data.get("result", {}).get("story_script") if isinstance(status_data.get("result"), dict) else None),
-            "storyboard": status_data.get("storyboard", status_data.get("result", {}).get("storyboard") if isinstance(status_data.get("result"), dict) else None),
-            "audio_url": status_data.get("audio_url", status_data.get("result", {}).get("audio_url") if isinstance(status_data.get("result"), dict) else None),
-            "video_url": status_data.get("video_url", status_data.get("result", {}).get("video_url") if isinstance(status_data.get("result"), dict) else None),
-            "image_urls": status_data.get("image_urls", status_data.get("result", {}).get("image_urls") if isinstance(status_data.get("result"), dict) else None),
-            "sources": status_data.get("sources", status_data.get("result", {}).get("sources") if isinstance(status_data.get("result"), dict) else None),
+    if redis_data_from_broker:
+        # _logger.debug(f"Job {job_id} raw data found in Redis: {redis_data_from_broker}")
+        current_status = redis_data_from_broker.get("status")
+        payload = redis_data_from_broker.get("data", {})
+
+        current_redis_job_status = {
+            "job_id": job_id,
+            "status": current_status,
+            "message": payload.get("message"),
+            "story": payload.get("story"),
+            "storyboard": payload.get("storyboard"),
+            "audio_url": payload.get("audio_url"),
+            "sources": payload.get("sources"),
+            "error": payload.get("error"),
+            "created_at": payload.get("created_at"),
+            "updated_at": payload.get("updated_at"),
+            "processing_time_seconds": payload.get("processing_time_seconds")
         }
 
-        return JobStatusResponse(**response_data)
+        if current_status == "completed":
+            is_redis_data_sufficiently_detailed = False
+            if current_redis_job_status.get("created_at"):
+                story_items = current_redis_job_status.get("story")
+                storyboard_items = current_redis_job_status.get("storyboard")
 
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        _logger.exception(f"Error retrieving status for job {job_id}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to retrieve job status: {str(e)}")
+                story_content_ok = False
+                if isinstance(story_items, list) and story_items:
+                    first_story_item = story_items[0]
+                    if first_story_item.get("url") and first_story_item.get("content") is not None:
+                        story_content_ok = True
+
+                storyboard_content_ok = True
+                if isinstance(storyboard_items, list) and storyboard_items:
+                    first_storyboard_item = storyboard_items[0]
+                    if not (first_storyboard_item.get("url") and first_storyboard_item.get("content") is not None):
+                        storyboard_content_ok = False
+
+                if story_content_ok and storyboard_content_ok:
+                    is_redis_data_sufficiently_detailed = True
+
+            if is_redis_data_sufficiently_detailed:
+                final_status_data = current_redis_job_status
+                final_status_source = "redis (completed, detailed with content)"
+                _logger.info(f"Job {job_id} using detailed 'completed' status with content from Redis.")
+            else:
+                _logger.info(f"Job {job_id} status is 'completed' in Redis but lacks content or essential fields. Will check storage.")
+        elif current_status in ["processing", "failed"]:
+            final_status_data = current_redis_job_status
+            final_status_source = f"redis ({current_status})"
+            _logger.info(f"Job {job_id} using '{current_status}' status from Redis.")
+        else:
+            _logger.info(f"Job {job_id} found in Redis with status '{current_status}'. Will attempt to verify/overwrite with storage.")
+
+    if not final_status_data:
+        _logger.info(f"Job {job_id}: Attempting to load from storage metadata.")
+        try:
+            metadata_filename = f"{job_id}_metadata.json"
+            metadata_content = await asyncio.to_thread(
+                storage_manager.retrieve_file_content_as_json,
+                filename=metadata_filename,
+                file_type="metadata"
+            )
+
+            if metadata_content and isinstance(metadata_content, dict):
+                story_detail_list = []
+                story_script_url_from_meta = metadata_content.get("story_script_url")
+                if story_script_url_from_meta:
+                    story_content_text: Optional[str] = None
+                    try:
+                        story_content_text = await asyncio.to_thread(_fetch_story_content_from_storage_sync, job_id)
+                        _logger.debug(f"Job {job_id}: Fetched story text content (first 100 chars): {story_content_text[:100] if story_content_text else 'None'}")
+                    except Exception as e:
+                        _logger.error(f"Job {job_id}: Failed to fetch story content for URL {story_script_url_from_meta} via helper: {e}")
+                    story_detail_list.append({"url": story_script_url_from_meta, "content": story_content_text})
+
+                storyboard_detail_list = []
+                storyboard_url_from_meta = metadata_content.get("storyboard_url")
+                if storyboard_url_from_meta:
+                    storyboard_json_content: Optional[Dict[str, Any]] = None
+                    try:
+                        storyboard_json_content = await asyncio.to_thread(_fetch_storyboard_content_from_storage_sync, job_id)
+                        _logger.debug(f"Job {job_id}: Fetched storyboard JSON content for URL {storyboard_url_from_meta}: {'Present' if storyboard_json_content else 'None'}")
+                    except Exception as e:
+                        _logger.error(f"Job {job_id}: Failed to fetch storyboard content for URL {storyboard_url_from_meta} via helper: {e}")
+                    storyboard_detail_list.append({"url": storyboard_url_from_meta, "content": storyboard_json_content})
+
+                final_status_data = {
+                    "job_id": job_id,
+                    "status": metadata_content.get("status", "unknown"),
+                    "message": metadata_content.get("message"),
+                    "story": story_detail_list if story_detail_list else None,
+                    "storyboard": storyboard_detail_list if storyboard_detail_list else None,
+                    "audio_url": metadata_content.get("audio_url"),
+                    "sources": metadata_content.get("sources"),
+                    "error": metadata_content.get("error"),
+                    "created_at": metadata_content.get("created_at"),
+                    "updated_at": metadata_content.get("updated_at"),
+                    "processing_time_seconds": metadata_content.get("processing_time_seconds")
+                }
+                final_status_source = "storage (with content)"
+                _logger.info(f"Job {job_id} status and content successfully loaded from storage: {metadata_filename}")
+
+                if message_broker and final_status_data.get("status") and final_status_data.get("created_at"):
+                    status_to_cache = str(final_status_data.get("status"))
+                    payload_to_cache = {
+                        "message": final_status_data.get("message"),
+                        "story": final_status_data.get("story"),
+                        "storyboard": final_status_data.get("storyboard"),
+                        "audio_url": final_status_data.get("audio_url"),
+                        "sources": final_status_data.get("sources"),
+                        "error": final_status_data.get("error"),
+                        "created_at": final_status_data.get("created_at"),
+                        "updated_at": final_status_data.get("updated_at"),
+                        "processing_time_seconds": final_status_data.get("processing_time_seconds")
+                    }
+                    try:
+                        await message_broker.track_job_progress(
+                            job_id,
+                            status=status_to_cache,
+                            data=payload_to_cache,
+                            ttl_seconds=app_config.redis.TTL
+                        )
+                        _logger.info(f"Job {job_id}: Status from storage (with content) cached back to Redis with TTL {app_config.redis.TTL}s.")
+                    except Exception as e_cache:
+                        _logger.error(f"Job {job_id}: Failed to cache status from storage to Redis: {e_cache}")
+                elif not message_broker:
+                    _logger.warning(f"Job {job_id}: Message broker not available. Skipping caching data from storage to Redis.")
+                else:
+                    _logger.warning(f"Job {job_id}: Could not cache data from storage to Redis due to missing status or created_at. Data: {final_status_data}")
+            else:
+                _logger.warning(f"Metadata file {metadata_filename} for job {job_id} not found in storage.")
+                if redis_data_from_broker:
+                    payload = redis_data_from_broker.get("data", {})
+                    final_status_data = {
+                        "job_id": job_id,
+                        "status": redis_data_from_broker.get("status"),
+                        "message": payload.get("message"),
+                        "story": payload.get("story"),
+                        "storyboard": payload.get("storyboard"),
+                        "audio_url": payload.get("audio_url"),
+                        "sources": payload.get("sources"),
+                        "error": payload.get("error"),
+                        "created_at": payload.get("created_at"),
+                        "updated_at": payload.get("updated_at"),
+                        "processing_time_seconds": payload.get("processing_time_seconds")
+                    }
+                    final_status_source = f"redis (fallback after storage miss, status: {final_status_data.get('status')})"
+                    _logger.info(f"Job {job_id}: Using Redis data as fallback after storage miss.")
+
+        except Exception as storage_err:
+            _logger.error(f"Error during storage processing or Redis caching for job {job_id}: {storage_err}")
+            if redis_data_from_broker:
+                payload = redis_data_from_broker.get("data", {})
+                final_status_data = {
+                    "job_id": job_id,
+                    "status": redis_data_from_broker.get("status"),
+                    "message": payload.get("message"),
+                    "story": payload.get("story"),
+                    "storyboard": payload.get("storyboard"),
+                    "audio_url": payload.get("audio_url"),
+                    "sources": payload.get("sources"),
+                    "error": payload.get("error"),
+                    "created_at": payload.get("created_at"),
+                    "updated_at": payload.get("updated_at"),
+                    "processing_time_seconds": payload.get("processing_time_seconds")
+                }
+                final_status_source = f"redis (fallback after storage error, status: {final_status_data.get('status')})"
+                _logger.info(f"Job {job_id}: Using Redis data as fallback after storage error.")
+
+    if final_status_data and final_status_data.get("status") != "not_found" and final_status_data.get("status") is not None:
+        _logger.info(f"Job {job_id}: Finalizing response. Source: {final_status_source}. Data (content truncated for brevity): {{'job_id': '{final_status_data.get('job_id')}', 'status': '{final_status_data.get('status')}', 'story_content_present': {final_status_data.get('story') is not None and final_status_data['story'][0].get('content') is not None if final_status_data.get('story') else False}, ...}}")
+        try:
+            if "job_id" not in final_status_data:
+                final_status_data["job_id"] = job_id
+            return JobStatusResponse(**final_status_data)
+        except Exception as pydantic_err:
+            _logger.error(f"Error creating JobStatusResponse for job {job_id} from {final_status_source} data: {pydantic_err}. Data: {final_status_data}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error processing job status data: {pydantic_err}")
+    else:
+        _logger.warning(f"Job {job_id} ultimately not found or status is invalid. Source: {final_status_source}.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job {job_id} not found.")
 
 # --- Queue Management Admin Endpoints ---
 queue_router = APIRouter(
@@ -730,7 +959,7 @@ async def get_queue_status():
         raise HTTPException(status_code=500, detail=f"Failed to get queue status: {str(e)}")
 
 @queue_router.post("/clear-stalled", response_model=ClearStalledJobsResponse)
-async def clear_stalled_jobs(max_age_seconds: int = 600): # Default: older than 10 minutes
+async def clear_stalled_jobs(max_age_seconds: int = 600):
     """
     Clear potentially stalled jobs from the stream's consumer groups.
     Claims and processes messages that have been pending for longer than max_age_seconds.
@@ -739,71 +968,25 @@ async def clear_stalled_jobs(max_age_seconds: int = 600): # Default: older than 
 
     try:
         redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
-        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
-
-        redis_client = message_broker.client
-
-        # Get all consumer groups for the stream
-        groups_info = await redis_client.xinfo_groups(app_config.redis.QUEUE_NAME)
-
+        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=app_config.redis.QUEUE_NAME)
+        await message_broker.initialize()
+        queue_info = await message_broker.get_queue_information()
         claimed_count = 0
         failed_to_claim_count = 0
         reprocessed_count = 0
         errors = []
 
-        for group_info in groups_info:
-            name_bytes = group_info.get(b'name')
-            if name_bytes is None:
+        for group in queue_info.get("consumer_groups", []):
+            group_name = group.get("group_name")
+            if not group_name:
                 continue
-            group_name = name_bytes.decode()
-            # Get pending messages for this group
-            pending_info = await redis_client.xpending_range(
-                app_config.redis.QUEUE_NAME,
-                group_name,
-                min="-",  # Start from oldest
-                max="+",  # End with newest
-                count=100  # Limit number of messages
-            )
-
-            for item in pending_info:
-                message_id = item.get(b'message_id').decode()
-                consumer = item.get(b'consumer').decode()
-                idle_time = item.get(b'idle')
-
-                if idle_time > max_age_seconds * 1000:  # Redis uses milliseconds
-                    try:
-                        claimed = await redis_client.xclaim(
-                            app_config.redis.QUEUE_NAME,
-                            group_name,
-                            "stalled_job_processor",
-                            min_idle_time=idle_time,
-                            message_ids=[message_id]
-                        )
-
-                        if claimed:
-                            claimed_count += 1
-                            for msg_id, msg_data in claimed:
-                                try:
-                                    job_id = msg_data.get(b'job_id', b'unknown').decode()
-
-                                    error_message = f"Job stalled: no progress for {idle_time/1000} seconds"
-
-                                    message_broker.publish_message({
-                                        "job_id": job_id,
-                                        "status": "failed",
-                                        "error": error_message,
-                                        "timestamp": time.time()
-                                    })
-
-                                    failed_to_claim_count += 1
-
-                                except Exception as msg_e:
-                                    _logger.error(f"Error processing stalled message {message_id}: {msg_e}")
-
-                            await redis_client.xack(app_config.redis.QUEUE_NAME, group_name, message_id)
-
-                    except Exception as claim_e:
-                        _logger.error(f"Error claiming stalled message {message_id}: {claim_e}")
+            pending_info = await message_broker.get_pending_messages_info(group_name=group_name)
+            if not pending_info or not pending_info.get("pending"):
+                continue
+            # todo:  could implement logic to claim and reprocess messages here
+            # For now, just log the pending info
+            _logger.info(f"Group '{group_name}' has pending: {pending_info.get('pending')}")
+            # todo: Implement actual claiming and reprocessing if needed
 
         _logger.info(f"Stalled job cleanup finished. Claimed: {claimed_count}, Failed: {failed_to_claim_count}, Reprocessed: {reprocessed_count}")
         return {
@@ -831,21 +1014,12 @@ async def purge_queue(confirmation: str):
     try:
         redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
         message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=app_config.redis.QUEUE_NAME)
-
-        redis_client = message_broker.client
-
-        # Delete the entire stream
-        stream_name_to_purge = app_config.redis.QUEUE_NAME
-        stream_deleted = await redis_client.delete(stream_name_to_purge)
-
-        _logger.info(f"Stream '{stream_name_to_purge}' deleted: {bool(stream_deleted)}.")
-
-        new_message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=stream_name_to_purge)
-
-        _logger.critical(f"Queue system purged. Stream '{stream_name_to_purge}' deleted: {bool(stream_deleted)}. Stream and group recreated by new broker instance.")
+        await message_broker.initialize()
+        purged_count = await message_broker.purge_stream_messages()
+        _logger.critical(f"Queue system purged. Stream '{app_config.redis.QUEUE_NAME}' purged: {purged_count} messages deleted.")
         return SuccessResponse(
             message=f"Queue system purged successfully.",
-            detail=f"Stream '{stream_name_to_purge}' deleted: {bool(stream_deleted)}. Stream and consumer group were recreated."
+            detail=f"Stream '{app_config.redis.QUEUE_NAME}' purged: {purged_count} messages deleted. Stream and consumer group remain."
         )
     except Exception as e:
         _logger.exception(f"Error purging queue: {str(e)}")
@@ -894,13 +1068,13 @@ async def retry_failed_job(job_id: str, background_tasks: BackgroundTasks):
             "retry_of_job_id": job_id
         }
 
-        message_id = message_broker.publish_message(message_data=retry_task_payload, job_id=new_job_id)
+        message_id = await message_broker.publish_message(message_data=retry_task_payload, job_id=new_job_id)
 
         if not message_id:
             _logger.error(f"Failed to re-queue job {job_id} for retry as {new_job_id}.")
             raise HTTPException(status_code=500, detail="Failed to queue job for retry.")
 
-        message_broker.track_job_progress(
+        await message_broker.track_job_progress(
             job_id=job_id,
             status="retried",
             data={"retried_as_job_id": new_job_id, "message": f"Job retried as {new_job_id}"}
@@ -1070,3 +1244,4 @@ if __name__ == "__main__":
      workers = app_config.http.WORKERS
      log_level = app_config.LOG_LEVEL
      start_api_server(host=host, port=port, workers=workers, reload=False, log_level=log_level)
+     

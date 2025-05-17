@@ -29,108 +29,51 @@ def is_safe_filename(path_or_filename: str) -> bool:
         _logger.debug(f"Input to is_safe_filename is empty.")
         return False
 
-    # Extract the basename component for validation
     filename_component = os.path.basename(path_or_filename)
 
-    if not filename_component: # e.g. from os.path.basename("/") -> ""
+    if not filename_component:
         _logger.debug(f"Extracted basename from '{path_or_filename}' is empty.")
         return False
 
-    # 1. Check for '..' explicitly in the extracted component.
-    #    os.path.basename will preserve '..' if it's the component (e.g. "foo/..")
-    #    A basename component should not be '..'.
-    #    Also check for path separators, which might appear if os.path.basename encounters unusual input
-    #    or on certain OS edge cases (e.g. os.path.basename("foo/bar\\baz") on POSIX -> "bar\\baz").
     if '..' in filename_component or '/' in filename_component or '\\' in filename_component:
         _logger.debug(f"Unsafe basename detected (path traversal or separators in component '{filename_component}' from input '{path_or_filename}')")
         return False
 
-    # 2. Check for null bytes
     if '\0' in filename_component:
         _logger.debug(f"Unsafe basename detected (null byte in component '{filename_component}' from input '{path_or_filename}')")
         return False
 
-    # 3. Check character whitelist (allow alphanumeric, underscore, hyphen, period)
-    # Allows for common filename patterns like 'my-file_v2.txt'
-    # Note: os.path.basename('.') is '.', os.path.basename('..') is '..'
-    # '..' is caught by the specific check above. '.' is generally a safe filename component.
     pattern = re.compile(r'^[a-zA-Z0-9_\-\.]+$')
     if not pattern.match(filename_component):
         _logger.debug(f"Unsafe basename detected (invalid characters in component '{filename_component}' from input '{path_or_filename}')")
         return False
 
-    # 4. Optional: Check for reserved filenames on different OS (e.g., CON, PRN on Windows)
-    # reserved_windows = {'CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'LPT1'}
-    # if os.name == 'nt' and filename_component.upper().split('.')[0] in reserved_windows:
-    #    _logger.debug(f"Unsafe basename detected (reserved name '{filename_component}' from input '{path_or_filename}')")
-    #    return False
-
-    # 5. Optional: Check length
-    MAX_FILENAME_LENGTH = 255 # Common filesystem limit
+    MAX_FILENAME_LENGTH = 255
     if len(filename_component) > MAX_FILENAME_LENGTH:
          _logger.debug(f"Unsafe basename detected (component '{filename_component}' from input '{path_or_filename}' is too long)")
          return False
 
     return True
 
-
 def is_file_in_directory(file_path: str, directory: str) -> bool:
-    """
-    Check if a file path is safely contained within the specified directory.
-    Prevents path traversal attacks by resolving real paths.
-
-    Args:
-        file_path: The file path to check
-        directory: The directory that should contain the file
-
-    Returns:
-        bool: True if the file is within the directory, False otherwise
-    """
     try:
-        # Resolve symlinks and normalize paths to absolute paths
         abs_directory = os.path.realpath(os.path.abspath(directory))
         abs_file_path = os.path.realpath(os.path.abspath(file_path))
-
-        # Check if the file's path starts with the directory's path
         return os.path.commonprefix([abs_file_path, abs_directory]) == abs_directory
-        # return os.path.commonpath([abs_file_path, abs_directory]) == abs_directory
     except Exception as e:
-         _logger.error(f"Error checking file path {file_path} in directory {directory}: {e}")
-         return False
-
+        _logger.error(f"Error checking file path {file_path} in directory {directory}: {e}")
+        return False
 
 def is_valid_uuid(uuid_string: Optional[str]) -> bool:
-    """
-    Validate that a string is a valid UUID (version 1, 3, 4, or 5).
-
-    Args:
-        uuid_string: The string to validate as a UUID
-
-    Returns:
-        bool: True if the string is a valid UUID, False otherwise
-    """
     if not isinstance(uuid_string, str):
         return False
     try:
-        # Attempt to create a UUID object from the string
         uuid_obj = uuid.UUID(uuid_string)
         return str(uuid_obj) == uuid_string
     except (ValueError, AttributeError, TypeError):
         return False
 
-
 def is_valid_voice_id(voice_id: Optional[str]) -> bool:
-    """
-    Validate that a string matches the configured regex pattern for a voice ID.
-    Relies on `config.security.VOICE_ID_PATTERN`.
-
-    Args:
-        voice_id: The voice ID string to validate.
-
-    Returns:
-        bool: True if the voice ID is valid according to the pattern, or if no
-              pattern is configured (fail open). False otherwise.
-    """
     if not isinstance(voice_id, str):
         return False
 
@@ -144,97 +87,48 @@ def is_valid_voice_id(voice_id: Optional[str]) -> bool:
         pattern = re.compile(pattern_str)
         is_match = bool(pattern.match(voice_id))
         if not is_match:
-             _logger.debug(f"Invalid voice ID format: '{voice_id}' does not match pattern '{pattern_str}'")
+            _logger.debug(f"Invalid voice ID '{voice_id}' for pattern '{pattern_str}'")
         return is_match
     except re.error as e:
-        _logger.error(f"Invalid regex pattern configured for VOICE_ID_PATTERN: {pattern_str} - {e}")
+        _logger.error(f"Invalid regex pattern for VOICE_ID_PATTERN: {pattern_str} - {e}")
         return False
 
-
-def sanitize_input(input_string: Optional[str],
-                  max_length: Optional[int] = None,
-                  remove_chars: Optional[List[str]] = None) -> str:
-    """
-    Basic sanitization for user input strings. Primarily truncates length
-    and removes a configurable list of potentially dangerous characters.
-
-    Args:
-        input_string: The string to sanitize.
-        max_length: Maximum allowed length. Defaults to config.security.SANITIZE_MAX_LENGTH.
-        remove_chars: List of characters to remove. Defaults to config.security.DANGEROUS_CHARS.
-
-    Returns:
-        str: Sanitized string.
-
-    Warning:
-        This function uses a blacklist approach (removing known bad characters),
-        which is generally less secure than allowlisting (defining allowed characters).
-        It should NOT be relied upon as the primary defense against injection attacks
-        (e.g., XSS, SQLi). Prefer strict validation at API boundaries (Pydantic, regex)
-        and context-specific output encoding/escaping (e.g., HTML escaping,
-        parameterized SQL queries). Use this function cautiously, primarily for
-        basic cleanup or limiting input length.
-    """
+def sanitize_input(input_string: Optional[str], max_length: Optional[int] = None, remove_chars: Optional[List[str]] = None) -> str:
     if input_string is None:
         return ""
 
-    # Use defaults from config if not provided
     max_len = max_length if max_length is not None else app_config.security.SANITIZE_MAX_LENGTH
     chars_to_remove = remove_chars if remove_chars is not None else app_config.security.DANGEROUS_CHARS
 
-    # 1. Truncate to max length
     sanitized = input_string[:max_len]
 
-    # 2. Remove specified dangerous characters
     for char in chars_to_remove:
         sanitized = sanitized.replace(char, '')
 
-    # 3. Optional: Normalize whitespace (e.g., replace multiple spaces with one)
     sanitized = ' '.join(sanitized.split())
 
     return sanitized
 
-
 def validate_path_component(path_component: str) -> bool:
-    """
-    Validate that a single path component (like a folder or file name within a path)
-    doesn't contain dangerous patterns like traversal or separators.
-
-    Args:
-        path_component: The path component string to validate.
-
-    Returns:
-        bool: True if the path component is safe, False otherwise.
-    """
     if not path_component:
         return False
 
-    # Check for path traversal attempts
     if '..' in path_component:
         return False
 
-    # Check for path separators (should not be in a single component)
     if '/' in path_component or '\\' in path_component:
         return False
 
-    # Check for null bytes
     if '\0' in path_component:
         return False
 
-    # Optional: Check for problematic characters depending on context/OS
     pattern = re.compile(r'^[a-zA-Z0-9_\-\.]+$')
     if not pattern.match(path_component):
-       return False
-
-    # Check if it looks like an absolute path (shouldn't be a component)
-    # This check is less reliable across OSes, better handled by `is_file_in_directory`
-    # if path_component.startswith('/') or path_component.startswith('\\') or ':' in path_component:
-    #    return False
+        return False
 
     return True
 
 def sanitize_for_filename(text: str, max_length: int = 100) -> str:
-    """Removes unsafe characters and shortens text for use in filenames."""
     if not text: return "untitled"
     sanitized = re.sub(r'[\\/*?:"<>|\0]', '_', text)
     sanitized = re.sub(r'[\s_]+', '_', sanitized)
