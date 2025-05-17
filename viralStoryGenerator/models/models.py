@@ -167,8 +167,8 @@ class QueueConsumerDetail(BaseModel):
     idle: Optional[int]
 
 class QueueConsumerGroup(BaseModel):
-    name: str
-    pending_messages: Optional[int]
+    group_name: str
+    pending: Optional[int]
     consumers: int
     consumer_details: List[QueueConsumerDetail]
     last_delivered_id: Optional[str] = None
@@ -186,7 +186,7 @@ class QueueStreamStatus(BaseModel):
     recent_messages: List[QueueRecentMessage]
 
 class SingleQueueStatusResponse(BaseModel):
-    queue_name: str
+    stream_name: str
     status: str = "available"
     stream_length: int
     consumer_groups: List[QueueConsumerGroup]

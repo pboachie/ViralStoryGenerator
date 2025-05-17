@@ -79,9 +79,6 @@ def preload_components(group_name: str):
         else:
             _logger.debug(f"Consumer group '{group_name}' already exists.")
 
-    # Ensure stream exists
-    _message_broker.ensure_stream_exists(app_config.redis.QUEUE_NAME)
-
     _logger.info(f"Worker components initialized successfully for stream '{app_config.redis.QUEUE_NAME}'.")
 
 def get_message_broker() -> Optional[RedisMessageBroker]:
@@ -157,7 +154,6 @@ async def process_api_jobs(group_name: str, consumer_name: str):
                         message_broker.acknowledge_message(group_name, message_id)
                         continue
 
-                    # Check if we have job_id and job_type
                     job_id = job_data.get("job_id")
                     job_type = job_data.get("job_type")
 
@@ -183,7 +179,7 @@ async def process_api_jobs(group_name: str, consumer_name: str):
                             try:
                                 job_data[key] = json.loads(value)
                             except:
-                                pass  # Keep as string if not valid JSON
+                                pass
 
                     # Create task to process the job
                     task = asyncio.create_task(process_api_job(job_data, consumer_name, group_name, message_broker))

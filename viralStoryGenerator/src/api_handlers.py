@@ -5,7 +5,7 @@ import os
 import datetime
 import json
 import uuid
-import re # For sanitization
+import re
 from typing import Dict, Any, Optional, List
 
 from viralStoryGenerator.models import (
@@ -84,8 +84,6 @@ def create_story_task(topic: str, sources_folder: Optional[str] = None,
 
     try:
         message_broker = get_message_broker()
-        message_broker.ensure_stream_exists("api_jobs")
-
         message_id = message_broker.publish_message(task_data_payload)
         success = message_id is not None
     except Exception as e:
@@ -101,7 +99,7 @@ def create_story_task(topic: str, sources_folder: Optional[str] = None,
 
     return task_response
 
-def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
+async def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
     """
     Get the status of a task. Checks Redis Streams first, then final storage
     if the task is marked completed or not found in Redis.
@@ -110,7 +108,7 @@ def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
     status_source = "unknown"
     try:
         message_broker = get_message_broker()
-        stream_status = message_broker.get_job_status(task_id)
+        stream_status = await message_broker.get_job_progress(task_id)
         final_result_data = {}
 
         if stream_status:
@@ -119,7 +117,7 @@ def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
             current_status = stream_status.get("status", "pending")
 
             # If completed according to Redis, try fetching final results from storage
-            if current_status == "completed":
+            if (current_status == "completed"):
                 metadata_filename = f"{task_id}_metadata.json"
                 try:
                     final_result_data = storage_manager.retrieve_file_content_as_json(filename=metadata_filename, file_type="metadata") or {}
@@ -161,7 +159,7 @@ def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
                      status_data["error"] = combined_error
                      status_data["message"] = f"Job status from Redis ({current_status}). Error fetching final results: {storage_error}"
                 elif current_status == "completed":
-                     status_data["message"] = final_result_data.get("message", "Job completed and final results retrieved from storage.") # Update message if completed successfully
+                     status_data["message"] = final_result_data.get("message", "Job completed and final results retrieved from storage.")
 
                 status_data["created_at"] = final_result_data.get("created_at", status_data["created_at"])
                 status_data["updated_at"] = final_result_data.get("updated_at", status_data["updated_at"])
@@ -202,7 +200,6 @@ def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
                  return None
             except Exception as storage_err:
                  _logger.error(f"Error checking storage for task {task_id} after Redis miss: {storage_err}")
-                 # Ensure error_response aligns with JobStatusResponse types
                  error_data_for_response = {
                      "status": "error",
                      "message": f"Error checking storage for job status: {str(storage_err)}",
@@ -259,7 +256,7 @@ def process_audio_queue():
     from .elevenlabs_tts import generate_elevenlabs_audio # Local import
 
     for filename in os.listdir(audio_queue_dir):
-        if filename.endswith(".json"):
+        if (filename.endswith(".json")):
             file_path = os.path.join(audio_queue_dir, filename)
             _logger.debug(f"Processing queued audio file: {filename}")
             try:
@@ -276,7 +273,7 @@ def process_audio_queue():
                 success = generate_elevenlabs_audio(
                     text=metadata["story"],
                     api_key=api_key,
-                    output_mp3_path=metadata["mp3_file_path"], # Assumes original path is still valid
+                    output_mp3_path=metadata["mp3_file_path"],
                     voice_id=metadata.get("voice_id"),
                     model_id=metadata.get("model_id", "eleven_multilingual_v2"),
                     stability=metadata.get("stability", 0.5),
@@ -296,7 +293,6 @@ def process_audio_queue():
 
             except json.JSONDecodeError:
                  _logger.error(f"Error reading queued file {file_path}: Invalid JSON.")
-                 # Optionally move/delete invalid file
             except Exception as e:
                 _logger.exception(f"Unexpected error processing queue file {file_path}: {e}")
 

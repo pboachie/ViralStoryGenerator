@@ -3,22 +3,20 @@
 HTTP API backend for ViralStoryGenerator.
 """
 import hmac
-import json
 import uuid
 import time
 import os
 from typing import List, Dict, Any, Optional, Tuple
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, status, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse, RedirectResponse
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import Counter, Histogram, Gauge, generate_latest
 from starlette.responses import Response
 import redis
-import time
-import tempfile
 import uvicorn
+import aiofiles
 
 from viralStoryGenerator.models.models import (
     StoryGenerationRequest,
@@ -49,10 +47,7 @@ from viralStoryGenerator.utils.security import (
     sanitize_input,
     validate_path_component
 )
-from viralStoryGenerator.src.api_handlers import (
-    create_story_task,
-    get_task_status
-)
+from viralStoryGenerator.src.api_handlers import create_story_task, get_task_status, get_message_broker
 
 import viralStoryGenerator.src.logger
 _logger = logging.getLogger(__name__)
@@ -65,9 +60,6 @@ app = FastAPI(
     title=app_config.APP_TITLE,
     description=app_config.APP_DESCRIPTION,
     version=app_config.VERSION,
-    # openapi_url=f"{app_config.http.API_PREFIX}/openapi.json",
-    # docs_url=f"{app_config.http.API_PREFIX}/docs",
-    # redoc_url=f"{app_config.http.API_PREFIX}/redoc"
 )
 
 
@@ -76,27 +68,27 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 # Authentication dependency
 async def get_api_key(request: Request, api_key: str = Depends(api_key_header)):
-    # Skip authentication if API key security is disabled
     if not app_config.http.API_KEY_ENABLED:
-        _logger.warning("API key security is disabled.")
-        return None
+        return
 
     if not api_key:
-         raise HTTPException(
+        _logger.warning(f"Missing API Key from {request.client.host if request.client else 'Unknown client'}")
+        raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="API Key required",
+            detail="Not authenticated: Missing API Key",
+            headers={"WWW-Authenticate": "APIKey"},
         )
 
     if not app_config.http.API_KEY or not hmac.compare_digest(api_key, app_config.http.API_KEY):
-        _logger.warning(f"Invalid API Key received from {request.client.host}")
+        _logger.warning(f"Invalid API Key received from {request.client.host if request.client else 'Unknown client'}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API Key",
+            detail="Not authenticated: Invalid API Key",
+            headers={"WWW-Authenticate": "APIKey"},
         )
-    _logger.debug(f"Valid API Key received from {request.client.host}")
+    _logger.debug(f"Valid API Key received from {request.client.host if request.client else 'Unknown client'}")
     return api_key
 
-# router = APIRouter(dependencies=[Depends(get_api_key)]) # Example global application
 
 # --- Middleware ---
 
@@ -108,10 +100,9 @@ app.add_middleware(
     allow_origins=app_config.http.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST"],
-    allow_headers=["*"], # Consider restricting headers
+    allow_headers=["*"],
 )
 
-# Middleware for basic security headers
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
@@ -143,7 +134,7 @@ if app_config.http.RATE_LIMIT_ENABLED and app_config.redis.ENABLED:
             socket_timeout=2,
             socket_connect_timeout=2
         )
-        redis_client.ping()  # Test connection
+        redis_client.ping()
         _logger.info("Redis rate limiting enabled and connected")
     except Exception as e:
         _logger.warning(f"Failed to connect to Redis for rate limiting: {e}. Using local memory rate limiting fallback.")
@@ -152,9 +143,11 @@ if app_config.http.RATE_LIMIT_ENABLED and app_config.redis.ENABLED:
 class RateLimiter:
     """Rate limiter using sliding window algorithm"""
 
-    def __init__(self, redis_client=None):
-        self.redis = redis_client
-        self.local_cache = {}  # Fallback in-memory storage if Redis is unavailable
+    def __init__(self, redis_client_instance, limit: int = 100, period: int = 60):
+        self.redis = redis_client_instance
+        self.limit = limit
+        self.period = period
+        self.local_cache = {}
 
     async def check_rate_limit(self, client_ip: str, endpoint: str) -> Tuple[bool, int, int, int]:
         """
@@ -178,40 +171,28 @@ class RateLimiter:
         # If Redis is available, use it for distributed rate limiting
         if self.redis:
             try:
-                if self.redis.ping(): # Check connection before using
-                    # Use Redis sorted set for sliding window
-                    pipeline = self.redis.pipeline()
-                    # Remove entries outside the current window
-                    pipeline.zremrangebyscore(rate_key, 0, current_time - window)
-                    # Add current request timestamp
-                    pipeline.zadd(rate_key, {str(uuid.uuid4()): current_time}) # Use unique member for each request
-                    # Count requests in the window
-                    pipeline.zcount(rate_key, current_time - window, current_time)
-                    # Set expiry to avoid leaking memory
-                    pipeline.expire(rate_key, window * 2)
-                    # Get the timestamp of the oldest request in the window if over limit
-                    pipeline.zrange(rate_key, -limit, -limit, withscores=True) # Get the Nth oldest request (if N=limit, this is the one that caused overflow)
+                pipe = self.redis.pipeline()
+                # Record the current request timestamp
+                pipe.zadd(rate_key, {str(current_time): current_time})
+                # Remove timestamps older than the window
+                pipe.zremrangebyscore(rate_key, 0, current_time - window)
+                pipe.zcard(rate_key)
+                pipe.expire(rate_key, window)
+                results = pipe.execute()
+                request_count = results[2] # zcard result
 
-                    results = pipeline.execute()
-                    request_count = results[2] # zcount result
+                is_allowed = request_count <= limit
 
-                    is_allowed = request_count <= limit
-
-                    if not is_allowed:
-                        oldest_relevant_req = results[4]
-                        if oldest_relevant_req:
-                             oldest_ts = oldest_relevant_req[0][1]
-                             retry_after = int(window - (current_time - oldest_ts) + 1) # Time until the oldest request expires + 1s buffer
-
-                    return is_allowed, request_count, limit, max(0, retry_after)
-                else:
-                    _logger.warning("Redis connection lost for rate limiting. Falling back to local.")
-                    self.redis = None # Mark Redis as unavailable
+                if not is_allowed:
+                    oldest_timestamps = self.redis.zrange(rate_key, 0, 0, withscores=True)
+                    if oldest_timestamps:
+                        oldest_ts = oldest_timestamps[0][1]
+                        retry_after = int(window - (current_time - oldest_ts))
+                    RATE_LIMIT_HIT.labels(client_ip=client_ip, endpoint=endpoint).inc()
+                return is_allowed, request_count, limit, retry_after
             except Exception as e:
-                _logger.error(f"Redis error during rate limiting: {e}. Falling back to local.")
-                self.redis = None # Mark Redis as unavailable
+                _logger.error(f"Redis error during rate limiting for {client_ip} at {endpoint}: {e}. Falling back to local cache.")
 
-        # Fallback to local memory if Redis is unavailable
         if rate_key not in self.local_cache:
             self.local_cache[rate_key] = []
 
@@ -222,64 +203,51 @@ class RateLimiter:
         is_allowed = request_count < limit # Allow *up to* the limit
 
         if is_allowed:
-            # Add current request only if allowed
             self.local_cache[rate_key].append(current_time)
-            request_count += 1 # Increment count after adding
-            retry_after = 0
         else:
-             if self.local_cache[rate_key]:
-                 oldest_ts = self.local_cache[rate_key][0]
-                 retry_after = int(window - (current_time - oldest_ts) + 1)
+            if self.local_cache[rate_key]:
+                oldest_ts_in_window = min(self.local_cache[rate_key])
+                retry_after = int(window - (current_time - oldest_ts_in_window))
+            RATE_LIMIT_HIT.labels(client_ip=client_ip, endpoint=endpoint).inc()
 
 
         return is_allowed, request_count, limit, max(0, retry_after)
+
+    def is_allowed(self, key: str, endpoint: str) -> bool:
+        """Check if a request is allowed under the rate limit."""
+        if not self.redis:
+            _logger.warning(f"Rate limiter: Redis not available for key {key}, endpoint {endpoint}. Allowing request (fallback).")
+            return True
+
+        current_time = int(time.time())
+        redis_key = f"rate_limit:{key}:{endpoint}"
+
+        pipe = self.redis.pipeline()
+        pipe.zremrangebyscore(redis_key, 0, current_time - self.period)
+        pipe.zadd(redis_key, {str(current_time): current_time})
+        pipe.zcard(redis_key)
+        pipe.expire(redis_key, self.period)
+        results = pipe.execute()
+
+        count = results[2]
+        return count <= self.limit
 
 rate_limiter = RateLimiter(redis_client)
 
 # Rate limiting middleware
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    start_time = time.time()
-    response = None # Define response initially
-
-    if app_config.http.RATE_LIMIT_ENABLED:
-        client_ip = request.client.host
+    if app_config.http.RATE_LIMIT_ENABLED and redis_client:
+        client_ip = request.client.host if request.client else "unknown"
         endpoint = request.url.path
-
-        # Skip rate limiting for certain endpoints
-        if endpoint in ['/health', '/metrics', '/docs', '/openapi.json']:
-            response = await call_next(request)
-            return response
-
-        is_allowed, current, limit, retry_after = await rate_limiter.check_rate_limit(client_ip, endpoint)
-
-        # If request exceeds limit, return 429 Too Many Requests
-        if not is_allowed:
+        if not rate_limiter.is_allowed(client_ip, endpoint):
             RATE_LIMIT_HIT.labels(client_ip=client_ip, endpoint=endpoint).inc()
-            _logger.warning(f"Rate limit exceeded for {client_ip} on {endpoint}: {current}/{limit}")
-
-            # Custom rate limit exceeded response
-            response = JSONResponse(
+            _logger.warning(f"Rate limit exceeded for {client_ip} at {endpoint}")
+            return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                content={
-                    "error": "Rate limit exceeded",
-                    "detail": f"Too many requests. Maximum {limit} requests per {app_config.http.RATE_LIMIT_WINDOW} second window."
-                },
-                headers={
-                    "X-RateLimit-Limit": str(limit),
-                    "X-RateLimit-Remaining": "0",
-                    "X-RateLimit-Reset": str(int(time.time()) + retry_after),
-                    "Retry-After": str(retry_after)
-                }
+                content={"detail": "Rate limit exceeded. Please try again later."}
             )
-            return response
-        else:
-             response = await call_next(request)
-             response.headers["X-RateLimit-Limit"] = str(limit)
-             response.headers["X-RateLimit-Remaining"] = str(max(0, limit - current))
-    else:
-        response = await call_next(request)
-
+    response = await call_next(request)
     return response
 
 # Middleware for metrics and request logging
@@ -287,23 +255,26 @@ async def rate_limit_middleware(request: Request, call_next):
 async def metrics_logging_middleware(request: Request, call_next):
     start_time = time.time()
     ACTIVE_REQUESTS.inc()
+
     response = None
     status_code = 500
 
     try:
         response = await call_next(request)
         status_code = response.status_code
-    except Exception as e:
-        _logger.exception(f"Unhandled exception during request: {request.method} {request.url.path}") # Log exception details
-        status_code = 500
-        raise e from None
+    except HTTPException as http_exc: # Capture FastAPI's own HTTPExceptions
+        status_code = http_exc.status_code
+        raise
+    except Exception:
+        raise
     finally:
         process_time = time.time() - start_time
         ACTIVE_REQUESTS.dec()
-        endpoint_path = request.url.path
-        REQUEST_LATENCY.labels(method=request.method, endpoint=endpoint_path).observe(process_time)
-        REQUEST_COUNT.labels(method=request.method, endpoint=endpoint_path, status=status_code).inc()
-        _logger.info(f"{request.client.host} - \"{request.method} {request.url.path} HTTP/{request.scope['http_version']}\" {status_code} {process_time:.4f}s")
+        REQUEST_COUNT.labels(method=request.method, endpoint=request.url.path, status=status_code).inc()
+        REQUEST_LATENCY.labels(method=request.method, endpoint=request.url.path).observe(process_time)
+
+        client_host = request.client.host if request.client else "Unknown"
+        _logger.info(f"{client_host} - \"{request.method} {request.url.path} HTTP/{request.scope['http_version']}\" {status_code} {process_time:.4f}s")
 
     return response
 
@@ -328,6 +299,14 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 
 # --- API Endpoints ---
+
+# Define allowed file types, their extensions, and media types
+FILE_TYPE_DETAILS = {
+    "audio": {"extension": "mp3", "media_type": "audio/mpeg", "storage_file_type": "audio"},
+    "story": {"extension": "txt", "media_type": "text/plain", "storage_file_type": "story"},
+    "storyboard": {"extension": "json", "media_type": "application/json", "storage_file_type": "storyboard"},
+    "metadata": {"extension": "json", "media_type": "application/json", "storage_file_type": "metadata"},
+}
 
 # Health and Metrics Endpoints
 @router.get("/metrics", tags=["Health and Metrics"])
@@ -431,299 +410,139 @@ async def check_story_status(task_id: str):
          raise HTTPException(status_code=500, detail="Failed to retrieve task status.")
 
 
-@router.get("/stories/{task_id}/download/{file_type}", tags=["Story Management"], dependencies=[Depends(get_api_key)])
-async def download_story_file(task_id: str, file_type: str):
-    """Download a generated file from a completed story task"""
-    _logger.debug(f"Request to download file type '{file_type}' for task_id: {task_id}")
-    if not is_valid_uuid(task_id):
-        raise HTTPException(status_code=400, detail="Invalid task ID format")
-
-    allowed_file_types = ["story", "audio", "storyboard"]
-    if file_type not in allowed_file_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid file type. Must be one of: {', '.join(allowed_file_types)}"
-        )
-
-    task_info = get_task_status(task_id)
-    if not task_info:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-
-    if task_info.get("status") != "completed":
-        raise HTTPException(status_code=400, detail=f"Task {task_id} is not completed (status: {task_info.get('status')})")
-
-    file_paths = task_info.get("file_paths", {})
-    relative_file_path = file_paths.get(file_type)
-
-    if not relative_file_path:
-        raise HTTPException(status_code=404, detail=f"No {file_type} file available for task {task_id}")
-
-    filename = os.path.basename(relative_file_path) # Get filename
-    if not is_safe_filename(filename):
-         _logger.warning(f"Security: Unsafe filename retrieved from task data: {filename}")
-         raise HTTPException(status_code=500, detail="Internal error: Invalid filename stored for task.")
-
-    expected_base_directory = None
-    if file_type == "audio":
-        expected_base_directory = os.path.abspath(app_config.storage.AUDIO_STORAGE_PATH)
-        media_type = "audio/mpeg"
-    elif file_type == "storyboard":
-        expected_base_directory = os.path.abspath(app_config.storage.STORYBOARD_STORAGE_PATH)
-        media_type = "application/json"
-    else: # story
-        expected_base_directory = os.path.abspath(app_config.storage.STORY_STORAGE_PATH)
-        media_type = "text/plain"
-
-    if app_config.storage.PROVIDER == "local":
-        full_file_path = os.path.abspath(os.path.join(expected_base_directory, filename))
-
-        if not os.path.exists(full_file_path) or not os.path.isfile(full_file_path):
-             _logger.error(f"File not found on local disk: {full_file_path}")
-             raise HTTPException(status_code=404, detail="File not found on server")
-
-        if not is_file_in_directory(full_file_path, expected_base_directory):
-             _logger.critical(f"SECURITY BREACH ATTEMPT: Access denied for file outside storage directory: {full_file_path}")
-             raise HTTPException(status_code=403, detail="Access denied")
-
-        _logger.info(f"Serving local file: {full_file_path}")
-        return FileResponse(path=full_file_path, media_type=media_type, filename=filename)
-    else:
-        _logger.info(f"Retrieving file '{filename}' of type '{file_type}' from cloud storage: {app_config.storage.PROVIDER}")
-        try:
-            file_content = storage_manager.retrieve_file(filename=filename, file_type=file_type)
-
-            if file_content is None:
-                _logger.error(f"File '{filename}' not found in cloud storage.")
-                raise HTTPException(status_code=404, detail="File not found in storage.")
-
-            if isinstance(file_content, bytes):
-                 return Response(content=file_content, media_type=media_type, headers={"Content-Disposition": f"attachment; filename={filename}"})
-            elif hasattr(file_content, 'read'): # Check if it's a file-like object/stream
-                 return StreamingResponse(file_content, media_type=media_type, headers={"Content-Disposition": f"attachment; filename={filename}"})
-            else:
-                 _logger.error(f"Unexpected content type from storage manager: {type(file_content)}")
-                 raise HTTPException(status_code=500, detail="Internal error retrieving file from storage.")
-
-        except Exception as e:
-            _logger.exception(f"Failed to retrieve file {filename} from cloud storage: {e}")
-            raise HTTPException(status_code=500, detail="Failed to retrieve file from storage.")
-
 
 # --- File Serving Endpoints---
-# These endpoints might be served directly by Nginx in production for efficiency.
 
-@router.get("/audio/{filename}", tags=["File Serving"], dependencies=[Depends(get_api_key)])
-async def serve_audio_file(filename: str):
-    """Serve audio files directly (publicly accessible?)"""
-    _logger.debug(f"Request to serve audio file: {filename}")
-    if not is_safe_filename(filename):
-        raise HTTPException(status_code=400, detail="Invalid filename format.")
+@router.get("/files/{task_id}/{file_type_key}", tags=["File Serving"], dependencies=[Depends(get_api_key)])
+async def serve_task_file(task_id: str, file_type_key: str, request: Request):
+    """
+    Serves a file associated with a task_id.
+    Supports range requests for audio files for streaming.
+    - task_id: The ID of the task.
+    - file_type_key: The type of file to serve (e.g., "audio", "story", "metadata", "storyboard").
+    """
+    _logger.debug(f"Request to serve file for task_id: {task_id}, file_type_key: {file_type_key}")
+
+    if not is_valid_uuid(task_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid task_id format.")
+
+    if file_type_key not in FILE_TYPE_DETAILS:
+        allowed_keys = ", ".join(FILE_TYPE_DETAILS.keys())
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid file_type_key. Allowed types are: {allowed_keys}")
+
+    details = FILE_TYPE_DETAILS[file_type_key]
+    storage_file_type = details["storage_file_type"]
+    media_type = details["media_type"]
+    file_extension = details["extension"]
+
+    actual_filename = f"{task_id}_{storage_file_type}.{file_extension}"
+
+    if not is_safe_filename(actual_filename):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Generated filename is invalid and potentially unsafe.")
 
     try:
-        serve_info = storage_manager.serve_file(filename, "audio")
+        serve_info = storage_manager.serve_file(actual_filename, storage_file_type)
 
-        if isinstance(serve_info, str) and os.path.exists(serve_info):
-             local_base = os.path.abspath(app_config.storage.AUDIO_STORAGE_PATH)
-             if not is_file_in_directory(serve_info, local_base):
-                  _logger.critical(f"SECURITY BREACH ATTEMPT: Serve path outside allowed dir: {serve_info}")
-                  raise HTTPException(status_code=403, detail="Access denied.")
-             return FileResponse(path=serve_info, media_type="audio/mpeg", filename=filename)
-        elif isinstance(serve_info, dict) and 'error' in serve_info:
-             _logger.error(f"Storage manager error serving audio {filename}: {serve_info['error']}")
-             raise HTTPException(status_code=500, detail="Error serving file from storage.")
-        elif serve_info:
-             _logger.warning(f"Unexpected return type {type(serve_info)} from storage_manager.serve_file for audio.")
-             try:
-                 return Response(content=serve_info, media_type="audio/mpeg", headers={"Content-Disposition": f"attachment; filename={filename}"})
-             except:
-                  raise HTTPException(status_code=500, detail="Internal error serving file.")
-        else:
-             raise HTTPException(status_code=404, detail="Audio file not found.")
+        if isinstance(serve_info, str) and os.path.exists(serve_info):  # Local file path
+            local_file_path = serve_info
 
-    except FileNotFoundError:
-         raise HTTPException(status_code=404, detail="Audio file not found.")
-    except Exception as e:
-         _logger.exception(f"Error serving audio file {filename}: {e}")
-         raise HTTPException(status_code=500, detail="Internal server error serving file.")
-
-
-@router.get("/api/audio/stream/{filename}", tags=["File Serving"], dependencies=[Depends(get_api_key)])
-async def stream_audio(filename: str, request: Request):
-    """Stream audio file with support for range requests (publicly accessible?)"""
-    _logger.debug(f"Request to stream audio file: {filename}")
-    if not is_safe_filename(filename):
-        raise HTTPException(status_code=400, detail="Invalid filename format.")
-
-    range_header = request.headers.get("Range")
-
-    file_size = None
-    try:
-        if app_config.storage.PROVIDER == "local":
-            local_path = os.path.join(app_config.storage.AUDIO_STORAGE_PATH, filename)
-            base_dir = os.path.abspath(app_config.storage.AUDIO_STORAGE_PATH)
-            if not os.path.exists(local_path) or not is_file_in_directory(local_path, base_dir):
-                 raise FileNotFoundError("File not found or access denied")
-            file_size = os.path.getsize(local_path)
-        else:
-            temp_file_info = storage_manager.serve_file(filename, "audio")
-            if isinstance(temp_file_info, str) and os.path.exists(temp_file_info):
-                file_size = os.path.getsize(temp_file_info)
+            # Security check: Ensure file is within the designated storage directory
+            storage_path_attr = f"{storage_file_type.upper()}_STORAGE_PATH"
+            if hasattr(app_config.storage, storage_path_attr):
+                expected_base_dir = os.path.abspath(getattr(app_config.storage, storage_path_attr))
+                if not is_file_in_directory(local_file_path, expected_base_dir):
+                    _logger.error(f"Access denied: File {local_file_path} is not in expected directory {expected_base_dir}.")
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access to file denied.")
             else:
-                 raise FileNotFoundError("Could not determine file size from storage")
+                _logger.warning(f"Could not determine base storage directory for file_type '{storage_file_type}' for security check.")
+                # Strict: raise error if path cannot be verified.
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Cannot verify file location security.")
 
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Audio file not found.")
-    except Exception as e:
-        _logger.exception(f"Error getting file size for streaming {filename}: {e}")
-        raise HTTPException(status_code=500, detail="Error accessing file for streaming.")
+            if file_type_key == "audio" and request.headers.get("Range"):
+                file_size = os.path.getsize(local_file_path)
+                range_header = request.headers.get("Range")
 
-    start = 0
-    end = file_size - 1
-    status_code = status.HTTP_200_OK
+                start_byte_str, end_byte_str = None, None
+                if range_header and range_header.lower().startswith("bytes="):
+                    parts = range_header.split("=")[1].split("-")
+                    start_byte_str = parts[0]
+                    if len(parts) > 1 and parts[1]:
+                        end_byte_str = parts[1]
 
-    if range_header:
-        try:
-            range_val = range_header.strip().lower()
-            if not range_val.startswith("bytes="):
-                 raise ValueError("Invalid Range header format")
-            parts = range_val.split("=")[1].split("-")
-            start = int(parts[0]) if parts[0] else 0
-            end = int(parts[1]) if parts[1] else file_size - 1
+                start = int(start_byte_str) if start_byte_str and start_byte_str.isdigit() else 0
+                end = int(end_byte_str) if end_byte_str and end_byte_str.isdigit() else file_size - 1
 
-            if start >= file_size or start < 0 or end < start:
-                 raise ValueError("Invalid range values")
+                if not (0 <= start < file_size and start <= end < file_size):
+                    _logger.warning(f"Invalid range requested: {start}-{end} for file size {file_size}")
+                    raise HTTPException(
+                        status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                        detail=f"Range {start}-{end} not satisfiable for file size {file_size}",
+                        headers={"Content-Range": f"bytes */{file_size}"}
+                    )
 
-            end = min(end, file_size - 1)
-            status_code = status.HTTP_206_PARTIAL_CONTENT
+                content_length = (end - start) + 1
+                http_status_code = status.HTTP_206_PARTIAL_CONTENT
 
-        except ValueError as ve:
-             _logger.warning(f"Invalid Range header '{range_header}': {ve}")
-             return Response(status_code=status.HTTP_416_RANGE_NOT_SATISFIABLE)
+                headers = {
+                    "Content-Range": f"bytes {start}-{end}/{file_size}",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(content_length),
+                    "Content-Type": media_type,
+                    "Cache-Control": "public, max-age=3600"
+                }
 
+                async def chunk_supplier(file_path: str, offset: int, length: int):
+                    async with aiofiles.open(file_path, 'rb') as f:
+                        await f.seek(offset)
+                        remaining = length
+                        while remaining > 0:
+                            data_to_read = min(remaining, 65536)  # 64KB chunks
+                            chunk = await f.read(data_to_read)
+                            if not chunk:
+                                break
+                            yield chunk
+                            remaining -= len(chunk)
 
-    content_length = end - start + 1
-
-    async def file_streamer(start_byte: int, length: int):
-        chunk_size = 64 * 1024 # 64KB
-        bytes_yielded = 0
-        try:
-            stream = storage_manager.retrieve_file(
-                filename=filename,
-                file_type="audio",
-                start_byte=start_byte,
-                end_byte=start_byte + length - 1
-            )
-
-            if stream is None:
-                 _logger.error(f"Streaming error: retrieve_file returned None for range {start_byte}-{start_byte+length-1}")
-                 raise IOError("Failed to retrieve file stream chunk")
-
-            if hasattr(stream, 'read'):
-                 while bytes_yielded < length:
-                      read_size = min(chunk_size, length - bytes_yielded)
-                      chunk = stream.read(read_size)
-                      if not chunk: break
-                      yield chunk
-                      bytes_yielded += len(chunk)
-                 if hasattr(stream, 'close'): stream.close()
-
-            elif hasattr(stream, 'chunks'): # Check if it's a file-like object/stream
-                 async for chunk in stream.chunks():
-                      yield chunk
-                      bytes_yielded += len(chunk)
-
-            elif isinstance(stream, bytes):
-                 yield stream
-                 bytes_yielded = len(stream)
-
+                return StreamingResponse(
+                    chunk_supplier(local_file_path, start, content_length),
+                    status_code=http_status_code,
+                    headers=headers,
+                    media_type=media_type
+                )
             else:
-                 _logger.error(f"Streaming error: Unexpected stream type {type(stream)}")
-                 raise IOError("Unsupported stream type from storage manager")
+                return FileResponse(
+                    path=local_file_path,
+                    media_type=media_type,
+                    filename=actual_filename
+                )
 
-            if bytes_yielded < length:
-                _logger.warning(f"Streaming ended prematurely for {filename}: yielded {bytes_yielded}, expected {length}")
+        elif isinstance(serve_info, dict) and 'url' in serve_info:  # S3/Azure presigned URL
+            return RedirectResponse(url=serve_info['url'])
 
-        except Exception as e:
-            _logger.exception(f"Error during audio streaming for {filename}: {e}")
-            yield b''
-
-
-    headers = {
-        "Content-Range": f"bytes {start}-{end}/{file_size}",
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(content_length),
-        "Content-Type": "audio/mpeg",
-        "Cache-Control": "public, max-age=3600"
-    }
-    return StreamingResponse(
-        file_streamer(start, content_length),
-        status_code=status_code,
-        headers=headers,
-        media_type="audio/mpeg"
-    )
-
-
-@router.get("/story/{filename}", tags=["File Serving"])
-async def serve_story_file(filename: str):
-    """Serve story text files directly (publicly accessible?)"""
-    _logger.debug(f"Request to serve story file: {filename}")
-    if not is_safe_filename(filename):
-        raise HTTPException(status_code=400, detail="Invalid filename format.")
-
-    try:
-        serve_info = storage_manager.serve_file(filename, "story")
-        if isinstance(serve_info, str) and os.path.exists(serve_info):
-             local_base = os.path.abspath(app_config.storage.STORY_STORAGE_PATH)
-             if not is_file_in_directory(serve_info, local_base):
-                 raise HTTPException(status_code=403, detail="Access denied.")
-             return FileResponse(path=serve_info, media_type="text/plain", filename=filename)
         elif isinstance(serve_info, dict) and 'error' in serve_info:
-             raise HTTPException(status_code=500, detail="Error serving file from storage.")
-        elif serve_info: # Assume bytes or similar direct content
-             return Response(content=serve_info, media_type="text/plain", headers={"Content-Disposition": f"attachment; filename={filename}"})
+            _logger.error(f"Storage manager error for {actual_filename} ({storage_file_type}): {serve_info['error']}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error serving file from storage: {serve_info['error']}")
+
         else:
-             raise HTTPException(status_code=404, detail="Story file not found.")
+            _logger.warning(f"File not found or unable to serve by storage_manager: task_id={task_id}, file_type_key={file_type_key}, constructed_filename={actual_filename}, serve_info: {serve_info}")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{file_type_key.capitalize()} file not found for task {task_id}.")
+
     except FileNotFoundError:
-         raise HTTPException(status_code=404, detail="Story file not found.")
+        _logger.warning(f"Direct FileNotFoundError for task_id={task_id}, file_type_key={file_type_key}, constructed_filename={actual_filename}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{file_type_key.capitalize()} file not found.")
+    except HTTPException as he:
+        raise he
     except Exception as e:
-         _logger.exception(f"Error serving story file {filename}: {e}")
-         raise HTTPException(status_code=500, detail="Internal server error serving file.")
-
-
-@router.get("/storyboard/{filename}", tags=["File Serving"])
-async def serve_storyboard_file(filename: str):
-    """Serve storyboard JSON files directly (publicly accessible?)"""
-    _logger.debug(f"Request to serve storyboard file: {filename}")
-    if not is_safe_filename(filename):
-        raise HTTPException(status_code=400, detail="Invalid filename format.")
-
-    try:
-        serve_info = storage_manager.serve_file(filename, "storyboard")
-        if isinstance(serve_info, str) and os.path.exists(serve_info):
-             local_base = os.path.abspath(app_config.storage.STORYBOARD_STORAGE_PATH)
-             if not is_file_in_directory(serve_info, local_base):
-                 raise HTTPException(status_code=403, detail="Access denied.")
-             return FileResponse(path=serve_info, media_type="application/json", filename=filename)
-        elif isinstance(serve_info, dict) and 'error' in serve_info:
-             raise HTTPException(status_code=500, detail="Error serving file from storage.")
-        elif serve_info:
-             return Response(content=serve_info, media_type="application/json", headers={"Content-Disposition": f"attachment; filename={filename}"})
-        else:
-             raise HTTPException(status_code=404, detail="Storyboard file not found.")
-    except FileNotFoundError:
-         raise HTTPException(status_code=404, detail="Storyboard file not found.")
-    except Exception as e:
-         _logger.exception(f"Error serving storyboard file {filename}: {e}")
-         raise HTTPException(status_code=500, detail="Internal server error serving file.")
-
+        _logger.exception(f"Unexpected error serving file for task_id={task_id}, file_type_key={file_type_key}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error while serving file.")
 
 # --- Job Management Endpoints (Using Redis Queue Directly) ---
 API_QUEUE_NAME = app_config.redis.QUEUE_NAME
 RESULT_PREFIX = app_config.redis.RESULT_PREFIX
 
 @router.post("/generate", response_model=JobResponse, status_code=status.HTTP_202_ACCEPTED, tags=["Job Management"], dependencies=[Depends(get_api_key)])
-async def generate_story_from_urls(
-    request: StoryGenerationRequest,
+async def generate_story_from_urls_endpoint(
+    request_data: StoryGenerationRequest,
     background_tasks: BackgroundTasks,
 ):
     """
@@ -731,185 +550,112 @@ async def generate_story_from_urls(
     This endpoint queues the request for processing and returns a job ID.
     Relies on a separate worker process consuming from the Redis stream.
     """
-    _logger.info(f"Received request to generate story from URLs for topic: '{request.topic}'")
+    _logger.info(f"Received request to generate story from URLs for topic: '{request_data.topic}'")
     try:
-        if not app_config.storyboard.ENABLE_STORYBOARD_GENERATION:
-            _logger.info("Storyboard generation is disabled in the configuration.")
-            request.include_images = False
+        if not request_data.topic:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Topic cannot be empty.")
+        if not request_data.urls:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="URLs list cannot be empty.")
 
-        # Generate a unique job ID
+        # Sanitize inputs
+        sanitized_topic = sanitize_input(request_data.topic)
+        sanitized_urls = [sanitize_input(str(url)) for url in request_data.urls]
+        raw_voice_id = getattr(request_data, 'voice_id', None)
+        sanitized_voice_id = sanitize_input(raw_voice_id) if raw_voice_id else None
+
+        if sanitized_voice_id and not is_valid_voice_id(sanitized_voice_id):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid voice_id format.")
+
         job_id = str(uuid.uuid4())
-        job_data = {
+
+        # Safely access other optional fields for the task payload
+        include_storyboard = getattr(request_data, 'include_storyboard', None)
+        custom_prompt = getattr(request_data, 'custom_prompt', None)
+        output_format = getattr(request_data, 'output_format', None)
+        temperature = getattr(request_data, 'temperature', None)
+        chunk_size = getattr(request_data, 'chunk_size', None)
+
+        task_payload = {
             "job_id": job_id,
             "job_type": "generate_story",
-            "topic": request.topic,
-            "urls": json.dumps([str(url) for url in request.urls]),
-            "include_images": request.include_images,
-            "temperature": str(request.temperature if request.temperature is not None else app_config.llm.TEMPERATURE),
-            "chunk_size": str(request.chunk_size if request.chunk_size is not None else app_config.llm.CHUNK_SIZE),
-            "request_time": str(time.time())
+            "topic": sanitized_topic,
+            "urls": sanitized_urls,
+            "voice_id": sanitized_voice_id,
+            "include_storyboard": include_storyboard if include_storyboard is not None \
+                                 else app_config.storyboard.ENABLE_STORYBOARD_GENERATION,
+            "request_time": time.time(),
+            "custom_prompt": sanitize_input(custom_prompt) if custom_prompt else None,
+            "output_format": sanitize_input(output_format) if output_format else "standard",
+            "temperature": temperature if temperature is not None else app_config.llm.TEMPERATURE,
+            "chunk_size": chunk_size if chunk_size is not None else app_config.llm.CHUNK_SIZE,
         }
 
-        redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
-        # Use the configured queue name from app_config
-        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=app_config.redis.QUEUE_NAME)
+        message_broker = get_message_broker()
+        message_id = message_broker.publish_message(task_payload)
 
-        # Ensure the stream exists before publishing
-        message_broker.ensure_stream_exists(app_config.redis.QUEUE_NAME)
+        if message_id:
+            _logger.info(f"Job {job_id} for topic '{sanitized_topic}' queued successfully with message ID {message_id}.")
+            return JobResponse(job_id=job_id, message="Story generation task queued.")
+        else:
+            _logger.error(f"Failed to queue job {job_id} for topic '{sanitized_topic}'.")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to queue story generation task.")
 
-        try:
-            message_id = message_broker.publish_message(job_data)
-            success = message_id is not None
-        except Exception as e:
-            _logger.error(f"Failed to publish message to stream api_jobs: {e}")
-            success = False
-
-        if not success:
-            _logger.error(f"Failed to add job {job_id} to Redis stream.")
-            raise HTTPException(status_code=500, detail="Failed to queue job for processing.")
-
-        _logger.info(f"Job {job_id} queued successfully for topic: '{request.topic}'")
-        return JobResponse(
-            job_id=job_id,
-            message="Story generation job queued successfully. A worker will process it."
-        )
-
-    except HTTPException:
-         raise
+    except HTTPException as he:
+        _logger.warning(f"HTTPException during /generate: {he.detail}")
+        raise he
     except Exception as e:
-        _logger.exception(f"Error queueing job for topic '{request.topic}': {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error queueing job.")
+        _logger.exception(f"Unexpected error in /generate for topic '{request_data.topic}': {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {str(e)}")
 
 @router.get("/status/{job_id}", response_model=JobStatusResponse, tags=["Job Management"], dependencies=[Depends(get_api_key)])
-async def get_job_status(job_id: str):
-    """
-    Get the status of a story generation job queued via /generate endpoint.
-    Returns the result if the job has completed.
-    """
-    _logger.debug(f"Checking status for job_id: {job_id}")
+async def get_job_status_endpoint(job_id: str):
+    """Retrieve the status of a previously submitted job."""
     if not is_valid_uuid(job_id):
-        raise HTTPException(status_code=400, detail="Invalid job ID format")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id format.")
 
+    _logger.debug(f"Fetching status for job_id: {job_id}")
     try:
-        redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
-        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=API_QUEUE_NAME)
+        message_broker = get_message_broker()
+        status_data = await message_broker.get_job_progress(job_id)
 
-        # Get job status from the Redis Stream
-        job_status = message_broker.get_job_status(job_id)
+        if not status_data:
+            _logger.info(f"Job status for {job_id} not found in Redis stream/results.")
+            handler_status = get_task_status(job_id)
+            if handler_status and handler_status.get("status") != "not_found":
+                _logger.info(f"Job status for {job_id} found via api_handlers.get_task_status.")
+                return JobStatusResponse(**handler_status)
+            else:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job with ID {job_id} not found.")
 
-        if not job_status:
-            _logger.warning(f"Job ID not found in Redis Stream: {job_id}")
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+        response_data = {
+            "job_id": status_data.get("job_id", job_id),
+            "status": status_data.get("status", "unknown"),
+            "message": status_data.get("message", "Status retrieved from Redis."),
+            "created_at": status_data.get("created_at") or status_data.get("request_time"),
+            "updated_at": status_data.get("updated_at") or status_data.get("timestamp"),
+            "error": status_data.get("error"),
+            "result": status_data.get("result"),
+            "story_script": status_data.get("story_script", status_data.get("result", {}).get("story_script") if isinstance(status_data.get("result"), dict) else None),
+            "storyboard": status_data.get("storyboard", status_data.get("result", {}).get("storyboard") if isinstance(status_data.get("result"), dict) else None),
+            "audio_url": status_data.get("audio_url", status_data.get("result", {}).get("audio_url") if isinstance(status_data.get("result"), dict) else None),
+            "video_url": status_data.get("video_url", status_data.get("result", {}).get("video_url") if isinstance(status_data.get("result"), dict) else None),
+            "image_urls": status_data.get("image_urls", status_data.get("result", {}).get("image_urls") if isinstance(status_data.get("result"), dict) else None),
+            "sources": status_data.get("sources", status_data.get("result", {}).get("sources") if isinstance(status_data.get("result"), dict) else None),
+        }
 
-        if "job_id" not in job_status:
-             job_status["job_id"] = job_id
+        return JobStatusResponse(**response_data)
 
-        if job_status.get("status") == "completed":
-            _logger.debug(f"Job {job_id} is completed. Attempting to load content from storage.")
-            try:
-                # --- Story Script ---
-                if ref := job_status.pop("story_script_ref", None):
-                    filename = os.path.basename(ref)
-                    _logger.debug(f"Retrieving story script: {filename}")
-                    content = storage_manager.retrieve_file(filename=filename, file_type="story")
-                    if content:
-                        if isinstance(content, bytes):
-                            job_status["story_script"] = content.decode('utf-8')
-                        elif hasattr(content, 'read'):
-                            try:
-                                job_status["story_script"] = content.read().decode('utf-8')
-                            finally:
-                                if hasattr(content, 'close'):
-                                    content.close()
-                        else:
-                            job_status["story_script"] = str(content)
-                    else:
-                         _logger.warning(f"Story script file not found via ref {ref} for job {job_id}")
-
-                # --- Storyboard ---
-                if ref := job_status.pop("storyboard_ref", None):
-                    filename = os.path.basename(ref)
-                    _logger.debug(f"Retrieving storyboard: {filename}")
-                    content = storage_manager.retrieve_file(filename=filename, file_type="storyboard")
-                    if content:
-                        try:
-                            if isinstance(content, bytes):
-                                json_content = content.decode('utf-8')
-                            elif hasattr(content, 'read'):
-                                try:
-                                    json_content = content.read().decode('utf-8')
-                                finally:
-                                    if hasattr(content, 'close'):
-                                        content.close()
-                            else:
-                                json_content = str(content)
-                            job_status["storyboard"] = json.loads(json_content)
-                        except json.JSONDecodeError as json_e:
-                            _logger.error(f"Failed to parse storyboard JSON for job {job_id}: {json_e}")
-                        except Exception as e:
-                             _logger.error(f"Error processing storyboard content for job {job_id}: {e}")
-                    else:
-                         _logger.warning(f"Storyboard file not found via ref {ref} for job {job_id}")
-
-                # --- Audio URL ---
-                if ref := job_status.pop("audio_ref", None):
-                     filename = os.path.basename(ref)
-                     job_status["audio_url"] = f"/api/stories/{job_id}/download/audio" # todo: potentially /api/audio/{filename}
-                     _logger.debug(f"Constructed audio URL: {job_status['audio_url']}")
-                else:
-                     job_status["audio_url"] = None
-
-
-                # --- Sources (from Metadata) ---
-                if ref := job_status.pop("metadata_ref", None):
-                    try:
-                        metadata_content = storage_manager.retrieve_file_content_as_json(
-                            filename=ref,
-                            file_type="metadata"
-                        )
-                        if metadata_content and isinstance(metadata_content, dict) and "sources" in metadata_content:
-                            job_status["sources"] = metadata_content["sources"]
-                            _logger.debug(f"Successfully loaded sources for job {job_id} from metadata file: {ref}")
-                        else:
-                            job_status["sources"] = None
-                            _logger.warning(f"Metadata file {ref} for job {job_id} loaded, but 'sources' key missing, not a dict, or content is null. Content: {str(metadata_content)[:200]}")
-                    except FileNotFoundError:
-                        job_status["sources"] = None
-                        _logger.warning(f"Metadata file {ref} not found for job {job_id}.")
-                    except Exception as e:
-                        job_status["sources"] = None
-                        _logger.error(f"Failed to load or parse sources from metadata_ref {ref} for job {job_id}: {e}", exc_info=True)
-                else:
-                    job_status["sources"] = None
-                    _logger.debug(f"No metadata_ref found in job status for job {job_id}, 'sources' will be null.")
-
-            except Exception as load_e:
-                 _logger.error(f"Error loading content from storage for completed job {job_id}: {load_e}", exc_info=True)
-                 if "sources" not in job_status: job_status["sources"] = None
-                 if "story_script" not in job_status: job_status["story_script"] = None
-                 if "storyboard" not in job_status: job_status["storyboard"] = None
-                 if "audio_url" not in job_status: job_status["audio_url"] = None
-
-
-        _logger.debug(f"Final status data being passed to model for job {job_id}: {job_status}")
-        try:
-            return JobStatusResponse(**job_status)
-        except Exception as model_e:
-             _logger.error(f"Error creating JobStatusResponse model for job {job_id}: {model_e}. Raw status after potential enrichment: {job_status}")
-             raise HTTPException(status_code=500, detail="Internal server error processing job status.")
-
-    except HTTPException:
-        raise
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        _logger.exception(f"Error checking job status for {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error checking job status.")
-
+        _logger.exception(f"Error retrieving status for job {job_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to retrieve job status: {str(e)}")
 
 # --- Queue Management Admin Endpoints ---
 queue_router = APIRouter(
-    prefix="/queue", # Prefix all routes in this router with /queue
+    prefix="/queue",
     tags=["Queue Management"],
-    dependencies=[Depends(get_api_key)] # Apply API key auth to all queue endpoints
+    dependencies=[Depends(get_api_key)]
 )
 
 @queue_router.get("/status", response_model=QueueStatusResponse)
@@ -922,13 +668,61 @@ async def get_queue_status():
     try:
         redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
         message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=app_config.redis.QUEUE_NAME)
-        raw_status = message_broker.get_queue_status()
+
+        raw_status = await message_broker.get_queue_information()
+        raw_consumer_groups = raw_status.get("consumer_groups", [])
+        mapped_consumer_groups = []
+        for group_data in raw_consumer_groups:
+            if isinstance(group_data, dict):
+                raw_consumer_details = group_data.get("consumer_details", [])
+                mapped_consumer_details = []
+                if isinstance(raw_consumer_details, list):
+                    for detail_data in raw_consumer_details:
+                        if isinstance(detail_data, dict):
+                            try:
+                                mapped_consumer_details.append(QueueConsumerDetail(**detail_data))
+                            except Exception as e_detail:
+                                _logger.warning(f"Failed to map consumer detail: {detail_data}, error: {e_detail}")
+                        else:
+                            _logger.warning(f"Skipping non-dict consumer detail: {detail_data}")
+                else:
+                     _logger.warning(f"consumer_details for group {group_data.get('group_name')} is not a list: {raw_consumer_details}")
+
+                group_data["consumer_details"] = mapped_consumer_details
+                try:
+                    mapped_consumer_groups.append(QueueConsumerGroup(**group_data))
+                except Exception as e_group:
+                    _logger.warning(f"Failed to map consumer group: {group_data}, error: {e_group}")
+            else:
+                _logger.warning(f"Skipping non-dict consumer group: {group_data}")
+
+
+        raw_recent_messages = raw_status.get("recent_messages", [])
+        mapped_recent_messages = []
+        for msg_data in raw_recent_messages:
+            if isinstance(msg_data, dict):
+                try:
+                    mapped_recent_messages.append(QueueRecentMessage(**msg_data))
+                except Exception as e_msg:
+                    _logger.warning(f"Failed to map recent message: {msg_data}, error: {e_msg}")
+            else:
+                _logger.warning(f"Skipping non-dict recent message: {msg_data}")
+
+        # Check for overall error status from get_queue_information
+        if raw_status.get("status") == "error":
+            _logger.error(f"Error reported by get_queue_information: {raw_status.get('error_message')}")
+            return QueueStatusResponse(
+                status="error",
+                stream_length=0,
+                consumer_groups=[],
+                recent_messages=[],
+            )
 
         mapped_status = QueueStatusResponse(
             status=raw_status.get("status", "available"),
             stream_length=raw_status.get("stream_length", 0),
-            consumer_groups=raw_status.get("consumer_groups", []),
-            recent_messages=raw_status.get("recent_messages", [])
+            consumer_groups=mapped_consumer_groups,
+            recent_messages=mapped_recent_messages
         )
         return mapped_status
     except Exception as e:
@@ -947,24 +741,24 @@ async def clear_stalled_jobs(max_age_seconds: int = 600): # Default: older than 
         redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
         message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
 
-        # Use Redis client directly
-        redis_client = message_broker.redis
+        redis_client = message_broker.client
 
         # Get all consumer groups for the stream
-        groups = redis_client.xinfo_groups("api_jobs")
+        groups_info = await redis_client.xinfo_groups(app_config.redis.QUEUE_NAME)
 
         claimed_count = 0
-        failed_count = 0
+        failed_to_claim_count = 0
         reprocessed_count = 0
+        errors = []
 
-        for group in groups:
-            name_bytes = group.get(b'name')
+        for group_info in groups_info:
+            name_bytes = group_info.get(b'name')
             if name_bytes is None:
                 continue
             group_name = name_bytes.decode()
             # Get pending messages for this group
-            pending_info = redis_client.xpending_range(
-                "api_jobs",
+            pending_info = await redis_client.xpending_range(
+                app_config.redis.QUEUE_NAME,
                 group_name,
                 min="-",  # Start from oldest
                 max="+",  # End with newest
@@ -978,10 +772,10 @@ async def clear_stalled_jobs(max_age_seconds: int = 600): # Default: older than 
 
                 if idle_time > max_age_seconds * 1000:  # Redis uses milliseconds
                     try:
-                        claimed = redis_client.xclaim(
-                            "api_jobs",
+                        claimed = await redis_client.xclaim(
+                            app_config.redis.QUEUE_NAME,
                             group_name,
-                            "stalled_job_processor",  # New consumer name
+                            "stalled_job_processor",
                             min_idle_time=idle_time,
                             message_ids=[message_id]
                         )
@@ -1001,21 +795,21 @@ async def clear_stalled_jobs(max_age_seconds: int = 600): # Default: older than 
                                         "timestamp": time.time()
                                     })
 
-                                    failed_count += 1
+                                    failed_to_claim_count += 1
 
                                 except Exception as msg_e:
                                     _logger.error(f"Error processing stalled message {message_id}: {msg_e}")
 
-                            redis_client.xack("api_jobs", group_name, message_id)
+                            await redis_client.xack(app_config.redis.QUEUE_NAME, group_name, message_id)
 
                     except Exception as claim_e:
                         _logger.error(f"Error claiming stalled message {message_id}: {claim_e}")
 
-        _logger.info(f"Stalled job cleanup finished. Claimed: {claimed_count}, Failed: {failed_count}, Reprocessed: {reprocessed_count}")
+        _logger.info(f"Stalled job cleanup finished. Claimed: {claimed_count}, Failed: {failed_to_claim_count}, Reprocessed: {reprocessed_count}")
         return {
-            "message": f"Stalled job cleanup completed. Claimed: {claimed_count}, Failed: {failed_count}, Reprocessed: {reprocessed_count}",
+            "message": f"Stalled job cleanup completed. Claimed: {claimed_count}, Failed: {failed_to_claim_count}, Reprocessed: {reprocessed_count}",
             "claimed_count": claimed_count,
-            "failed_count": failed_count,
+            "failed_count": failed_to_claim_count,
             "reprocessed_count": reprocessed_count
         }
     except Exception as e:
@@ -1036,21 +830,22 @@ async def purge_queue(confirmation: str):
     _logger.critical(f"Executing QUEUE PURGE operation with confirmation '{confirmation}'")
     try:
         redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
-        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
+        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=app_config.redis.QUEUE_NAME)
 
-        # Use Redis client directly
-        redis_client = message_broker.redis
+        redis_client = message_broker.client
 
         # Delete the entire stream
-        stream_deleted = redis_client.delete("api_jobs")
+        stream_name_to_purge = app_config.redis.QUEUE_NAME
+        stream_deleted = await redis_client.delete(stream_name_to_purge)
 
-        # Re-create the stream with an initial message
-        message_broker.ensure_stream_exists("api_jobs")
+        _logger.info(f"Stream '{stream_name_to_purge}' deleted: {bool(stream_deleted)}.")
 
-        _logger.critical(f"Queue system purged. Stream 'api_jobs' deleted: {bool(stream_deleted)}. Stream recreated.")
+        new_message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=stream_name_to_purge)
+
+        _logger.critical(f"Queue system purged. Stream '{stream_name_to_purge}' deleted: {bool(stream_deleted)}. Stream and group recreated by new broker instance.")
         return SuccessResponse(
             message=f"Queue system purged successfully.",
-            detail=f"Stream 'api_jobs' deleted: {bool(stream_deleted)}. Stream recreated."
+            detail=f"Stream '{stream_name_to_purge}' deleted: {bool(stream_deleted)}. Stream and consumer group were recreated."
         )
     except Exception as e:
         _logger.exception(f"Error purging queue: {str(e)}")
@@ -1067,182 +862,170 @@ async def retry_failed_job(job_id: str, background_tasks: BackgroundTasks):
 
     try:
         redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
-        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
+        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=app_config.redis.QUEUE_NAME)
 
         # Find the latest status for the job
-        job_status = message_broker.get_job_status(job_id)
+        job_status_data = await message_broker.get_job_progress(job_id)
 
-        if not job_status:
+        if not job_status_data:
             raise HTTPException(status_code=404, detail=f"Job {job_id} not found, cannot retry.")
 
-        current_status = job_status.get("status")
+        current_status = job_status_data.get("status")
         if current_status != "failed":
             raise HTTPException(status_code=400, detail=f"Only 'failed' jobs can be retried. Current status: '{current_status}'")
 
-        original_urls = job_status.get("urls", [])
-        original_topic = job_status.get("topic", "Unknown Topic")
-        include_images = job_status.get("include_images", "false")
-        temperature = job_status.get("temperature", str(app_config.llm.TEMPERATURE))
-        chunk_size = job_status.get("chunk_size", str(app_config.llm.CHUNK_SIZE))
+        original_job_payload = job_status_data.get("data")
+        if not original_job_payload or not isinstance(original_job_payload, dict):
+            original_job_payload = {
+                "topic": job_status_data.get("topic", "Unknown Topic"),
+                "urls": job_status_data.get("urls", []),
+                "voice_id": job_status_data.get("voice_id"),
+                "include_storyboard": job_status_data.get("include_storyboard", app_config.storyboard.ENABLE_STORYBOARD_GENERATION),
+                "custom_prompt": job_status_data.get("custom_prompt"),
+                "output_format": job_status_data.get("output_format", "standard"),
+                "temperature": job_status_data.get("temperature", app_config.llm.TEMPERATURE),
+                "chunk_size": job_status_data.get("chunk_size", app_config.llm.CHUNK_SIZE),
+            }
 
         new_job_id = str(uuid.uuid4())
 
-        new_job_payload = {
-            "job_id": new_job_id,
-            "job_type": "generate_story",
-            "urls": original_urls if isinstance(original_urls, str) else json.dumps([str(url) for url in original_urls]),
-            "topic": original_topic,
-            "include_images": include_images if isinstance(include_images, str) else str(include_images).lower(),
-            "temperature": temperature if isinstance(temperature, str) else str(temperature),
-            "chunk_size": chunk_size if isinstance(chunk_size, str) else str(chunk_size),
-            "retry_of": job_id,
-            "request_time": str(time.time())
+        retry_task_payload = {
+            "data": original_job_payload,
+            "retry_of_job_id": job_id
         }
 
-        message_broker.ensure_stream_exists("api_jobs")
-
-        message_id = message_broker.publish_message(new_job_payload)
+        message_id = message_broker.publish_message(message_data=retry_task_payload, job_id=new_job_id)
 
         if not message_id:
-            _logger.error(f"Failed to re-queue job {job_id} for retry.")
+            _logger.error(f"Failed to re-queue job {job_id} for retry as {new_job_id}.")
             raise HTTPException(status_code=500, detail="Failed to queue job for retry.")
 
-        message_broker.publish_message({
-            "job_id": job_id,
-            "status": "retried",
-            "retry_job_id": new_job_id,
-            "timestamp": str(time.time())
-        })
+        message_broker.track_job_progress(
+            job_id=job_id,
+            status="retried",
+            data={"retried_as_job_id": new_job_id, "message": f"Job retried as {new_job_id}"}
+        )
 
-        _logger.info(f"Job {job_id} successfully retried as new job {new_job_id}.")
+        _logger.info(f"Job {job_id} successfully retried as new job {new_job_id} with message ID {message_id}.")
         return SuccessResponse(
             message=f"Job {job_id} has been retried as new job {new_job_id}.",
-            detail=f"original_job_id: {job_id}, new_job_id: {new_job_id}"
+            detail=f"Original job_id: {job_id}, new_job_id: {new_job_id}, new_message_id: {message_id}"
         )
     except HTTPException:
         raise
     except Exception as e:
         _logger.exception(f"Error retrying job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error retrying job.")
-
+        raise HTTPException(status_code=500, detail=f"Internal server error retrying job: {str(e)}")
 
 @queue_router.get("/all-status", response_model=AllQueueStatusResponse)
 async def get_all_queue_status():
-    """
-    Get the status of all Redis streams (queues) dynamically.
-    Returns metrics for each stream found in Redis.
-    """
+    """Get status for all known Redis streams that look like job queues."""
     _logger.info("Request received for all queue statuses.")
     try:
         redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
-        message_broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
-        redis_client = message_broker.redis
 
-        stream_keys = [k.decode() if isinstance(k, bytes) else k for k in redis_client.keys() if redis_client.type(k) == b'stream']
-        all_status = {}
-        for stream in stream_keys:
-            stream_info = {}
+        queue_names_to_check = [app_config.redis.QUEUE_NAME]
+        queue_names_to_check = list(set(queue_names_to_check))
+
+        all_statuses_dict: Dict[str, SingleQueueStatusResponse] = {}
+
+        for queue_name in queue_names_to_check:
             try:
-                stream_info['stream_length'] = redis_client.xlen(stream)
-                consumer_info = []
-                try:
-                    groups = redis_client.xinfo_groups(stream)
-                    for group in groups:
-                        name_bytes = group.get(b'name')
-                        if name_bytes is None:
-                            continue
-                        group_name = name_bytes.decode()
-                        pending = group.get(b'pending')
-                        consumers = redis_client.xinfo_consumers(stream, group_name)
-                        consumer_info.append({
-                            "group_name": group_name,
-                            "pending": pending,
-                            "consumers": len(consumers),
-                            "consumer_details": [
-                                {
-                                    "name": c.get(b'name').decode(),
-                                    "pending": c.get(b'pending'),
-                                    "idle": c.get(b'idle')
-                                } for c in consumers
-                            ]
-                        })
-                except Exception as e:
-                    _logger.warning(f"Could not retrieve consumer group info for {stream}: {e}")
-                stream_info['consumer_groups'] = consumer_info
-                recent_messages = []
-                try:
-                    messages = redis_client.xrevrange(stream, count=10)
-                    for message_id, message_data in messages:
-                        message_id_str = message_id.decode()
-                        is_system = any(
-                            (k.decode() if isinstance(k, bytes) else k) in ("initialized", "purged")
-                            for k in message_data.keys()
-                        )
-                        decoded_data = {
-                            k.decode() if isinstance(k, bytes) else k:
-                            v.decode() if isinstance(v, bytes) else v
-                            for k, v in message_data.items()
-                        }
-                        message_info = QueueRecentMessage(
-                            id=message_id_str,
-                            timestamp=decoded_data.get("timestamp", message_id_str.split("-")[0]),
-                            job_id=decoded_data.get("job_id"),
-                            status=decoded_data.get("status", "queued"),
-                            is_system_message=is_system
-                        )
-                        recent_messages.append(message_info)
-                except Exception as e:
-                    _logger.warning(f"Could not retrieve recent messages for {stream}: {e}")
-                stream_info['recent_messages'] = recent_messages
+                broker = RedisMessageBroker(redis_url=redis_url, stream_name=queue_name)
+                raw_status = await broker.get_queue_information()
+
+                groups_list: List[QueueConsumerGroup] = []
+                if raw_status.get("consumer_groups"):
+                    for group_data in raw_status["consumer_groups"]:
+                        consumers_detail_list: List[QueueConsumerDetail] = []
+                        raw_consumers_data = group_data.get("consumer_details")
+
+                        if isinstance(raw_consumers_data, list):
+                            for cons_data_dict in raw_consumers_data:
+                                if isinstance(cons_data_dict, dict):
+                                     try:
+                                         consumers_detail_list.append(QueueConsumerDetail(**cons_data_dict))
+                                     except Exception as e_detail_all:
+                                         _logger.warning(f"AllQueueStatus: Failed to map consumer detail for group {group_data.get('group_name')}: {cons_data_dict}, error: {e_detail_all}")
+                                else:
+                                    _logger.warning(f"AllQueueStatus: Unexpected consumer detail data type for group {group_data.get('group_name')}: {type(cons_data_dict)}")
+
+                        group_data["consumer_details"] = consumers_detail_list
+                        try:
+                            groups_list.append(QueueConsumerGroup(**group_data))
+                        except Exception as e_group_all:
+                             _logger.warning(f"AllQueueStatus: Failed to map consumer group {group_data.get('group_name')}: {group_data}, error: {e_group_all}")
+
+
+                recent_msgs_list: List[QueueRecentMessage] = []
+                if raw_status.get("recent_messages"):
+                    for msg_data in raw_status["recent_messages"]:
+                        if isinstance(msg_data, dict):
+                            try:
+                                recent_msgs_list.append(QueueRecentMessage(**msg_data))
+                            except Exception as e_msg_all:
+                                _logger.warning(f"AllQueueStatus: Failed to map recent message: {msg_data}, error: {e_msg_all}")
+                        else:
+                             _logger.warning(f"AllQueueStatus: Skipping non-dict recent message: {msg_data}")
+
+
+                if raw_status.get("status") == "error":
+                     all_statuses_dict[queue_name] = SingleQueueStatusResponse(
+                        stream_name=queue_name,
+                        status="error",
+                        error_message=raw_status.get("error_message", "Failed to retrieve queue status"),
+                        stream_length=0,
+                        consumer_groups=[],
+                        recent_messages=[]
+                    )
+                else:
+                    single_status = SingleQueueStatusResponse(
+                        stream_name=queue_name,
+                        status=raw_status.get("status", "unknown"),
+                        stream_length=raw_status.get("stream_length", 0),
+                        consumer_groups_count=len(groups_list),
+                        consumer_groups=groups_list,
+                        recent_messages_count=len(recent_msgs_list),
+                        recent_messages=recent_msgs_list
+                    )
+                    all_statuses_dict[queue_name] = single_status
+
             except Exception as e:
-                _logger.warning(f"Error getting info for stream {stream}: {e}")
-            all_status[stream] = stream_info
-        return all_status
+                _logger.error(f"Failed to get status for queue {queue_name}: {e}")
+                all_statuses_dict[queue_name] = SingleQueueStatusResponse(
+                    stream_name=queue_name,
+                    status="error",
+                    error_message=str(e),
+                    stream_length=0,
+                    consumer_groups=[],
+                    recent_messages=[]
+                )
+
+        return AllQueueStatusResponse(root=all_statuses_dict)
+
     except Exception as e:
         _logger.exception(f"Error getting all queue statuses: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get all queue statuses: {str(e)}")
 
-        recent_messages = []
-        try:
-            raw_messages = redis_client.xrevrange("api_jobs", count=10)
-            for msg_id_bytes, msg_data_bytes in raw_messages:
-                msg_id = msg_id_bytes.decode() if isinstance(msg_id_bytes, bytes) else msg_id_bytes
-                msg_data = {
-                    k.decode() if isinstance(k, bytes) else k:
-                    v.decode() if isinstance(v, bytes) else v
-                    for k, v in msg_data_bytes.items()
-                }
-
-                is_system = any(k in ("initialized", "purged") for k in msg_data.keys())
-                recent_messages.append(QueueRecentMessage(
-                    id=msg_id,
-                    timestamp=msg_data.get("timestamp", msg_id.split("-")[0]),
-                    job_id=msg_data.get("job_id"),
-                    status=status,
-                    is_system_message=is_system
-                ))
-        except Exception as e:
-            _logger.warning(f"Could not retrieve recent messages for {app_config.redis.QUEUE_NAME}: {e}")
-
-
-@router.post("/config/storyboard", tags=["Configuration"])
+@queue_router.post("/config/storyboard", tags=["Configuration"])
 async def toggle_storyboard_generation(enabled: bool):
-    """Toggle storyboard generation dynamically."""
-    app_config.set_storyboard_generation(enabled)
-    return {"message": f"Storyboard generation {'enabled' if enabled else 'disabled'} successfully."}
+    app_config.storyboard.ENABLE_STORYBOARD_GENERATION = enabled
+    _logger.info(f"Storyboard generation dynamically set to: {enabled}")
+    return {"message": f"Storyboard generation {'enabled' if enabled else 'disabled'}.", "new_status": enabled}
 
-@router.post("/config/image-generation", tags=["Configuration"])
+@queue_router.post("/config/image-generation", tags=["Configuration"])
 async def toggle_image_generation(enabled: bool):
-    """API endpoint to toggle image generation."""
-    app_config.set_image_generation(enabled)
-    return {"message": "Image generation updated", "enabled": enabled}
+    app_config.ENABLE_IMAGE_GENERATION = enabled
+    app_config.openAI.ENABLED = enabled
+    _logger.info(f"Image generation dynamically set to: {enabled}")
+    return {"message": f"Image generation {'enabled' if enabled else 'disabled'}.", "new_status": enabled}
 
-@router.post("/config/audio-generation", tags=["Configuration"])
+@queue_router.post("/config/audio-generation", tags=["Configuration"])
 async def toggle_audio_generation(enabled: bool):
-    """API endpoint to toggle audio generation."""
-    app_config.set_audio_generation(enabled)
-    return {"message": "Audio generation updated", "enabled": enabled}
-
+    app_config.ENABLE_AUDIO_GENERATION = enabled
+    app_config.elevenLabs.ENABLED = enabled
+    _logger.info(f"Audio generation dynamically set to: {enabled}")
+    return {"message": f"Audio generation {'enabled' if enabled else 'disabled'}.", "new_status": enabled}
 
 app.include_router(router, prefix="/api")
 app.include_router(queue_router, prefix="/api")

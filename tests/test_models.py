@@ -32,7 +32,6 @@ class TestModels(unittest.TestCase):
     def test_url_metadata_alias(self):
         metadata = URLMetadata(url="http://example.com/page", metadata={"custom_key": "custom_value"})
         self.assertEqual(metadata.metadata_payload, {"custom_key": "custom_value"})
-        # Test serialization with alias
         self.assertIn("metadata", metadata.model_dump(by_alias=True))
         self.assertNotIn("metadata_payload", metadata.model_dump(by_alias=True))
         self.assertIn("metadata_payload", metadata.model_dump(by_alias=False))
@@ -118,7 +117,6 @@ class TestModels(unittest.TestCase):
         mock_http_config_attr_missing = MagicMock(spec=[]) # spec=[] ensures no attributes unless added
         mock_app_config.http = mock_http_config_attr_missing
 
-        # Ensure hasattr behaves as expected with this mock
         self.assertFalse(hasattr(mock_http_config_attr_missing, 'ALLOWED_DOMAINS'))
 
         try:
@@ -169,20 +167,21 @@ class TestModels(unittest.TestCase):
 
     def test_all_queue_status_response_creation(self):
         q_status_data = {
+            "stream_name": "queue1",
             "stream_length": 50,
             "consumer_groups": [],
             "recent_messages": []
         }
-        # AllQueueStatusResponse is a RootModel, expects a dict at the root
-        response_data = {"queue1": q_status_data, "queue2": q_status_data}
+        response_data = {
+            "queue1": {**q_status_data, "stream_name": "queue1"},
+            "queue2": {**q_status_data, "stream_name": "queue2"}
+        }
         response = AllQueueStatusResponse.model_validate(response_data)
         self.assertIn("queue1", response.root)
         self.assertEqual(response.root["queue1"].stream_length, 50)
 
-    # test to validate urls
     def test_validate_urls(self):
         max_urls = 10
-        # Test maximum URLs
         urls = [f"http://example.com/{i}" for i in range(max_urls + 1)]
         try:
             StoryGenerationRequest(urls=urls, topic="Too Many URLs")
@@ -192,7 +191,6 @@ class TestModels(unittest.TestCase):
             self.fail("ValidationError not raised for too many URLs")
 
     def test_queue_status_response_creation(self):
-        # Reusing QueueStreamStatus components for brevity
         consumer_detail = QueueConsumerDetail(name="c1", pending=1, idle=100)
         consumer_group = QueueConsumerGroup(
             group_name="cg1", pending=5, consumers=1, consumer_details=[consumer_detail]
@@ -211,10 +209,16 @@ class TestModels(unittest.TestCase):
 
     def test_single_queue_status_response_creation(self):
         recent_message_data = {"id": "msg1", "timestamp": "ts1", "job_id": "job1", "status": "pending"}
+        consumer_group = {
+            "group_name": "group1",
+            "pending": 2,
+            "consumers": 1,
+            "consumer_details": []
+        }
         response = SingleQueueStatusResponse(
             stream_name="my-stream",
             stream_length=10,
-            consumer_groups=[{"name": "group1", "pending": 2, "consumers": 1}], # Simplified for this test
+            consumer_groups=[consumer_group],
             recent_messages=[QueueRecentMessage(**recent_message_data)]
         )
         self.assertEqual(response.status, "available") # Default value
@@ -222,6 +226,19 @@ class TestModels(unittest.TestCase):
         self.assertEqual(response.stream_length, 10)
         self.assertEqual(len(response.recent_messages), 1)
         self.assertEqual(response.recent_messages[0].id, "msg1")
+
+    def test_single_queue_status_response_recent_message_id(self):
+        """Test that SingleQueueStatusResponse recent_messages[0].id is set correctly."""
+        recent_message_data = {"id": "test-id", "timestamp": "now", "job_id": "job42", "status": "pending"}
+        response = SingleQueueStatusResponse(
+            stream_name="test-stream",
+            stream_length=1,
+            consumer_groups=[],
+            recent_messages=[QueueRecentMessage(**recent_message_data)]
+        )
+        self.assertEqual(response.recent_messages[0].id, "test-id")
+
+
 
 if __name__ == '__main__':
     unittest.main()

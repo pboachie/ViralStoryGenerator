@@ -35,7 +35,6 @@ async def process_api_job(job_data: Dict[str, Any], consumer_name: str, group_na
         _logger.error(f"Cannot process job {job_id}: Redis message broker unavailable")
         return False
 
-    # Update job status to processing
     message_broker.track_job_progress(job_id, "processing", {"message": "Job processing started"})
 
     try:
@@ -270,7 +269,6 @@ async def process_api_job(job_data: Dict[str, Any], consumer_name: str, group_na
                  return False
             # < --- End Store Story Script ---
 
-            # Respect ENABLE_IMAGE_GENERATION and ENABLE_AUDIO_GENERATION in job processing
             if not app_config.ENABLE_IMAGE_GENERATION:
                 _logger.info("Image generation is disabled. Skipping image-related processing.")
                 image_generation_enabled = False
@@ -310,7 +308,7 @@ async def process_api_job(job_data: Dict[str, Any], consumer_name: str, group_na
                     if llm_endpoint_storyboard is None:
                         _logger.error(f"Job {job_id}: LLM_ENDPOINT for storyboard is not configured in app_config. Skipping storyboard.")
                         message_broker.track_job_progress(job_id, "processing", {"message": "Storyboard generation skipped: LLM_ENDPOINT not configured.", "progress": 75})
-                        sb_err = ValueError("LLM_ENDPOINT for storyboard not configured.") # Record as an error for metadata
+                        sb_err = ValueError("LLM_ENDPOINT for storyboard not configured.")
                     else:
                         message_broker.track_job_progress(
                             job_id,
@@ -451,7 +449,7 @@ async def process_api_job(job_data: Dict[str, Any], consumer_name: str, group_na
     except Exception as e:
         _logger.exception(f"Error processing job {job_id}: {e}")
         try:
-            message_broker.track_job_progress(
+            await message_broker.track_job_progress(
                 job_id,
                 "failed",
                 {

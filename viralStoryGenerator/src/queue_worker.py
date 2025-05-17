@@ -10,7 +10,7 @@ import os
 import json
 import uuid
 import time
-from typing import Dict
+from typing import Dict, Any
 
 
 from ..utils.config import config as app_config
@@ -36,19 +36,8 @@ def preload_components():
     global _message_broker
 
     redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
-    _message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=app_config.redis.QUEUE_NAME) # Use QUEUE_NAME
+    _message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=app_config.redis.QUEUE_NAME)
 
-    group_name = app_config.redis.API_WORKER_GROUP_NAME
-    try:
-        _message_broker.create_consumer_group(group_name=group_name)
-        _logger.info(f"Ensured consumer group '{group_name}' exists for stream '{app_config.redis.QUEUE_NAME}'.")
-    except Exception as e:
-        if "BUSYGROUP" not in str(e):
-            _logger.warning(f"Could not create consumer group '{group_name}': {e}")
-        else:
-            _logger.debug(f"Consumer group '{group_name}' already exists.")
-
-    _message_broker.ensure_stream_exists(app_config.redis.QUEUE_NAME)
 
     _logger.info(f"API Job worker components initialized successfully for stream '{app_config.redis.QUEUE_NAME}'.")
 
@@ -71,18 +60,21 @@ async def process_single_api_job(job_data_raw: Dict[bytes, bytes], message_id: s
     message_broker = get_message_broker()
     try:
         # Decode job data from bytes
-        job_data = {
-            k.decode() if isinstance(k, bytes) else k:
-            v.decode() if isinstance(v, bytes) else v
-            for k, v in job_data_raw.items()
-        }
-        job_id = job_data.get("job_id")
-        job_type = job_data.get("job_type")
+        job_data_decoded: Dict[str, Any] = {}
+        for k, v in job_data_raw.items():
+            key_decoded = k.decode() if isinstance(k, bytes) else str(k)
+            value_decoded = v.decode() if isinstance(v, bytes) else v
+            job_data_decoded[key_decoded] = value_decoded
 
-        if not job_id:
-            job_id = str(uuid.uuid4())
+        job_data = job_data_decoded
+
+        job_id_any = job_data.get("job_id")
+        job_id = str(job_id_any) if job_id_any is not None else str(uuid.uuid4())
+        if job_id_any is None:
             _logger.warning(f"Job message {message_id} missing job_id, assigned: {job_id}")
             job_data["job_id"] = job_id
+
+        job_type = job_data.get("job_type")
 
         _logger.info(f"Processing API job {job_id} (Type: {job_type or 'Unknown'}). Message ID: {message_id}")
 
@@ -92,13 +84,13 @@ async def process_single_api_job(job_data_raw: Dict[bytes, bytes], message_id: s
         _logger.exception(f"Error processing API job {job_id or message_id}: {e}")
         if job_id and message_broker:
             try:
-                message_broker.track_job_progress(job_id, "failed", {"error": f"Worker failed: {str(e)}"})
+                await message_broker.track_job_progress(job_id, "failed", {"error": f"Worker failed: {str(e)}"})
             except Exception as track_e:
                 _logger.error(f"Failed to update status to failed for job {job_id}: {track_e}")
     finally:
         if message_broker:
             try:
-                message_broker.acknowledge_message(group_name, message_id)
+                await message_broker.acknowledge_message(message_id)
                 _logger.debug(f"Acknowledged message {message_id} for job {job_id or 'unknown'}")
             except Exception as ack_e:
                  _logger.error(f"Failed to acknowledge message {message_id}: {ack_e}")
@@ -107,7 +99,6 @@ async def process_single_api_job(job_data_raw: Dict[bytes, bytes], message_id: s
 async def run_api_job_consumer(consumer_name: str):
     """Continuously consumes and processes jobs from the api_jobs stream."""
     message_broker = get_message_broker()
-    group_name = app_config.redis.API_WORKER_GROUP_NAME
     batch_size = app_config.redis.WORKER_BATCH_SIZE
     sleep_interval = app_config.redis.WORKER_SLEEP_INTERVAL
     max_concurrent = app_config.redis.WORKER_MAX_CONCURRENT
@@ -138,11 +129,9 @@ async def run_api_job_consumer(consumer_name: str):
                 await asyncio.sleep(0.1)
                 continue
 
-            messages = message_broker.consume_messages(
-                group_name=group_name,
-                consumer_name=consumer_name,
+            messages = await message_broker.consume_messages(
                 count=min(available_slots, batch_size),
-                block=2000
+                block_ms=2000
             )
 
             if not messages:
@@ -159,7 +148,7 @@ async def run_api_job_consumer(consumer_name: str):
                 if not message_id or not job_data_temp or not isinstance(job_data_temp, dict):
                     _logger.error(f"Invalid message structure received: {message_obj}. Skipping.")
                     if message_id:
-                        message_broker.acknowledge_message(group_name, message_id)
+                        await message_broker.acknowledge_message(message_id)
                     continue
 
 
@@ -171,14 +160,14 @@ async def run_api_job_consumer(consumer_name: str):
                     else:
                          _logger.warning(f"Skipping message {message_id} with unexpected job_type: {job_type}.")
                     try:
-                        message_broker.acknowledge_message(group_name, message_id)
+                        await message_broker.acknowledge_message(message_id)
                     except Exception as ack_e:
                         _logger.error(f"Failed to acknowledge message {message_id}: {ack_e}")
                     continue
                 # --- End Job Type Filtering ---
 
                 task = asyncio.create_task(
-                    process_single_api_job(job_data_temp, message_id, group_name, consumer_name)
+                    process_single_api_job(job_data_temp, message_id, app_config.redis.API_WORKER_GROUP_NAME, consumer_name)
                 )
                 active_tasks.add(task)
                 task.add_done_callback(active_tasks.discard)
