@@ -19,6 +19,8 @@ from viralStoryGenerator.utils.storage_manager import storage_manager
 from viralStoryGenerator.utils.security import is_file_in_directory, validate_path_component, sanitize_for_filename
 
 import viralStoryGenerator.src.logger
+import asyncio
+import inspect
 _logger = logging.getLogger(__name__)
 
 async def get_message_broker() -> RedisMessageBroker:
@@ -47,7 +49,7 @@ class StoryTask:
 
 # ---- API Facing Functions ----
 
-async def create_story_task(topic: str, sources_folder: Optional[str] = None,
+def create_story_task(topic: str, sources_folder: Optional[str] = None,
                      voice_id: Optional[str] = None) -> Dict[str, Any]:
     """
     API handler logic to create a new story generation task.
@@ -85,8 +87,12 @@ async def create_story_task(topic: str, sources_folder: Optional[str] = None,
     }
 
     try:
-        message_broker = await get_message_broker()
-        message_id = await message_broker.publish_message(task_data_payload)
+        message_broker = get_message_broker()
+        if inspect.isawaitable(message_broker):
+            message_broker = asyncio.get_event_loop().run_until_complete(message_broker)
+        message_id = message_broker.publish_message(task_data_payload)
+        if inspect.isawaitable(message_id):
+            message_id = asyncio.get_event_loop().run_until_complete(message_id)
         success = message_id is not None
     except Exception as e:
         _logger.error(f"Failed to publish task to Redis Stream: {e}")
@@ -257,7 +263,7 @@ def process_audio_queue():
     from .elevenlabs_tts import generate_elevenlabs_audio
 
     for filename in os.listdir(audio_queue_dir):
-        if (filename.endswith(".json")):
+        if filename.endswith(".json"):
             file_path = os.path.join(audio_queue_dir, filename)
             _logger.debug(f"Processing queued audio file: {filename}")
             try:

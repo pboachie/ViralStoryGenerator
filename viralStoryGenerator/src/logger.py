@@ -131,13 +131,10 @@ if not base_app_logger.handlers:
     _module_logger_internal = logging.getLogger(__name__)
     _module_logger_internal.debug(f"Logger '{base_app_logger.name}' configured by {__name__}.")
 else:
-    _module_logger_internal = logging.getLogger(__name__)
-    _module_logger_internal.setLevel(logging.DEBUG)
-    if not _module_logger_internal.handlers:
-        _module_logger_internal.addHandler(logging.NullHandler())
-    _module_logger_internal.debug(f"Logger '{base_app_logger.name}' already has handlers. Skipping reconfiguration by {__name__}.")
-    _module_logger = logging.getLogger(__name__)
-    _module_logger.debug(f"Logger '{base_app_logger.name}' already has handlers. Skipping reconfiguration by {__name__}.")
+    original_propagate = base_app_logger.propagate
+    base_app_logger.propagate = True
+    base_app_logger.info(f"Logger '{base_app_logger.name}' already has handlers. Skipping reconfiguration by {__name__}")
+    base_app_logger.propagate = original_propagate
 
 _module_logger = logging.getLogger(__name__)
 
@@ -148,7 +145,7 @@ def log_startup(environment: str = None, version: str = None, storage_provider: 
     storage = storage_provider or os.environ.get("STORAGE_PROVIDER", "local")
 
     logger = logging.getLogger()
-    logger.debug("Startup event triggered.", extra={'environment': env_to_log})
+    logger.debug("Startup event triggered", extra={'environment': env_to_log})
     logger.info(f"Starting Viral Story Generator API v{ver}", extra={'environment': env_to_log})
     logger.info(f"Environment for startup: {env_to_log}", extra={'environment': env_to_log}) # Message clarifies if different from default
     logger.info(f"Storage provider: {storage}", extra={'environment': env_to_log})

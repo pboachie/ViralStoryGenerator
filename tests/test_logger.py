@@ -210,6 +210,10 @@ def test_logger_skips_reconfiguration_when_handlers_exist(caplog):
     # Ensure base_logger (parent) has a handler so the 'else' branch in logger.py is hit upon reload.
     base_logger = logging.getLogger(base_logger_name)
 
+    # Store original handlers and propagate status for restoration
+    original_handlers = base_logger.handlers[:]
+    original_propagate = base_logger.propagate
+
     # --- MODIFICATION START ---
     # Clear all existing handlers from base_logger to ensure a clean slate.
     # This removes any pre-existing handlers (like the StreamHandler observed in logs)
@@ -262,15 +266,12 @@ def test_logger_skips_reconfiguration_when_handlers_exist(caplog):
             break
     assert found, f"Expected log message not found in caplog.records. Records: {[(r.name, r.levelno, r.getMessage()) for r in caplog.records]}. Expected content: '{expected_message_content}'"
 
-    # --- MODIFICATION: Restore original handlers and propagate status (optional, good practice) ---
-    # Clear handlers added during the test (i.e., caplog's handler)
+    # --- MODIFICATION: Restore original handlers and propagate status ---
     for handler in base_logger.handlers[:]:
         base_logger.removeHandler(handler)
-    # Restore original handlers
     for handler in original_handlers:
         base_logger.addHandler(handler)
     base_logger.propagate = original_propagate
-    print(f"Handlers on {base_logger_name} AFTER test completion and restoration: {base_logger.handlers}")
     # --- END MODIFICATION ---
 
 
