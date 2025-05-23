@@ -147,7 +147,7 @@ async def run_api_job_consumer(consumer_name: str):
                             _logger.error(f"Failed to acknowledge malformed message {stream_id}: {ack_e}")
                     continue
 
-                
+
                 payload_json_str = raw_fields_payload.get(b"payload")
 
                 parsed_payload_dict: Optional[Dict[str, Any]] = None
@@ -162,11 +162,11 @@ async def run_api_job_consumer(consumer_name: str):
                             job_type = parsed_payload_dict.get("job_type")
                             actual_job_data_for_processing = parsed_payload_dict.get("data")
 
-                            
+
                             if job_type is None and isinstance(actual_job_data_for_processing, dict):
                                 job_type = actual_job_data_for_processing.get("job_type")
 
-                            
+
                             if not isinstance(actual_job_data_for_processing, dict):
                                 _logger.warning(f"Message {stream_id}: 'data' field in parsed payload is missing or not a dict. Parsed payload: {parsed_payload_dict}. Will attempt to use root as job data if job_type is present.")
                                 if job_type and "job_id" in parsed_payload_dict:
@@ -180,7 +180,7 @@ async def run_api_job_consumer(consumer_name: str):
                 else:
                     _logger.warning(f"Message {stream_id} is missing 'payload' field, it's not a string, or it's empty. Raw Fields: {raw_fields_payload}")
 
-                
+
                 if job_type != "generate_story":
                     log_message = f"Message {stream_id} with job_type '{job_type}' (from JSON payload)"
                     if job_type is None:

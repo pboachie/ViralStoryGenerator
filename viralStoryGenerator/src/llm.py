@@ -70,6 +70,8 @@ def _make_llm_request(
             headers=headers,
             json=payload,
             timeout=timeout
+            json=payload,
+            timeout=timeout
         )
         response.raise_for_status()
         _logger.debug(f"LLM request successful (Status: {response.status_code})")
@@ -482,7 +484,7 @@ def process_with_llm(topic: str, temperature: float, model: str, system_prompt: 
          _logger.error("LLM processing request failed: Model name cannot be empty.")
          raise ValueError("LLM Model name cannot be empty")
     if not appconfig.llm.ENDPOINT:
-         _logger.error("LLM processing request failed: LLM_ENDPOINT is not configured.")
+         _logger.error("LLM cleaning request failed: LLM_ENDPOINT is not configured.")
          raise ValueError("LLM Endpoint not configured")
 
     messages = [
