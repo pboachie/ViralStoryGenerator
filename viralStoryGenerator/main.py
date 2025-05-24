@@ -59,7 +59,7 @@ async def scheduled_cleanup_runner():
             else:
                  _logger.debug("Skipping file cleanup as retention_days <= 0.")
 
-            # TODO: Make process_audio_queue async or run in executor if it's blocking
+            # TODO: Ensure process_audio_queue is non-blocking or consistently run in an executor. Currently, it's called directly in the scheduled task, which might block. Consider uncommenting 'await loop.run_in_executor(None, process_audio_queue)' and removing the direct call.
             _logger.debug("Running audio queue processing...")
             # If process_audio_queue is potentially blocking:
             # await loop.run_in_executor(None, process_audio_queue)

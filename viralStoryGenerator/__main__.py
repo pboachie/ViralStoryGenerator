@@ -13,5 +13,4 @@ if __name__ == "__main__":
         sys.argv.pop(1)
         _logger.info("Starting API server...")
 
-    # Run the main function
     main()

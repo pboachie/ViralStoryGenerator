@@ -750,3 +750,18 @@ Enjoy creating viral stories and engaging content! 💥🔥
   - Significantly enhanced README with detailed Architecture, Program Flow, Core Technologies, and Key Modules sections.
   - Added Mermaid diagrams for System Architecture and Program Flow.
   - Included a Table of Contents for easier navigation.
+
+
+## Future Cleanup Tasks
+
+- **Review and Remove Unnecessary Comments**: During a refactoring pass, several files were identified as potentially containing unnecessary comments (e.g., commented-out old code, overly verbose comments). A full cleanup was not completed due to tool limitations. Files to revisit include:
+    - `viralStoryGenerator/main.py`
+    - `viralStoryGenerator/src/api.py`
+    - `viralStoryGenerator/src/api_handlers.py`
+    - `viralStoryGenerator/src/elevenlabs_tts.py`
+    - `viralStoryGenerator/src/llm.py`
+    - `viralStoryGenerator/src/logger.py`
+    - `viralStoryGenerator/src/source_cleanser.py` (contains a large commented-out block potentially superseded by RAG)
+    - `viralStoryGenerator/src/storyboard.py`
+    - `viralStoryGenerator/src/worker_runner.py`
+  A manual review is recommended to remove comments that do not add significant value.

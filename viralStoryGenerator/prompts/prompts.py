@@ -266,7 +266,7 @@ You are a Storyboard Planner. Analyze the provided story and identify logical sc
 ## Task
 Analyze the input story's narrative flow and emotional tone. Identify 3-5 logical scene breaks. For each scene, provide:
 1.  `scene_number`: An integer starting from 1.
-2.  `scene_start_marker`: The **exact first 5 to 10 words** of the text segment that should begin this scene. This marker **MUST** be a non-empty string copied precisely from the beginning of the corresponding text segment in the input story. It is critical for splitting the story later.
+2.  `scene_start_marker`: The **exact first 4 to 7 words** of the text segment that should begin this scene. This marker **MUST** be a non-empty string copied precisely from the beginning of the corresponding text segment in the input story. It is critical for splitting the story later.
 3.  `image_prompt`: A concise DALL-E image description for the scene.
 Output ONLY the valid JSON object containing a 'scenes' list, with NO other text before or after the JSON structure. Adhere strictly to the schema.
 
@@ -275,7 +275,7 @@ Output ONLY the valid JSON object containing a 'scenes' list, with NO other text
   "scenes": [
     {{
       "scene_number": 1,
-      "scene_start_marker": "Exact first 5-10 words of the scene...", // CRITICAL: Must be exact, non-empty text from the story.
+      "scene_start_marker": "Exact first 4 to 7 words of the scene...", // CRITICAL: Must be exact, non-empty text from the story.
       "image_prompt": "DALL-E description focusing on: [1] Main subject [2] Style refs [3] Key details",
       "duration": 0, // Placeholder - Will be calculated later
       "start_time": 0 // Placeholder - Will be calculated later
@@ -286,8 +286,8 @@ Output ONLY the valid JSON object containing a 'scenes' list, with NO other text
 
 ## Guidelines
 1.  **Analyze Flow & Tone:** Read the entire story to understand its structure, pacing, and emotional shifts.
-2.  **Identify Breaks:** Determine 3-5 points where the narrative logically shifts (change in time, location, focus, or emotion).
-3.  **Extract Start Markers:** For each identified scene break, copy the **exact first 5 to 10 words** from the original story that mark the beginning of that scene. These markers **MUST** be accurate, non-empty string substrings of the original story. Double-check this requirement.
+2.  **Identify Breaks:** Determine 5-10 points where the narrative logically shifts (change in time, location, focus, or emotion).
+3.  **Extract Start Markers:** For each identified scene break, copy the **exact first 4 to 7 words** from the original story that mark the beginning of that scene. These markers **MUST** be accurate, non-empty string substrings of the original story. Double-check this requirement.
 4.  **Image Prompts:** Generate a concise, descriptive `image_prompt` for each scene, including:
     *   Concrete visual elements (no abstract concepts).
     *   Style references (e.g., "cyberpunk animation style", "Ultra photorealistic").
@@ -338,13 +338,13 @@ Generate valid JSON output now. Ensure every scene includes a valid 'scene_start
     """.strip()
 
 # TODO: To be implemented in the future
-def _identify_errors(text):
-    """Helper to generate error descriptions"""
-    errors = []
-    if "### Video Description:" not in text:
-        errors.append("Missing video description section")
-    if len(text.split("###")) != 3:
-        errors.append("Incorrect number of sections")
-    if any(c in text for c in ["[Cut to", "[Scene"]):
-        errors.append("Contains forbidden scene directions")
-    return ", ".join(errors) or "Formatting violations"
+# def _identify_errors(text):
+#     """Helper to generate error descriptions"""
+#     errors = []
+#     if "### Video Description:" not in text:
+#         errors.append("Missing video description section")
+#     if len(text.split("###")) != 3:
+#         errors.append("Incorrect number of sections")
+#     if any(c in text for c in ["[Cut to", "[Scene"]):
+#         errors.append("Contains forbidden scene directions")
+#     return ", ".join(errors) or "Formatting violations"
