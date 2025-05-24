@@ -43,7 +43,6 @@ def get_message_broker() -> RedisMessageBroker:
     _logger.warning("Message broker accessed before preload, initializing now.")
     redis_url = f"redis://{app_config.redis.HOST}:{app_config.redis.PORT}"
     _message_broker = RedisMessageBroker(redis_url=redis_url, stream_name=app_config.redis.QUEUE_NAME)
-    import asyncio
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
