@@ -1,3 +1,19 @@
+# TODO: Clarify dependency management strategy.
+# Currently, `requirements.txt` and `setup.py` (install_requires) are identical and list all project dependencies.
+# Service-specific files (requirements-api.txt, requirements-queue.txt, requirements-scraper.txt) are subsets of this main list,
+# likely used for building lean service images.
+#
+# Consider the following:
+# 1. `setup.py`: Define abstract dependencies (e.g., `requests>=2.30`) as the source of truth for library use.
+# 2. `requirements.txt`: Use for `pip freeze > requirements.txt` to capture a reproducible development environment with exact versions.
+#    This file would then NOT be identical to setup.py's install_requires.
+# 3. Service-specific files: Continue to use these for lean deployments, but ensure they pull versions consistent with the overall project strategy
+#    (e.g., either by also using `pip freeze` from a service-specific virtual env, or by referencing abstract versions from setup.py and resolving them at build time).
+#
+# Current approach (identical superset in requirements.txt/setup.py and subsets in others) is functional but can lead to maintenance overhead
+# if versions need to be updated, as they must be changed in multiple places if a specific service needs a different version than the core or another service.
+# However, it also ensures strict version consistency across all services if that's the primary goal.
+
 requests==2.32.3
 python-dotenv==1.0.0
 crawl4ai==0.6.3

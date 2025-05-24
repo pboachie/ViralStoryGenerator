@@ -88,7 +88,7 @@ class config:
         MAX_REQUEST_SIZE_MB: int = int(os.environ.get("MAX_REQUEST_SIZE_MB", 10))
 
         # File uploads
-        UPLOAD_DIR: str = os.environ.get("UPLOAD_DIR", "./uploads") # TODO: Use in API for all uploads
+        UPLOAD_DIR: str = os.environ.get("UPLOAD_DIR", "./uploads") # TODO: Verify all API upload endpoints use config.http.UPLOAD_DIR and config.http.MAX_UPLOAD_SIZE_MB for consistency and security.
         MAX_UPLOAD_SIZE_MB: int = int(os.environ.get("MAX_UPLOAD_SIZE_MB", 50))
 
         BASE_URL: str = os.environ.get("BASE_URL", f"http://localhost:{PORT}")

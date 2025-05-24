@@ -134,7 +134,7 @@ def query_collection(
         results = collection.query(
             query_texts=query_texts,
             n_results=n_results,
-            include=['documents', 'metadatas', 'distances'] # TODO: Include distances for potential relevance scoring
+            include=['documents', 'metadatas', 'distances'] # TODO: Include 'distances' in chromadb.collection.query include_list for relevance scoring and add handling for it in consuming functions.
         )
         _logger.info(f"Query successful for collection '{collection_name}'. Found results.")
         return results
