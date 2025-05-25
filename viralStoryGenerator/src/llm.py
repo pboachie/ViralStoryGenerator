@@ -70,8 +70,6 @@ def _make_llm_request(
             headers=headers,
             json=payload,
             timeout=timeout
-            json=payload,
-            timeout=timeout
         )
         response.raise_for_status()
         _logger.debug(f"LLM request successful (Status: {response.status_code})")

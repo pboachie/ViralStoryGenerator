@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch, MagicMock
-from pydantic import ValidationError, AnyHttpUrl
-from typing import List, Dict, Any
+from pydantic import ValidationError, AnyHttpUrl, HttpUrl
+from typing import List, Dict, Any, Optional, Union, Tuple # Added HttpUrl, Optional, Union, Tuple
 
 from viralStoryGenerator.models.models import (
     URLMetadata,
@@ -12,7 +12,21 @@ from viralStoryGenerator.models.models import (
     QueueStreamStatus,
     AllQueueStatusResponse,
     QueueStatusResponse,
-    SingleQueueStatusResponse
+    SingleQueueStatusResponse,
+    JobResponse, # Added
+    StoryGenerationResult, # Added
+    ErrorResponse, # Added
+    ServiceStatusDetail, # Added
+    HealthResponse, # Added
+    ContentDetailItem, # Added
+    JobStatusResponse, # Added
+    StoryboardScene, # Added
+    StoryboardResponse, # Added
+    ScrapeJobRequest, # Added
+    ScrapeJobResult, # Added
+    ClearStalledJobsResponse, # Added
+    SuccessResponse, # Added
+    FailureResponse # Added
 )
 
 class TestModels(unittest.TestCase):
@@ -85,7 +99,7 @@ class TestModels(unittest.TestCase):
     @patch('viralStoryGenerator.models.models.app_config')
     def test_story_generation_request_urls_no_domain_restriction_applied(self, mock_app_config):
         """
-        Tests that URL validation passes for any domain if ALLOWED_DOMAINS is not configured,
+        Tests that URL validation passes for any domain if ALLOWED_DOMAAINS is not configured,
         None, or an empty list.
         """
         urls_to_test = ["http://anydomain.com/path", "https://another.co.uk/resource"]
@@ -238,6 +252,388 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(response.recent_messages[0].id, "test-id")
 
+    # --- Tests for JobResponse ---
+    def test_job_response_creation(self):
+        data = {"job_id": "job123", "message": "Job created successfully"}
+        obj = JobResponse(**data)
+        self.assertEqual(obj.job_id, "job123")
+        self.assertEqual(obj.message, "Job created successfully")
+
+    def test_job_response_missing_required_fields(self):
+        with self.assertRaises(ValidationError):
+            JobResponse(message="Job created successfully") # job_id missing
+        with self.assertRaises(ValidationError):
+            JobResponse(job_id="job123") # message missing
+
+    def test_job_response_invalid_types(self):
+        with self.assertRaises(ValidationError):
+            JobResponse(job_id=123, message="Job created successfully") # job_id invalid type
+        with self.assertRaises(ValidationError):
+            JobResponse(job_id="job123", message=123) # message invalid type
+
+    # --- Tests for StoryGenerationResult ---
+    def test_story_generation_result_creation(self):
+        data = {
+            "story_script": "This is the story.",
+            "storyboard": {"scene1": "details1"},
+            "audio_url": "http://example.com/audio.mp3",
+            "sources": ["http://example.com/source1"]
+        }
+        obj = StoryGenerationResult(**data)
+        self.assertEqual(obj.story_script, "This is the story.")
+        self.assertEqual(obj.storyboard, {"scene1": "details1"})
+        self.assertEqual(obj.audio_url, "http://example.com/audio.mp3")
+        self.assertEqual(obj.sources, ["http://example.com/source1"])
+
+    def test_story_generation_result_missing_required_fields(self):
+        required_fields = ["story_script", "storyboard", "sources"]
+        base_data = {
+            "story_script": "Script", "storyboard": {}, "sources": [], "audio_url": "http://example.com/audio.mp3"
+        }
+        for field in required_fields:
+            data = base_data.copy()
+            del data[field]
+            with self.assertRaises(ValidationError, msg=f"Missing field: {field}"):
+                StoryGenerationResult(**data)
+
+    def test_story_generation_result_invalid_types(self):
+        with self.assertRaises(ValidationError): # story_script invalid
+            StoryGenerationResult(story_script=123, storyboard={}, sources=[])
+        with self.assertRaises(ValidationError): # storyboard invalid
+            StoryGenerationResult(story_script="Script", storyboard="not a dict", sources=[])
+        with self.assertRaises(ValidationError): # audio_url invalid
+            StoryGenerationResult(story_script="Script", storyboard={}, sources=[], audio_url=123)
+        with self.assertRaises(ValidationError): # sources invalid
+            StoryGenerationResult(story_script="Script", storyboard={}, sources="not a list")
+
+    # --- Tests for ErrorResponse ---
+    def test_error_response_creation(self):
+        data = {"error": "NotFound", "detail": "Resource not found"}
+        obj = ErrorResponse(**data)
+        self.assertEqual(obj.error, "NotFound")
+        self.assertEqual(obj.detail, "Resource not found")
+
+    def test_error_response_missing_required_fields(self):
+        with self.assertRaises(ValidationError):
+            ErrorResponse(detail="Resource not found") # error missing
+        with self.assertRaises(ValidationError):
+            ErrorResponse(error="NotFound") # detail missing
+
+    def test_error_response_invalid_types(self):
+        with self.assertRaises(ValidationError):
+            ErrorResponse(error=123, detail="Resource not found")
+        with self.assertRaises(ValidationError):
+            ErrorResponse(error="NotFound", detail=123)
+
+    # --- Tests for ServiceStatusDetail ---
+    def test_service_status_detail_creation(self):
+        data = {"status": "healthy", "uptime": 12345.6, "response_time": 100.5, "message": "All systems nominal"}
+        obj = ServiceStatusDetail(**data)
+        self.assertEqual(obj.status, "healthy")
+        self.assertEqual(obj.uptime, 12345.6)
+        self.assertEqual(obj.response_time, 100.5)
+        self.assertEqual(obj.message, "All systems nominal")
+        data_str_uptime = {"status": "degraded", "uptime": "3 days", "response_time": "N/A", "message": "High load"}
+        obj_str = ServiceStatusDetail(**data_str_uptime)
+        self.assertEqual(obj_str.uptime, "3 days")
+
+
+    def test_service_status_detail_missing_required_fields(self):
+        required = ["status", "uptime", "response_time"]
+        base_data = {"status": "healthy", "uptime": 1.0, "response_time": 1.0, "message": "OK"}
+        for field in required:
+            data = base_data.copy()
+            del data[field]
+            with self.assertRaises(ValidationError, msg=f"Missing field: {field}"):
+                ServiceStatusDetail(**data)
+
+    def test_service_status_detail_invalid_types(self):
+        with self.assertRaises(ValidationError): # status invalid
+            ServiceStatusDetail(status=123, uptime=1.0, response_time=1.0)
+        # uptime/response_time can be str or float, so direct type errors are harder to trigger without specific constraints
+        with self.assertRaises(ValidationError): # message invalid
+            ServiceStatusDetail(status="ok", uptime=1.0, response_time=1.0, message=[])
+
+
+    # --- Tests for HealthResponse ---
+    def test_health_response_creation(self):
+        service_detail_data = {"status": "healthy", "uptime": 10.0, "response_time": 1.0}
+        data = {
+            "status": "healthy",
+            "services": {"service1": ServiceStatusDetail(**service_detail_data)},
+            "version": "1.0.0",
+            "environment": "production",
+            "uptime": 12345.0
+        }
+        obj = HealthResponse(**data)
+        self.assertEqual(obj.status, "healthy")
+        self.assertEqual(obj.services["service1"].status, "healthy")
+        self.assertEqual(obj.version, "1.0.0")
+
+    def test_health_response_missing_required_fields(self):
+        required = ["status", "services", "version", "environment", "uptime"]
+        base_data = {
+            "status": "healthy", "services": {}, "version": "1.0", "environment": "dev", "uptime": 1.0
+        }
+        for field in required:
+            data = base_data.copy()
+            del data[field]
+            with self.assertRaises(ValidationError, msg=f"Missing field: {field}"):
+                HealthResponse(**data)
+
+    def test_health_response_invalid_types(self):
+        service_detail_data = {"status": "healthy", "uptime": 10.0, "response_time": 1.0}
+        base_args = {"services": {"s1": service_detail_data}, "version": "1", "environment": "dev", "uptime": 1.0}
+        with self.assertRaises(ValidationError): # status invalid
+            HealthResponse(status=123, **base_args)
+        with self.assertRaises(ValidationError): # services invalid
+            HealthResponse(status="ok", services="not a dict", version="1", environment="dev", uptime=1.0)
+        with self.assertRaises(ValidationError): # version invalid
+            HealthResponse(status="ok", **base_args, version=1.0)
+
+
+    # --- Tests for ContentDetailItem ---
+    def test_content_detail_item_creation(self):
+        data = {"url": "http://example.com/content", "content": "This is the content."}
+        obj = ContentDetailItem(**data)
+        self.assertEqual(obj.url, "http://example.com/content")
+        self.assertEqual(obj.content, "This is the content.")
+        data_dict_content = {"url": "http://example.com/json", "content": {"key": "value"}}
+        obj_dict = ContentDetailItem(**data_dict_content)
+        self.assertEqual(obj_dict.content, {"key": "value"})
+
+
+    def test_content_detail_item_invalid_types(self):
+         # URL should be a string, content can be Any
+        with self.assertRaises(ValidationError):
+            ContentDetailItem(url=123, content="content")
+
+
+    # --- Tests for JobStatusResponse ---
+    def test_job_status_response_creation(self):
+        content_item_data = {"url": "http://example.com/doc", "content": "doc content"}
+        data = {
+            "job_id": "job789",
+            "status": "completed",
+            "message": "Job finished.",
+            "story": [ContentDetailItem(**content_item_data)],
+            "storyboard": [ContentDetailItem(**content_item_data)],
+            "audio_url": "http://example.com/audio.mp3",
+            "sources": ["http://example.com/source"],
+            "error": None,
+            "created_at": "2023-01-01T00:00:00Z",
+            "updated_at": "2023-01-01T01:00:00Z",
+            "processing_time_seconds": 60.5
+        }
+        obj = JobStatusResponse(**data)
+        self.assertEqual(obj.job_id, "job789")
+        self.assertEqual(obj.status, "completed")
+        self.assertEqual(obj.story[0].url, "http://example.com/doc")
+
+    def test_job_status_response_missing_required_fields(self):
+        with self.assertRaises(ValidationError):
+            JobStatusResponse(status="pending") # job_id missing
+        with self.assertRaises(ValidationError):
+            JobStatusResponse(job_id="job123") # status missing
+
+    def test_job_status_response_invalid_types(self):
+        base_data = {"job_id": "job1", "status": "done"}
+        with self.assertRaises(ValidationError): # job_id invalid
+            JobStatusResponse(job_id=123, status="pending")
+        with self.assertRaises(ValidationError): # status invalid
+            JobStatusResponse(job_id="job1", status=123)
+        with self.assertRaises(ValidationError): # story invalid
+            JobStatusResponse(**base_data, story="not a list")
+        with self.assertRaises(ValidationError): # storyboard invalid
+            JobStatusResponse(**base_data, storyboard="not a list")
+        with self.assertRaises(ValidationError): # audio_url invalid
+            JobStatusResponse(**base_data, audio_url=123)
+        with self.assertRaises(ValidationError): # sources invalid
+            JobStatusResponse(**base_data, sources="not a list")
+        with self.assertRaises(ValidationError): # processing_time_seconds invalid
+            JobStatusResponse(**base_data, processing_time_seconds="not a float")
+
+
+    # --- Tests for StoryboardScene ---
+    def test_storyboard_scene_creation(self):
+        data = {
+            "scene_number": 1,
+            "narration_text": "The story begins...",
+            "image_prompt": "A beautiful landscape.",
+            "duration": 10.5,
+            "start_time": 0.0
+        }
+        obj = StoryboardScene(**data)
+        self.assertEqual(obj.scene_number, 1)
+        self.assertEqual(obj.narration_text, "The story begins...")
+
+    def test_storyboard_scene_missing_required_fields(self):
+        required = ["scene_number", "narration_text", "image_prompt", "duration", "start_time"]
+        base_data = {"scene_number": 1, "narration_text": "text", "image_prompt": "prompt", "duration": 1.0, "start_time": 0.0}
+        for field in required:
+            data = base_data.copy()
+            del data[field]
+            with self.assertRaises(ValidationError, msg=f"Missing field: {field}"):
+                StoryboardScene(**data)
+
+    def test_storyboard_scene_invalid_types(self):
+        base_data = {"narration_text": "text", "image_prompt": "prompt", "duration": 1.0, "start_time": 0.0}
+        with self.assertRaises(ValidationError): # scene_number invalid
+            StoryboardScene(scene_number="not an int", **base_data)
+        with self.assertRaises(ValidationError): # narration_text invalid
+            StoryboardScene(scene_number=1, narration_text=123, image_prompt="p", duration=1.0, start_time=0.0)
+        with self.assertRaises(ValidationError): # duration invalid
+            StoryboardScene(scene_number=1, **base_data, duration="not a float", start_time=0.0)
+
+
+    # --- Tests for StoryboardResponse ---
+    def test_storyboard_response_creation(self):
+        scene_data = {
+            "scene_number": 1, "narration_text": "text", "image_prompt": "prompt", "duration": 5.0, "start_time": 0.0
+        }
+        data = {"scenes": [StoryboardScene(**scene_data)]}
+        obj = StoryboardResponse(**data)
+        self.assertEqual(len(obj.scenes), 1)
+        self.assertEqual(obj.scenes[0].scene_number, 1)
+
+    def test_storyboard_response_missing_required_fields(self):
+        with self.assertRaises(ValidationError):
+            StoryboardResponse() # scenes missing
+
+    def test_storyboard_response_invalid_types(self):
+        with self.assertRaises(ValidationError): # scenes not a list
+            StoryboardResponse(scenes="not a list")
+        with self.assertRaises(ValidationError): # scene item invalid
+            StoryboardResponse(scenes=[{"invalid_scene_data": True}])
+
+
+    # --- Tests for ScrapeJobRequest ---
+    def test_scrape_job_request_creation(self):
+        data = {
+            "job_id": "scrape_job_1",
+            "urls": ["http://example.com/scrape_this"],
+            "browser_config": {"headless": True},
+            "run_config": {"timeout": 30},
+            "request_time": 1678886400.0
+        }
+        obj = ScrapeJobRequest(**data)
+        self.assertEqual(obj.job_id, "scrape_job_1")
+        self.assertEqual(obj.urls, ["http://example.com/scrape_this"])
+        self.assertTrue(obj.browser_config["headless"])
+
+    def test_scrape_job_request_missing_required_fields(self):
+        required = ["job_id", "urls", "request_time"]
+        base_data = {"job_id": "j1", "urls": ["http://example.com"], "request_time": 1.0}
+        for field in required:
+            data = base_data.copy()
+            del data[field]
+            with self.assertRaises(ValidationError, msg=f"Missing field: {field}"):
+                ScrapeJobRequest(**data)
+
+    def test_scrape_job_request_invalid_types(self):
+        base_data = {"urls": ["http://example.com"], "request_time": 1.0}
+        with self.assertRaises(ValidationError): # job_id invalid
+            ScrapeJobRequest(job_id=123, **base_data)
+        with self.assertRaises(ValidationError): # urls invalid (not list)
+            ScrapeJobRequest(job_id="j1", urls="not a list", request_time=1.0)
+        with self.assertRaises(ValidationError): # urls invalid (item not str)
+            ScrapeJobRequest(job_id="j1", urls=[123], request_time=1.0)
+        with self.assertRaises(ValidationError): # browser_config invalid
+            ScrapeJobRequest(job_id="j1", **base_data, browser_config="not a dict")
+        with self.assertRaises(ValidationError): # request_time invalid
+            ScrapeJobRequest(job_id="j1", urls=["http://example.com"], request_time="not a float")
+
+    # --- Tests for ScrapeJobResult ---
+    def test_scrape_job_result_creation(self):
+        data = {
+            "status": "completed",
+            "message": "Scraping done.",
+            "error": None,
+            "data": [("http://example.com", "content")],
+            "created_at": 1678886400.0,
+            "updated_at": 1678886460.0
+        }
+        obj = ScrapeJobResult(**data)
+        self.assertEqual(obj.status, "completed")
+        self.assertEqual(obj.data[0][0], "http://example.com")
+
+    def test_scrape_job_result_missing_required_fields(self):
+        required = ["status", "created_at", "updated_at"]
+        base_data = {"status": "ok", "created_at": 1.0, "updated_at": 2.0}
+        for field in required:
+            data = base_data.copy()
+            del data[field]
+            with self.assertRaises(ValidationError, msg=f"Missing field: {field}"):
+                ScrapeJobResult(**data)
+
+    def test_scrape_job_result_invalid_types(self):
+        base_data = {"created_at": 1.0, "updated_at": 2.0}
+        with self.assertRaises(ValidationError): # status invalid
+            ScrapeJobResult(status=123, **base_data)
+        with self.assertRaises(ValidationError): # data invalid (not list)
+            ScrapeJobResult(status="ok", **base_data, data="not a list")
+        with self.assertRaises(ValidationError): # data invalid (tuple item not str)
+            ScrapeJobResult(status="ok", **base_data, data=[(123, "content")])
+        with self.assertRaises(ValidationError): # created_at invalid
+            ScrapeJobResult(status="ok", created_at="not a float", updated_at=2.0)
+
+
+    # --- Tests for ClearStalledJobsResponse ---
+    def test_clear_stalled_jobs_response_creation(self):
+        data = {"message": "Cleared jobs", "claimed_count": 5, "failed_count": 1, "reprocessed_count": 4}
+        obj = ClearStalledJobsResponse(**data)
+        self.assertEqual(obj.message, "Cleared jobs")
+        self.assertEqual(obj.claimed_count, 5)
+
+    def test_clear_stalled_jobs_response_missing_required_fields(self):
+        required = ["message", "claimed_count", "failed_count", "reprocessed_count"]
+        base_data = {"message":"msg", "claimed_count":0, "failed_count":0, "reprocessed_count":0}
+        for field in required:
+            data = base_data.copy()
+            del data[field]
+            with self.assertRaises(ValidationError, msg=f"Missing field: {field}"):
+                ClearStalledJobsResponse(**data)
+
+    def test_clear_stalled_jobs_response_invalid_types(self):
+        base_data = {"claimed_count":0, "failed_count":0, "reprocessed_count":0}
+        with self.assertRaises(ValidationError): # message invalid
+            ClearStalledJobsResponse(message=123, **base_data)
+        with self.assertRaises(ValidationError): # claimed_count invalid
+            ClearStalledJobsResponse(message="msg", claimed_count="not int", failed_count=0, reprocessed_count=0)
+
+    # --- Tests for SuccessResponse ---
+    def test_success_response_creation(self):
+        data = {"message": "Operation successful", "detail": "Extra details here"}
+        obj = SuccessResponse(**data)
+        self.assertEqual(obj.message, "Operation successful")
+        self.assertEqual(obj.detail, "Extra details here")
+
+    def test_success_response_missing_required_fields(self):
+        with self.assertRaises(ValidationError): # message missing
+            SuccessResponse(detail="details")
+
+    def test_success_response_invalid_types(self):
+        with self.assertRaises(ValidationError): # message invalid
+            SuccessResponse(message=123)
+        with self.assertRaises(ValidationError): # detail invalid
+            SuccessResponse(message="ok", detail=123)
+
+    # --- Tests for FailureResponse ---
+    def test_failure_response_creation(self):
+        data = {"error": "Operation failed", "detail": "Reason for failure"}
+        obj = FailureResponse(**data)
+        self.assertEqual(obj.error, "Operation failed")
+        self.assertEqual(obj.detail, "Reason for failure")
+
+    def test_failure_response_missing_required_fields(self):
+        with self.assertRaises(ValidationError): # error missing
+            FailureResponse(detail="details")
+
+    def test_failure_response_invalid_types(self):
+        with self.assertRaises(ValidationError): # error invalid
+            FailureResponse(error=123)
+        with self.assertRaises(ValidationError): # detail invalid
+            FailureResponse(error="fail", detail=123)
 
 
 if __name__ == '__main__':
