@@ -388,8 +388,11 @@ class TestModels(unittest.TestCase):
             HealthResponse(status=123, **base_args)
         with self.assertRaises(ValidationError): # services invalid
             HealthResponse(status="ok", services="not a dict", version="1", environment="dev", uptime=1.0)
-        with self.assertRaises(ValidationError): # version invalid
-            HealthResponse(status="ok", **base_args, version=1.0)
+
+        base_args_no_version = base_args.copy()
+        del base_args_no_version["version"]
+        with self.assertRaises(ValidationError):
+            HealthResponse(status="ok", **base_args_no_version, version="1.0")
 
 
     # --- Tests for ContentDetailItem ---
