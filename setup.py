@@ -40,7 +40,7 @@ setup(
         "httpx>=0.28.1",
         "boto3==1.37.28",
         "azure-storage-blob==12.16.0",
-        # "sentence-transformers==2.2.2",
+        "sentence-transformers==2.2.2",
         "chromadb>=1.0.9",
         "pydantic-settings==2.0.0",
         # "torch==2.3.1",

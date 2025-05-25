@@ -5,7 +5,6 @@ import os
 import sys
 from typing import List, Optional, Union, Tuple, Dict, Any
 import logging
-import torch
 import viralStoryGenerator.src.logger
 _logger = logging.getLogger(__name__)
 
@@ -186,7 +185,8 @@ class config:
         RELEVANT_CHUNKS_COUNT: int = int(os.environ.get("RAG_RELEVANT_CHUNKS_COUNT", 5))
         CHUNK_SIZE: int = int(os.environ.get("RAG_CHUNK_SIZE", 500)) # Chunks for RAG can often be smaller
         CHUNK_OVERLAP: int = int(os.environ.get("RAG_CHUNK_OVERLAP", 50))
-        DEVICE: str = "cuda:0" if torch.cuda.is_available() else "cpu"
+        # DEVICE: str = "cuda:0" if torch.cuda.is_available() else "cpu"
+        DEVICE: str = "cpu"  # Default to CPU for RAG operations
 
     class storyboard:
         ENABLE_STORYBOARD_GENERATION: bool = os.environ.get("ENABLE_STORYBOARD_GENERATION", "True").lower() in ["true", "1", "yes"]
@@ -239,10 +239,10 @@ class config:
     @staticmethod
     def get_device() -> str:
         """Returns the appropriate device for PyTorch operations."""
-        if torch.cuda.is_available():
-            return "cuda"
-        elif torch.backends.mps.is_available():
-            return "mps"
+        # if torch.cuda.is_available():
+        #     return "cuda"
+        # elif torch.backends.mps.is_available():
+        #     return "mps"
         return "cpu"
 
 # --- Configuration Validation ---
