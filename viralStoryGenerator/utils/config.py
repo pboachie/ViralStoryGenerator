@@ -5,7 +5,6 @@ import os
 import sys
 from typing import List, Optional, Union, Tuple, Dict, Any
 import logging
-import torch
 import viralStoryGenerator.src.logger
 _logger = logging.getLogger(__name__)
 
@@ -88,7 +87,7 @@ class config:
         MAX_REQUEST_SIZE_MB: int = int(os.environ.get("MAX_REQUEST_SIZE_MB", 10))
 
         # File uploads
-        UPLOAD_DIR: str = os.environ.get("UPLOAD_DIR", "./uploads") # TODO: Use in API for all uploads
+        UPLOAD_DIR: str = os.environ.get("UPLOAD_DIR", "./uploads") # TODO: Verify all API upload endpoints use config.http.UPLOAD_DIR and config.http.MAX_UPLOAD_SIZE_MB for consistency and security.
         MAX_UPLOAD_SIZE_MB: int = int(os.environ.get("MAX_UPLOAD_SIZE_MB", 50))
 
         BASE_URL: str = os.environ.get("BASE_URL", f"http://localhost:{PORT}")
@@ -186,11 +185,13 @@ class config:
         RELEVANT_CHUNKS_COUNT: int = int(os.environ.get("RAG_RELEVANT_CHUNKS_COUNT", 5))
         CHUNK_SIZE: int = int(os.environ.get("RAG_CHUNK_SIZE", 500)) # Chunks for RAG can often be smaller
         CHUNK_OVERLAP: int = int(os.environ.get("RAG_CHUNK_OVERLAP", 50))
-        DEVICE: str = "cuda:0" if torch.cuda.is_available() else "cpu"
+        # DEVICE: str = "cuda:0" if torch.cuda.is_available() else "cpu"
+        DEVICE: str = "cpu"  # Default to CPU for RAG operations
 
     class storyboard:
-        WORD_PER_MINUTE_RATE: int = int(os.environ.get("STORYBOARD_WPM", 150))
         ENABLE_STORYBOARD_GENERATION: bool = os.environ.get("ENABLE_STORYBOARD_GENERATION", "True").lower() in ["true", "1", "yes"]
+        WPM: int = int(os.environ.get("STORYBOARD_WPM", 150))
+        STRUCTURE_MAX_RETRIES: int = int(os.environ.get("STORYBOARD_STRUCTURE_MAX_RETRIES", 2))
 
     class scraper:
         # Content extraction
@@ -236,26 +237,13 @@ class config:
         WORKER_SHUTDOWN_TIMEOUT: int = int(os.environ.get("SCRAPER_WORKER_SHUTDOWN_TIMEOUT", 30))
 
     @staticmethod
-    def set_storyboard_generation(enabled: bool):
-        """Dynamically update the storyboard generation setting."""
-        config.storyboard.ENABLE_STORYBOARD_GENERATION = enabled
-        _logger.info(f"Storyboard generation set to {'enabled' if enabled else 'disabled'}.")
-
-    @classmethod
-    def set_storyboard_generation(cls, enabled: bool):
-        """Dynamically update storyboard generation setting."""
-        cls.storyboard.ENABLE_STORYBOARD_GENERATION = enabled
-
-    @classmethod
-    def set_image_generation(cls, enabled: bool):
-        """Dynamically update image generation setting."""
-        cls.openAI.ENABLED = enabled
-
-    @classmethod
-    def set_audio_generation(cls, enabled: bool):
-        """Dynamically update audio generation setting."""
-        cls.elevenLabs.ENABLED = enabled
-
+    def get_device() -> str:
+        """Returns the appropriate device for PyTorch operations."""
+        # if torch.cuda.is_available():
+        #     return "cuda"
+        # elif torch.backends.mps.is_available():
+        #     return "mps"
+        return "cpu"
 
 # --- Configuration Validation ---
 def validate_config_on_startup(cfg: config):
@@ -297,8 +285,8 @@ def validate_config_on_startup(cfg: config):
 
     if cfg.openAI.ENABLED and not cfg.openAI.API_KEY: # Check if enabled AND key missing
         _logger.warning("Image generation (ENABLE_IMAGE_GENERATION) is TRUE, but OPENAI_API_KEY is missing. DALL-E image generation for storyboards will fail.")
-    elif not cfg.openAI.ENABLED:
-         _logger.critical("Image generation via DALL-E is globally disabled (ENABLE_IMAGE_GENERATION=False).")
+    # elif not cfg.openAI.ENABLED: # This line is removed to enable image generation
+    #      _logger.critical("Image generation via DALL-E is globally disabled (ENABLE_IMAGE_GENERATION=False).")
 
 
     if not cfg.llm.ENDPOINT or not cfg.llm.MODEL:

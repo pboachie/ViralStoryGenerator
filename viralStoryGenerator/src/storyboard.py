@@ -9,6 +9,7 @@ import time
 import tempfile
 import shutil
 from typing import Dict, Any, Optional, List
+import asyncio
 
 from viralStoryGenerator.src.elevenlabs_tts import generate_elevenlabs_audio
 from viralStoryGenerator.prompts.prompts import get_storyboard_prompt
@@ -39,7 +40,7 @@ def generate_storyboard_structure(story: str, llm_endpoint: str, temperature: fl
     """
     Uses the LLM (specifically the MODEL_MULTI) to produce a storyboard breakdown
     containing scene markers and image prompts in JSON format.
-    Includes basic error handling and parsing.
+    Includes basic error handling, parsing, and retry logic.
 
     Returns:
         Parsed storyboard data (with scene_start_marker) as dict, or None on failure.
@@ -50,7 +51,7 @@ def generate_storyboard_structure(story: str, llm_endpoint: str, temperature: fl
         return None
 
     prompt = get_storyboard_prompt(story).strip()
-    _logger.info(f"Requesting storyboard structure (with markers) from LLM using model: {model}...")
+    _logger.debug(f"Requesting storyboard structure using model: {model}")
 
     headers = {
         "Content-Type": "application/json",
@@ -68,83 +69,97 @@ def generate_storyboard_structure(story: str, llm_endpoint: str, temperature: fl
         "response_format": STORYBOARD_RESPONSE_FORMAT
     }
 
-    try:
-        response = requests.post(
-            llm_endpoint,
-            headers=headers,
-            json=data,
-            timeout=appconfig.httpOptions.TIMEOUT
-        )
-        response.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        if response.status_code == 400 and "response_format" in data:
-            _logger.warning(f"LLM ({model}) returned 400 Bad Request with 'response_format', retrying without it.")
-            data.pop("response_format", None)
+    max_retries = appconfig.storyboard.STRUCTURE_MAX_RETRIES
+    for attempt in range(max_retries + 1): # +1 to include the initial attempt
+        try:
+            response = requests.post(llm_endpoint, headers=headers, json=data, timeout=appconfig.httpOptions.TIMEOUT)
+            response.raise_for_status()
+            raw_response_content = response.text
+            parsed_json = None
+
             try:
-                response = requests.post(llm_endpoint, headers=headers, json=data, timeout=appconfig.httpOptions.TIMEOUT)
-                response.raise_for_status()
-            except requests.exceptions.RequestException as retry_e:
-                 _logger.error(f"LLM ({model}) retry request for storyboard failed: {retry_e}")
-                 return None
+                outer_json = json.loads(raw_response_content)
+
+                # Extract the string content that should contain the actual storyboard JSON
+                if (outer_json.get("choices") and
+                    isinstance(outer_json["choices"], list) and
+                    len(outer_json["choices"]) > 0 and
+                    outer_json["choices"][0].get("message") and
+                    isinstance(outer_json["choices"][0]["message"], dict) and
+                    outer_json["choices"][0]["message"].get("content")):
+
+                    content_str = outer_json["choices"][0]["message"]["content"]
+
+                    try:
+                        parsed_json = json.loads(content_str)
+                        _logger.debug(f"Successfully parsed nested JSON from 'message.content' for storyboard structure. Attempt {attempt + 1}/{max_retries + 1}")
+                        if "scenes" in parsed_json and parsed_json["scenes"]:
+                            return parsed_json
+                        else:
+                            _logger.warning(f"Parsed JSON lacks scenes (attempt {attempt+1}/{max_retries+1})")
+                    except json.JSONDecodeError as e_nested:
+                        _logger.warning(f"Failed to parse nested JSON string from 'message.content'. Attempt {attempt + 1}/{max_retries + 1}. Error: {e_nested}. Content: {content_str[:500]}. Falling back to other methods.")
+                else:
+                    _logger.warning(f"Outer JSON structure does not match expected format for nested content. Attempt {attempt + 1}/{max_retries + 1}. Outer JSON: {raw_response_content[:500]}. Falling back to other methods.")
+
+                # Fallback 1: Try parsing the raw_response_content directly if not already successfully parsed from nested
+                if not (parsed_json and "scenes" in parsed_json and parsed_json["scenes"]):
+                    try:
+                        parsed_json = json.loads(raw_response_content)
+                        _logger.debug(f"Successfully parsed entire raw response as JSON for storyboard structure. Attempt {attempt + 1}/{max_retries + 1}")
+                        if "scenes" in parsed_json and parsed_json["scenes"]:
+                            return parsed_json
+                        # else: # Warning already logged if it was the nested attempt that failed here
+                            # _logger.warning(f"LLM response parsed as JSON but lacks 'scenes' or scenes are empty. Attempt {attempt + 1}/{max_retries + 1}. Response: {raw_response_content[:500]}")
+                    except json.JSONDecodeError:
+                        _logger.debug(f"Failed to parse entire raw response as JSON, will attempt markdown extraction. Attempt {attempt + 1}/{max_retries + 1}")
+
+                # Fallback 2: Try markdown extraction if other methods failed
+                if not (parsed_json and "scenes" in parsed_json and parsed_json["scenes"]):
+                    match = re.search(r"```json\\s*([\\s\\S]*?)\\s*```", raw_response_content, re.IGNORECASE)
+                    if match:
+                        json_str = match.group(1).strip()
+                        try:
+                            parsed_json = json.loads(json_str)
+                            _logger.info(f"Successfully extracted and parsed JSON from markdown for storyboard structure. Attempt {attempt + 1}/{max_retries + 1}")
+                            if "scenes" in parsed_json and parsed_json["scenes"]:
+                                return parsed_json
+                            else:
+                                _logger.warning(f"LLM response extracted from markdown but lacks 'scenes' or scenes are empty. Attempt {attempt + 1}/{max_retries + 1}. Extracted: {json_str[:500]}")
+                        except json.JSONDecodeError as e_markdown:
+                            _logger.error(f"Failed to parse JSON extracted from markdown for storyboard structure. Attempt {attempt + 1}/{max_retries + 1}. Error: {e_markdown}. Extracted: {json_str[:500]}")
+                    else:
+                        _logger.error(f"No JSON found in LLM response for storyboard structure (neither direct, nested, nor in markdown). Attempt {attempt + 1}/{max_retries + 1}. Response: {raw_response_content[:500]}")
+
+            except json.JSONDecodeError as e_outer:
+                 _logger.error(f"Failed to parse the initial LLM response as JSON. Attempt {attempt + 1}/{max_retries + 1}. Error: {e_outer}. Response: {raw_response_content[:500]}")
+
+
+            # If we reach here, it means parsing failed or scenes were not valid
+            if attempt < max_retries:
+                _logger.debug(f"Retrying storyboard structure generation attempt {attempt+1}/{max_retries+1}")
+                time.sleep(1 * (attempt + 1))
+                continue # Go to next attempt
+            else:
+                _logger.error(f"All {max_retries + 1} attempts failed to generate valid storyboard structure.")
+                return None
+
+        except requests.exceptions.HTTPError as e:
+            _logger.error(f"HTTP error during storyboard structure request (Attempt {attempt + 1}/{max_retries + 1}): {e}. Response: {e.response.text if e.response else 'No response'}")
+        except requests.exceptions.Timeout:
+            _logger.error(f"Timeout during storyboard structure request (Attempt {attempt + 1}/{max_retries + 1}).")
+        except requests.exceptions.RequestException as e:
+            _logger.error(f"Request exception during storyboard structure request (Attempt {attempt + 1}/{max_retries + 1}): {e}")
+        except Exception as e:
+            _logger.error(f"Unexpected error during storyboard structure generation attempt {attempt + 1}/{max_retries + 1}: {e}")
+
+        if attempt < max_retries:
+            _logger.info(f"Retrying storyboard structure generation due to error ({attempt + 1}/{max_retries + 1})...")
+            time.sleep(1 * (attempt + 1))
         else:
-            _logger.error(f"LLM ({model}) request for storyboard failed: {e}. Response: {response.text[:200]}")
+            _logger.error(f"All {max_retries + 1} attempts failed for storyboard structure generation after encountering errors.")
             return None
-    except requests.exceptions.Timeout:
-         _logger.error(f"LLM ({model}) request for storyboard timed out after {appconfig.httpOptions.TIMEOUT} seconds.")
-         return None
-    except requests.exceptions.RequestException as e:
-        payload_str = json.dumps(data)
-        _logger.error(f"Failed to generate storyboard structure from LLM ({model}): {e}. Request Payload: {payload_str[:500]}...", exc_info=True)
-        return None
-
-    try:
-        response_data = response.json()
-        if not response_data or "choices" not in response_data or not response_data["choices"]:
-            _logger.error(f"LLM ({model}) response missing 'choices' field or empty. Response: {response.text[:200]}")
-            return None
-
-        raw_content = response_data["choices"][0]["message"]["content"]
-
-        cleaned_content, thinking = _extract_chain_of_thought(raw_content)
-        _logger.debug(f"Extracted thinking block: {thinking[:100]}...")
-
-        json_match = re.search(r'\{.*\}', cleaned_content, re.DOTALL)
-        if json_match:
-            cleaned_content = json_match.group(0)
-        else:
-             _logger.warning(f"Could not find explicit JSON object in cleaned LLM message content. Raw (cleaned): {cleaned_content[:200]}...")
-
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as extract_err:
-         _logger.error(f"Error parsing LLM response structure or extracting content: {extract_err}. Response text: {response.text[:500]}...", exc_info=True)
-         return None
-    except Exception as text_extract_err:
-         _logger.error(f"Unexpected error extracting/cleaning text from LLM response: {text_extract_err}. Response status: {response.status_code}", exc_info=True)
-         return None
-
-    try:
-         storyboard_data = json.loads(cleaned_content)
-         if "scenes" not in storyboard_data or not isinstance(storyboard_data["scenes"], list):
-             raise ValueError("Missing or invalid 'scenes' list in LLM response.")
-         if not storyboard_data["scenes"]:
-              _logger.warning(f"LLM ({model}) returned an empty 'scenes' list.")
-              return None # todo: or allow empty list to proceed
-         for i, scene in enumerate(storyboard_data["scenes"]):
-             if "scene_start_marker" not in scene or not isinstance(scene["scene_start_marker"], str) or not scene["scene_start_marker"].strip():
-                 raise ValueError(f"Scene {i+1} is missing or has an invalid 'scene_start_marker'.")
-             if "image_prompt" not in scene or not isinstance(scene["image_prompt"], str):
-                 if "image_prompt" not in scene:
-                     _logger.warning(f"Scene {i+1} is missing 'image_prompt'.")
-                 elif not isinstance(scene["image_prompt"], str):
-                      _logger.warning(f"Scene {i+1} has non-string 'image_prompt': {type(scene['image_prompt'])}. Setting to empty.")
-                      scene["image_prompt"] = "" # Attempt recovery
-             scene.setdefault("duration", 0)
-             scene.setdefault("start_time", 0)
-
-         _logger.info(f"Successfully parsed storyboard structure with {len(storyboard_data['scenes'])} scenes (using markers).")
-         return storyboard_data
-    except (json.JSONDecodeError, ValueError) as e:
-         _logger.error(f"JSON decode/validation error after cleaning (model: {model}): {e}. Cleaned content: {cleaned_content[:500]}...")
-         return None
+    return None
 
 def generate_dalle_image(image_prompt: str, output_image_path: str, openai_api_key: str) -> Optional[str]:
     """
@@ -166,7 +181,7 @@ def generate_dalle_image(image_prompt: str, output_image_path: str, openai_api_k
         _logger.error("Cannot generate DALL-E image: Missing OpenAI API key.")
         return None
 
-    _logger.info(f"Requesting DALL-E image generation. Output: {output_image_path}")
+    _logger.debug(f"DALL-E image request for: {output_image_path}")
     _logger.debug(f"DALL-E Prompt (potential injection risk): {image_prompt[:100]}...")
 
     url = "https://api.openai.com/v1/images/generations"
@@ -185,6 +200,7 @@ def generate_dalle_image(image_prompt: str, output_image_path: str, openai_api_k
         "style": "vivid" # or "natural"
     }
     dalle_timeout = 60
+    response_data = None
 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=dalle_timeout)
@@ -202,7 +218,7 @@ def generate_dalle_image(image_prompt: str, output_image_path: str, openai_api_k
              for chunk in image_response.iter_content(chunk_size=8192):
                  f.write(chunk)
 
-        _logger.info(f"DALL-E image saved successfully to {output_image_path}")
+        _logger.debug(f"DALL-E image saved to {output_image_path}")
         return output_image_path
 
     except requests.exceptions.Timeout as e:
@@ -215,7 +231,7 @@ def generate_dalle_image(image_prompt: str, output_image_path: str, openai_api_k
         _logger.error(f"DALL-E API call failed: {e}. Details: {error_details}")
         return None
     except (KeyError, IndexError, TypeError) as e:
-         _logger.error(f"Failed processing DALL-E response or downloading image: {e}. Response data: {response_data if 'response_data' in locals() else 'N/A'}")
+         _logger.error(f"Failed processing DALL-E response or downloading image: {e}. Response data: {response_data if response_data is not None else 'N/A'}")
          return None
     except IOError as e:
          _logger.error(f"Failed to save DALL-E image to {output_image_path}: {e}")
@@ -225,6 +241,7 @@ def generate_dalle_image(image_prompt: str, output_image_path: str, openai_api_k
 def generate_storyboard(story: str, topic: str, task_id: str, llm_endpoint: str, temperature: float, voice_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     Generates a full storyboard from a story script using scene markers.
+    Retries fetching markers and splitting the story if initial attempts fail.
 
     Steps:
     1. Generate scene structure (markers, prompts) using LLM (MODEL_MULTI).
@@ -251,23 +268,69 @@ def generate_storyboard(story: str, topic: str, task_id: str, llm_endpoint: str,
     """
 
     if not appconfig.storyboard.ENABLE_STORYBOARD_GENERATION:
-        _logger.info(f"Storyboard generation is disabled for task: '{task_id}'. Skipping storyboard generation.")
+        _logger.debug(f"Storyboard generation disabled for task: '{task_id}'")
         return None
 
-    _logger.info(f"Starting storyboard generation for task: '{task_id}' (Topic: '{topic}') using marker-based splitting.")
+    _logger.debug(f"Starting storyboard generation for task: '{task_id}' (Topic: '{topic}')")
 
-    storyboard_data = generate_storyboard_structure(story, llm_endpoint, temperature)
-    if not storyboard_data or "scenes" not in storyboard_data or not storyboard_data["scenes"]:
-        _logger.error(f"Storyboard structure generation (with markers) failed or returned empty scenes for task {task_id}.")
+    max_overall_attempts = getattr(appconfig.storyboard, "RL_MAX_DELAY", 3)
+    retry_delay_seconds = getattr(appconfig.storyboard, "RL_MAX_RETRIES", 2)
+
+    if not isinstance(max_overall_attempts, int) or max_overall_attempts <= 0:
+        _logger.warning(f"Task {task_id}: Invalid OVERALL_STORYBOARD_ATTEMPTS ({max_overall_attempts}), defaulting to 3.")
+        max_overall_attempts = 3
+    if not isinstance(retry_delay_seconds, (int, float)) or retry_delay_seconds < 0:
+        _logger.warning(f"Task {task_id}: Invalid RETRY_DELAY_SECONDS ({retry_delay_seconds}), defaulting to 2.")
+        retry_delay_seconds = 2
+
+    successful_storyboard_data: Optional[Dict[str, Any]] = None
+    successful_scenes_list: Optional[List[Dict[str, Any]]] = None
+    successful_scene_narrations: Optional[List[str]] = None
+
+    for attempt in range(max_overall_attempts):
+        _logger.debug(f"Storyboard attempt {attempt+1}/{max_overall_attempts} for task {task_id}")
+
+        # Step 1: Generate storyboard structure (markers)
+        current_storyboard_structure = generate_storyboard_structure(story, llm_endpoint, temperature)
+
+        if not current_storyboard_structure or "scenes" not in current_storyboard_structure or not current_storyboard_structure["scenes"]:
+            _logger.warning(f"Task {task_id}, Attempt {attempt + 1}: Failed to generate storyboard structure or no scenes found.")
+            if attempt < max_overall_attempts - 1:
+                _logger.info(f"Task {task_id}: Retrying structure generation. Waiting {retry_delay_seconds * (attempt + 1)}s...")
+                time.sleep(retry_delay_seconds * (attempt + 1))
+                continue  # Go to next overall attempt
+            else:
+                _logger.error(f"Task {task_id}: All {max_overall_attempts} attempts failed to generate a valid storyboard structure.")
+                break # Exit loop, will return None later
+
+        current_scenes_from_structure = current_storyboard_structure["scenes"]
+
+        # Step 2: Split story using the markers from the current structure
+        _logger.debug(f"Splitting story using {len(current_scenes_from_structure)} markers")
+        narrations = split_story_by_markers(story, current_scenes_from_structure)
+
+        if narrations and len(narrations) == len(current_scenes_from_structure):
+            _logger.debug(f"Generated and split into {len(narrations)} scenes")
+            successful_storyboard_data = current_storyboard_structure
+            successful_scenes_list = current_scenes_from_structure
+            successful_scene_narrations = narrations
+            break  # Success, exit the overall attempt loop
+        else:
+            _logger.warning(f"Task {task_id}, Attempt {attempt + 1}: Failed to split story accurately. Expected {len(current_scenes_from_structure)} narrations, got {len(narrations) if narrations is not None else 'None'}.")
+            markers_for_debug = [s.get("scene_start_marker", "N/A") for s in current_scenes_from_structure]
+            _logger.debug(f"Task {task_id}, Attempt {attempt + 1}: Markers that failed splitting: {markers_for_debug}")
+            if attempt < max_overall_attempts - 1:
+                _logger.info(f"Task {task_id}: Retrying with new set of markers. Waiting {retry_delay_seconds * (attempt + 1)}s...")
+                time.sleep(retry_delay_seconds * (attempt + 1))
+            # else: last attempt, loop will end
+
+    if not successful_storyboard_data or not successful_scenes_list or not successful_scene_narrations:
+        _logger.error(f"Task {task_id}: Failed to generate and split storyboard after {max_overall_attempts} attempts. Proceeding without storyboard.")
         return None
 
-    scenes = storyboard_data["scenes"]
-    scene_narrations = split_story_by_markers(story, scenes)
-    if not scene_narrations or len(scene_narrations) != len(scenes):
-        _logger.error(f"Failed to split story accurately based on markers for task {task_id}. Aborting storyboard generation.")
-        # Optionally save the faulty structure for debugging
-        # storage_manager.store_file(...)
-        return None
+    storyboard_data = successful_storyboard_data
+    scenes = successful_scenes_list
+    scene_narrations = successful_scene_narrations
 
     if not task_id:
         _logger.error("Task ID is missing, cannot generate storyboard filenames.")
@@ -276,7 +339,7 @@ def generate_storyboard(story: str, topic: str, task_id: str, llm_endpoint: str,
     storyboard_base_dir = storage_manager._get_storage_dir("storyboard")
     try:
         os.makedirs(storyboard_base_dir, exist_ok=True)
-        _logger.info(f"Ensured storyboard base directory exists: {storyboard_base_dir}")
+        _logger.debug(f"Storyboard base directory ready: {storyboard_base_dir}")
     except OSError as e:
         _logger.error(f"Failed to ensure storyboard base directory '{storyboard_base_dir}': {e}")
         return None
@@ -296,13 +359,13 @@ def generate_storyboard(story: str, topic: str, task_id: str, llm_endpoint: str,
 
     cumulative_time = 0.0
     combined_narration_texts = []
-    word_per_minute_rate = 150
+    word_per_minute_rate = appconfig.storyboard.WPM
     image_results = []
 
     # --- Start Change ---
     # Define desired duration range
     MIN_SCENE_DURATION = 3.0
-    MAX_SCENE_DURATION = 5.0
+    MAX_SCENE_DURATION = 15.0
     # --- End Change ---
 
     # Process each scene (assign text, calculate duration, generate image)
@@ -330,7 +393,7 @@ def generate_storyboard(story: str, topic: str, task_id: str, llm_endpoint: str,
 
         final_duration = min(max(calculated_duration, MIN_SCENE_DURATION), MAX_SCENE_DURATION)
         scene["duration"] = round(final_duration, 1)
-        _logger.info(f"Task {task_id}, Scene {scene_number}: Final duration set to {scene['duration']}s (clamped from {calculated_duration:.1f}s). Narration: '{narration_text[:50]}...'")
+        _logger.debug(f"Scene {scene_number}: Duration {scene['duration']}s; narration start '{narration_text[:50]}...'")
         # --- End Change ---
 
         scene["start_time"] = round(cumulative_time, 2)
@@ -390,7 +453,7 @@ def generate_storyboard(story: str, topic: str, task_id: str, llm_endpoint: str,
     if not combined_narration:
          _logger.warning(f"Task {task_id}: Combined narration text (after splitting) is empty. Skipping audio generation.")
     elif not audio_generation_enabled:
-         _logger.info(f"Task {task_id}: Audio generation is globally disabled. Skipping audio generation.")
+         _logger.debug(f"Audio generation disabled for task {task_id}")
     elif not elevenlabs_api_key:
          _logger.warning(f"Task {task_id}: ElevenLabs API key missing. Skipping audio generation.")
     else:
@@ -478,7 +541,7 @@ def generate_storyboard(story: str, topic: str, task_id: str, llm_endpoint: str,
         _logger.error(f"Task {task_id}: Failed to serialize or initiate storage for final storyboard JSON: {e}")
         return None
 
-    _logger.info(f"Storyboard generation process completed successfully for task: '{task_id}'")
+    _logger.debug(f"Storyboard generation completed for task: '{task_id}'")
 
     return storyboard_data
 
@@ -573,5 +636,143 @@ def split_story_by_markers(story: str, scenes: List[Dict[str, Any]]) -> List[str
         _logger.debug(f"Generated segments: {[seg[:50] + '...' for seg in scene_narrations]}")
         return []
 
-    _logger.info(f"Successfully split story into {len(scene_narrations)} segments based on markers.")
+    _logger.debug(f"Split into {len(scene_narrations)} segments")
     return scene_narrations
+
+async def generate_storyboard_from_story_script(
+    job_id: str,
+    story_script: str,
+    num_scenes: int,
+    image_style: Optional[str] = None,
+    negative_prompt: Optional[str] = None,
+    llm_provider_config: Optional[Dict[str, Any]] = None,
+    retry_attempts: int = 3
+) -> Dict[str, Any]:
+    """
+    Generates a storyboard from a story script, including scene descriptions,
+    visual suggestions, and camera shots. Retries marker generation and splitting on failure.
+    """
+    _logger.info(f"Job {job_id}: Starting storyboard generation from script. Target scenes: {num_scenes}, Style: {image_style}")
+    if not story_script:
+        _logger.error(f"Job {job_id}: Story script is empty.")
+        raise ValueError("Story script cannot be empty.")
+    if num_scenes <= 0:
+        _logger.error(f"Job {job_id}: Number of scenes must be positive, got {num_scenes}.")
+        raise ValueError("Number of scenes must be positive.")
+
+    if not llm_provider_config:
+        _logger.error(f"Job {job_id}: llm_provider_config is not provided.")
+        raise ValueError("llm_provider_config is required.")
+
+    scenes_content: List[Dict[str, Any]] = []
+    last_split_errors: List[str] = []
+    last_scene_markers: List[Dict[str, Any]] = []
+    success = False
+    storyboard_structure: Optional[Dict[str, Any]] = None
+
+    for attempt in range(retry_attempts):
+        _logger.info(f"Job {job_id}: Storyboard generation attempt {attempt + 1} of {retry_attempts}.")
+
+        try:
+            llm_endpoint = llm_provider_config.get("endpoint")
+            temperature = llm_provider_config.get("temperature")
+
+            if not llm_endpoint:
+                raise ValueError("LLM endpoint not found in llm_provider_config.")
+            if temperature is None:
+                raise ValueError("Temperature not found in llm_provider_config.")
+
+            storyboard_structure = await asyncio.to_thread(
+                generate_storyboard_structure,
+                story_script,
+                llm_endpoint,
+                float(temperature)
+            )
+        except Exception as e_struct:
+            _logger.error(f"Job {job_id}: Error calling generate_storyboard_structure in attempt {attempt + 1}: {e_struct}")
+            last_split_errors = [f"Error generating storyboard structure: {e_struct}"]
+            if attempt < retry_attempts - 1:
+                _logger.info(f"Job {job_id}: Retrying structure generation. Waiting a moment...")
+                await asyncio.sleep(min(5, 2 ** (attempt + 1)))
+                continue
+            else:
+                break
+
+        if not storyboard_structure:
+            _logger.error(f"Job {job_id}: generate_storyboard_structure returned None in attempt {attempt + 1}.")
+            last_split_errors = ["generate_storyboard_structure returned None."]
+            if attempt < retry_attempts - 1:
+                _logger.info(f"Job {job_id}: Retrying to get storyboard structure. Waiting a moment...")
+                await asyncio.sleep(min(5, 2 ** (attempt + 1)))
+                continue
+            else:
+                break
+
+        current_scene_markers = storyboard_structure.get("scenes", [])
+        last_scene_markers = current_scene_markers
+
+        if not current_scene_markers:
+            _logger.error(f"Job {job_id}: LLM did not return scene markers in attempt {attempt + 1}. Structure: {storyboard_structure}")
+            last_split_errors = ["LLM did not return scene markers."]
+            if attempt < retry_attempts - 1:
+                _logger.info(f"Job {job_id}: Retrying to get scene markers. Waiting a moment...")
+                await asyncio.sleep(min(5, 2 ** (attempt + 1))) # Exponential backoff
+                continue
+            else:
+                break
+
+        # 2. Split story script using the generated markers
+        _logger.debug(f"Job {job_id}: Attempt {attempt + 1}: Splitting story with {len(current_scene_markers)} markers.")
+        narrations = split_story_by_markers(story_script, current_scene_markers)
+
+        if narrations and len(narrations) == len(current_scene_markers):
+            _logger.info(f"Job {job_id}: Successfully split story into {len(narrations)} narrations in attempt {attempt + 1}.")
+
+            processed_scenes = []
+            for i, scene_marker_data in enumerate(current_scene_markers):
+                scene_data = dict(scene_marker_data)
+                scene_data['narration_text'] = narrations[i]
+                processed_scenes.append(scene_data)
+
+            scenes_content = processed_scenes
+            last_split_errors = []
+            success = True
+            break
+        else:
+            error_msg = f"Failed to split story accurately. Expected {len(current_scene_markers)} narrations, got {len(narrations) if narrations is not None else 'None'}."
+            last_split_errors = [error_msg]
+            _logger.warning(f"Job {job_id}: Attempt {attempt + 1} failed to split story: {error_msg}")
+            _logger.debug(f"Job {job_id}: Attempt {attempt + 1}: Story script for failed split (first 500 chars):\n{story_script[:500]}")
+            _logger.debug(f"Job {job_id}: Attempt {attempt + 1}: Scene markers for failed split: {current_scene_markers}")
+
+            if attempt < retry_attempts - 1:
+                _logger.info(f"Job {job_id}: Retrying storyboard generation. Waiting a moment...")
+                await asyncio.sleep(min(5, 2 ** (attempt + 1))) # Exponential backoff
+            else:
+                break
+
+    if not success:
+        error_detail = f"Last errors: {'; '.join(last_split_errors)}."
+        # Ensure storyboard_structure is not None before accessing it in the error message
+        markers_tried_message = f"Last scene markers tried: {last_scene_markers if last_scene_markers else (storyboard_structure.get('scenes') if storyboard_structure else 'None returned or structure generation failed')}."
+        if not last_scene_markers and any("LLM did not return scene markers" in e for e in last_split_errors) or any("generate_storyboard_structure returned None" in e for e in last_split_errors):
+             error_message = f"Job {job_id}: Failed to generate scene markers or structure after {retry_attempts} attempts. {error_detail}"
+        elif any("Error generating storyboard structure" in e for e in last_split_errors):
+            error_message = f"Job {job_id}: Failed to generate storyboard structure after {retry_attempts} attempts. {error_detail}"
+        else:
+            error_message = (
+                f"Job {job_id}: Failed to split story script into scenes after {retry_attempts} attempts. "
+                f"{error_detail} "
+                f"{markers_tried_message}"
+            )
+        _logger.error(error_message)
+        raise ValueError(error_message)
+
+    _logger.info(f"Job {job_id}: Successfully processed storyboard structure and narrations for {len(scenes_content)} scenes.")
+
+    # Ensure storyboard_structure is not None before returning it.
+    if storyboard_structure is None: # Should not happen if success is True
+        _logger.error(f"Job {job_id}: Storyboard structure is None even after successful processing. This indicates a logic error.")
+        raise ValueError("Storyboard structure is unexpectedly None after successful processing.")
+
+    return {"scenes": scenes_content, "original_structure": storyboard_structure}

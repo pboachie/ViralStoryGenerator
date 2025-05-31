@@ -2,8 +2,8 @@ FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# Copy application code
-COPY . .
+# Copy requirements file first for better caching
+COPY requirements-scraper.txt .
 
 # Install system dependencies for playwright and build tools
 RUN apt-get update && \
@@ -37,7 +37,7 @@ RUN apt-get update && \
         libpango-1.0-0 \
         libcairo2 \
         libgdk-pixbuf2.0-0 && \
-    pip install --no-cache-dir -e . && \
+    pip install --no-cache-dir -r requirements-scraper.txt && \
     playwright install --with-deps && \
     apt-get purge -y --auto-remove \
         build-essential \
@@ -48,6 +48,9 @@ RUN apt-get update && \
         wget \
         gnupg && \
     rm -rf /var/lib/apt/lists/*
+
+# Copy application code after dependencies are installed
+COPY . .
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

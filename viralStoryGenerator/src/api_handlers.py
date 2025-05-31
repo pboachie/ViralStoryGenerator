@@ -5,7 +5,7 @@ import os
 import datetime
 import json
 import uuid
-import re # For sanitization
+import re
 from typing import Dict, Any, Optional, List
 
 from viralStoryGenerator.models import (
@@ -19,12 +19,16 @@ from viralStoryGenerator.utils.storage_manager import storage_manager
 from viralStoryGenerator.utils.security import is_file_in_directory, validate_path_component, sanitize_for_filename
 
 import viralStoryGenerator.src.logger
+import asyncio
+import inspect
 _logger = logging.getLogger(__name__)
 
-def get_message_broker() -> RedisMessageBroker:
-    """Get Redis message broker for API handlers"""
+async def get_message_broker() -> RedisMessageBroker:
+    """Get Redis message broker for API handlers, ensuring async initialization."""
     redis_url = "redis://" + appconfig.redis.HOST + ":" + str(appconfig.redis.PORT)
-    return RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
+    broker = RedisMessageBroker(redis_url=redis_url, stream_name="api_jobs")
+    await broker.initialize()
+    return broker
 
 class StoryTask:
     """Basic representation of a task state for API response."""
@@ -84,9 +88,11 @@ def create_story_task(topic: str, sources_folder: Optional[str] = None,
 
     try:
         message_broker = get_message_broker()
-        message_broker.ensure_stream_exists("api_jobs")
-
+        if inspect.isawaitable(message_broker):
+            message_broker = asyncio.get_event_loop().run_until_complete(message_broker)
         message_id = message_broker.publish_message(task_data_payload)
+        if inspect.isawaitable(message_id):
+            message_id = asyncio.get_event_loop().run_until_complete(message_id)
         success = message_id is not None
     except Exception as e:
         _logger.error(f"Failed to publish task to Redis Stream: {e}")
@@ -101,7 +107,7 @@ def create_story_task(topic: str, sources_folder: Optional[str] = None,
 
     return task_response
 
-def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
+async def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
     """
     Get the status of a task. Checks Redis Streams first, then final storage
     if the task is marked completed or not found in Redis.
@@ -109,8 +115,8 @@ def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
     """
     status_source = "unknown"
     try:
-        message_broker = get_message_broker()
-        stream_status = message_broker.get_job_status(task_id)
+        message_broker = await get_message_broker()
+        stream_status = await message_broker.get_job_progress(task_id)
         final_result_data = {}
 
         if stream_status:
@@ -118,16 +124,16 @@ def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
             _logger.debug(f"Stream status for task {task_id}: {json.dumps(stream_status, indent=2)}")
             current_status = stream_status.get("status", "pending")
 
-            # If completed according to Redis, try fetching final results from storage
-            if current_status == "completed":
+            if (current_status == "completed"):
+                metadata_filename = f"{task_id}_metadata.json"
                 try:
-                    final_result_data = storage_manager.get_story_metadata(task_id) or {}
+                    final_result_data = storage_manager.retrieve_file_content_as_json(filename=metadata_filename, file_type="metadata") or {}
                     if not final_result_data:
-                         _logger.warning(f"Task {task_id} status is 'completed' in Redis, but final metadata not found/empty in storage.")
+                         _logger.warning(f"Task {task_id} status is 'completed' in Redis, but final metadata not found/empty in storage (checked {metadata_filename}).")
                     else:
                          _logger.info(f"Fetched final metadata for completed task {task_id} from storage.")
                 except FileNotFoundError:
-                    _logger.warning(f"Task {task_id} status is 'completed' in Redis, but final metadata file not found in storage.")
+                    _logger.warning(f"Task {task_id} status is 'completed' in Redis, but final metadata file ({metadata_filename}) not found in storage.")
                     final_result_data = {"error": "Completed task metadata file not found in storage."}
                 except Exception as storage_err:
                     _logger.error(f"Error fetching final metadata for completed task {task_id} from storage: {storage_err}")
@@ -160,7 +166,7 @@ def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
                      status_data["error"] = combined_error
                      status_data["message"] = f"Job status from Redis ({current_status}). Error fetching final results: {storage_error}"
                 elif current_status == "completed":
-                     status_data["message"] = final_result_data.get("message", "Job completed and final results retrieved from storage.") # Update message if completed successfully
+                     status_data["message"] = final_result_data.get("message", "Job completed and final results retrieved from storage.")
 
                 status_data["created_at"] = final_result_data.get("created_at", status_data["created_at"])
                 status_data["updated_at"] = final_result_data.get("updated_at", status_data["updated_at"])
@@ -173,10 +179,11 @@ def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
             # Task ID not found in Redis Streams, check final storage directly
             status_source = "storage"
             _logger.debug(f"Task ID {task_id} not found in Redis Streams. Checking final storage.")
+            metadata_filename = f"{task_id}_metadata.json"
             try:
-                final_result_data = storage_manager.get_story_metadata(task_id)
+                final_result_data = storage_manager.retrieve_file_content_as_json(filename=metadata_filename, file_type="metadata")
                 if final_result_data:
-                    _logger.info(f"Task {task_id} not found in Redis, but found completed results in storage.")
+                    _logger.info(f"Task {task_id} not found in Redis, but found completed results in storage (checked {metadata_filename}).")
                     status_data = {
                         "status": final_result_data.get("status", "completed"),
                         "job_id": task_id,
@@ -193,18 +200,41 @@ def get_task_status(task_id: str) -> Optional[Dict[str, Any]]:
                     return response
                 else:
                     # Not found in Redis or storage
-                     _logger.debug(f"Task ID {task_id} not found in Redis Streams or final storage.")
+                     _logger.debug(f"Task ID {task_id} not found in Redis Streams or final storage (checked {metadata_filename}).")
                      return None
             except FileNotFoundError:
-                 _logger.debug(f"Task ID {task_id} metadata file not found in storage (after Redis miss).")
+                 _logger.debug(f"Task ID {task_id} metadata file ({metadata_filename}) not found in storage (after Redis miss).")
                  return None
             except Exception as storage_err:
                  _logger.error(f"Error checking storage for task {task_id} after Redis miss: {storage_err}")
-                 return {"status": "error", "message": f"Error checking storage for job status: {str(storage_err)}", "task_id": task_id}
+                 error_data_for_response = {
+                     "status": "error",
+                     "message": f"Error checking storage for job status: {str(storage_err)}",
+                     "job_id": task_id,
+                     "story_script": None,
+                     "storyboard": None,
+                     "audio_url": None,
+                     "sources": None,
+                     "error": f"Error checking storage for job status: {str(storage_err)}",
+                     "created_at": None,
+                     "updated_at": None
+                 }
+                 return JobStatusResponse(**error_data_for_response).model_dump(exclude_none=True)
 
     except Exception as e:
         _logger.exception(f"Error retrieving task status for {task_id} (source: {status_source}): {e}")
-        error_response = {"status": "error", "message": f"Failed to retrieve task status: {str(e)}", "task_id": task_id}
+        error_response = {
+            "status": "error",
+            "message": f"Failed to retrieve task status: {str(e)}",
+            "job_id": task_id,
+            "story_script": None,
+            "storyboard": None,
+            "audio_url": None,
+            "sources": None,
+            "error": f"Failed to retrieve task status: {str(e)}",
+            "created_at": None,
+            "updated_at": None
+            }
         try:
             return JobStatusResponse(**error_response).model_dump(exclude_none=True)
         except Exception:
@@ -230,7 +260,7 @@ def process_audio_queue():
 
     processed_count = 0
     failed_count = 0
-    from .elevenlabs_tts import generate_elevenlabs_audio # Local import
+    from .elevenlabs_tts import generate_elevenlabs_audio
 
     for filename in os.listdir(audio_queue_dir):
         if filename.endswith(".json"):
@@ -243,14 +273,14 @@ def process_audio_queue():
                 # Basic validation of metadata
                 if not all(k in metadata for k in ["story", "mp3_file_path"]):
                      _logger.warning(f"Skipping invalid queue file {filename}: missing required keys.")
-                     # Optionally move/delete invalid file
+                     # todo:  move/delete invalid file
                      continue
 
                 # Attempt regeneration
                 success = generate_elevenlabs_audio(
                     text=metadata["story"],
                     api_key=api_key,
-                    output_mp3_path=metadata["mp3_file_path"], # Assumes original path is still valid
+                    output_mp3_path=metadata["mp3_file_path"],
                     voice_id=metadata.get("voice_id"),
                     model_id=metadata.get("model_id", "eleven_multilingual_v2"),
                     stability=metadata.get("stability", 0.5),
@@ -270,7 +300,6 @@ def process_audio_queue():
 
             except json.JSONDecodeError:
                  _logger.error(f"Error reading queued file {file_path}: Invalid JSON.")
-                 # Optionally move/delete invalid file
             except Exception as e:
                 _logger.exception(f"Unexpected error processing queue file {file_path}: {e}")
 
