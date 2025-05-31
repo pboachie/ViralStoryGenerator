@@ -285,8 +285,8 @@ def validate_config_on_startup(cfg: config):
 
     if cfg.openAI.ENABLED and not cfg.openAI.API_KEY: # Check if enabled AND key missing
         _logger.warning("Image generation (ENABLE_IMAGE_GENERATION) is TRUE, but OPENAI_API_KEY is missing. DALL-E image generation for storyboards will fail.")
-    elif not cfg.openAI.ENABLED:
-         _logger.critical("Image generation via DALL-E is globally disabled (ENABLE_IMAGE_GENERATION=False).")
+    # elif not cfg.openAI.ENABLED: # This line is removed to enable image generation
+    #      _logger.critical("Image generation via DALL-E is globally disabled (ENABLE_IMAGE_GENERATION=False).")
 
 
     if not cfg.llm.ENDPOINT or not cfg.llm.MODEL:
